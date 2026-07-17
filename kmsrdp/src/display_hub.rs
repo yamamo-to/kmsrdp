@@ -40,7 +40,12 @@ pub struct DisplayHub {
 
 impl DisplayHub {
     /// Starts the capture loop immediately and returns a shareable hub.
-    pub fn start(width: u16, height: u16, mouse_scale: MouseScale) -> Arc<Self> {
+    pub fn start(
+        width: u16,
+        height: u16,
+        mouse_scale: MouseScale,
+        capturer: capture::Capturer,
+    ) -> Arc<Self> {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let hub = Arc::new(Self {
             size: Mutex::new(DesktopSize { width, height }),
@@ -50,7 +55,7 @@ impl DisplayHub {
         });
         let capture_hub = Arc::clone(&hub);
         tokio::spawn(async move {
-            capture_hub.run_capture_loop().await;
+            capture_hub.run_capture_loop(capturer).await;
         });
         hub
     }
@@ -63,12 +68,42 @@ impl DisplayHub {
         }
     }
 
-    async fn run_capture_loop(self: Arc<Self>) {
+    async fn run_capture_loop(self: Arc<Self>, mut capturer: capture::Capturer) {
         let mut previous: Option<capture::RawFrame> = None;
         let mut negotiated_size = *self.size.lock().unwrap();
         loop {
-            match tokio::task::spawn_blocking(capture::capture_raw_bgrx).await {
-                Ok(Ok(raw)) => {
+            let task = tokio::task::spawn_blocking(move || {
+                let result = capturer.capture();
+                (capturer, result)
+            })
+            .await;
+            let result = match task {
+                Ok((returned, result)) => {
+                    capturer = returned;
+                    result
+                }
+                Err(e) => {
+                    eprintln!("capture task panicked: {e}");
+                    match tokio::task::spawn_blocking(capture::Capturer::new).await {
+                        Ok(Ok(replacement)) => {
+                            capturer = replacement;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
+                        Ok(Err(open_err)) => {
+                            eprintln!("failed to reopen capturer: {open_err}");
+                            return;
+                        }
+                        Err(open_err) => {
+                            eprintln!("capturer reopen task panicked: {open_err}");
+                            return;
+                        }
+                    }
+                }
+            };
+
+            match result {
+                Ok(raw) => {
                     let current_size = DesktopSize {
                         width: raw.width as u16,
                         height: raw.height as u16,
@@ -146,8 +181,7 @@ impl DisplayHub {
                     *self.latest_full.lock().unwrap() = Some(full);
                     previous = Some(raw);
                 }
-                Ok(Err(e)) => eprintln!("capture failed: {e}"),
-                Err(e) => eprintln!("capture task panicked: {e}"),
+                Err(e) => eprintln!("capture failed: {e}"),
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
