@@ -38,6 +38,8 @@ kmsrdp's own DRM/uinput glue.
   DRM/KMS entirely. `libnvidia-fbc.so.1` is also dlopen'd at runtime, so
   this is a no-op fallback (not a hard dependency) on non-NVIDIA boxes.
 - Mouse/keyboard input via a virtual `uinput` device
+- Selectable DRM connector through `KMSRDP_DISPLAY` when more than one
+  physical monitor is active
 - Japanese/CJK (IME-composed Unicode) text input, via an X11-specific
   keymap-remap + XTest trick (X11 sessions only)
 - Bidirectional clipboard sync (CLIPRDR <-> local clipboard, text only)
@@ -80,7 +82,9 @@ kmsrdp's own DRM/uinput glue.
   client uses (see `kmsrdp::nvfbc`'s doc comment) - unofficial, but this is
   exactly the mechanism tools like Sunshine rely on, and it's what's
   actually validated below.
-- Single monitor only.
+- One selected physical monitor is captured at a time. Combining monitors
+  into one desktop or exposing true RDP multimonitor layouts is not yet
+  supported.
 - MS-RDPDR (drive/printer redirection) is implemented and live-validated
   against a real client at the protocol level (`crates/rdpcore-rdpdr`), but
   isn't wired into the production server yet - there's no consumer on this
@@ -148,6 +152,35 @@ KMSRDP_TLS_HOSTS=server.example.test,192.0.2.10 \
 KMSRDP_USER=myuser KMSRDP_PASSWORD=mypassword \
 ./target/release/rdp_server
 ```
+
+### Selecting a monitor
+
+When multiple DRM connectors are active, set `KMSRDP_DISPLAY` to the Linux
+connector name:
+
+```bash
+KMSRDP_DISPLAY=DP-1 \
+KMSRDP_USER=myuser KMSRDP_PASSWORD=mypassword \
+./target/release/rdp_server
+```
+
+Connector names are the familiar `DP-1`, `HDMI-A-1`, `eDP-1`, and similar
+names shown under `/sys/class/drm`. If two DRM cards expose the same
+connector name, qualify it with the card:
+
+```bash
+KMSRDP_DISPLAY=card1:DP-1
+```
+
+The server logs the selected `card:connector`. If the requested connector
+is missing, disconnected, or has no active CRTC, startup fails and the
+error lists the DRM connectors it discovered. When `KMSRDP_DISPLAY` is
+unset, kmsrdp keeps its original behavior and uses the first active
+connector.
+
+NvFBC captures the X screen as a whole and cannot select an individual DRM
+connector, so the NvFBC fallback is intentionally disabled when
+`KMSRDP_DISPLAY` is set.
 
 ### Windows Remote Desktop (mstsc)
 

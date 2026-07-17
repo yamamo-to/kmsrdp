@@ -9,6 +9,7 @@
 use std::fs;
 use std::io;
 use std::os::unix::io::{AsFd, AsRawFd};
+use std::sync::{Mutex, OnceLock};
 
 use drm::Device;
 use drm::control::{Device as ControlDevice, connector, crtc, plane, property};
@@ -35,6 +36,75 @@ impl Card {
         // export framebuffers as PRIME fds; we never need to draw anything.
         let file = fs::OpenOptions::new().read(true).open(path)?;
         Ok(Card(file))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DisplaySelector {
+    card: Option<String>,
+    connector: String,
+}
+
+impl DisplaySelector {
+    fn parse(value: &str) -> Result<Option<Self>, String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Ok(None);
+        }
+
+        let (card, connector) = match value.split_once(':') {
+            Some((card, connector)) => {
+                let card = card.trim();
+                let connector = connector.trim();
+                if card.is_empty() || connector.is_empty() || connector.contains(':') {
+                    return Err("expected CONNECTOR (for example DP-1) or CARD:CONNECTOR \
+                         (for example card1:DP-1)"
+                        .to_string());
+                }
+                (Some(card.to_string()), connector.to_string())
+            }
+            None => (None, value.to_string()),
+        };
+
+        Ok(Some(Self { card, connector }))
+    }
+
+    fn matches(&self, card: &str, connector: &str) -> bool {
+        self.connector == connector && self.card.as_deref().is_none_or(|wanted| wanted == card)
+    }
+
+    fn configured_name(&self) -> String {
+        match &self.card {
+            Some(card) => format!("{card}:{}", self.connector),
+            None => self.connector.clone(),
+        }
+    }
+}
+
+static DISPLAY_SELECTOR: OnceLock<Result<Option<DisplaySelector>, String>> = OnceLock::new();
+static LAST_SELECTED_DISPLAY: Mutex<Option<String>> = Mutex::new(None);
+
+fn display_selector() -> io::Result<Option<&'static DisplaySelector>> {
+    let configured = DISPLAY_SELECTOR.get_or_init(|| {
+        DisplaySelector::parse(&std::env::var("KMSRDP_DISPLAY").unwrap_or_else(|_| String::new()))
+    });
+    match configured {
+        Ok(selector) => Ok(selector.as_ref()),
+        Err(reason) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid KMSRDP_DISPLAY: {reason}"),
+        )),
+    }
+}
+
+fn log_selected_display(card: &str, connector: &str) {
+    let selected = format!("{card}:{connector}");
+    let mut last = LAST_SELECTED_DISPLAY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if last.as_deref() != Some(&selected) {
+        eprintln!("kmsrdp: capturing DRM display {selected}");
+        *last = Some(selected);
     }
 }
 
@@ -74,9 +144,12 @@ fn connector_crtc_via_atomic_prop(
     Ok(None)
 }
 
-/// Find the first card with a connected connector that has an active CRTC,
-/// same "first usable connector" search as upstream `get_usable_card_and_connector`.
+/// Find the configured connected connector with an active CRTC. When
+/// `KMSRDP_DISPLAY` is unset, this preserves the original "first usable
+/// connector" behavior.
 fn find_usable_card_and_crtc() -> io::Result<(Card, String, crtc::Handle)> {
+    let selector = display_selector()?;
+    let mut discovered = Vec::new();
     let mut entries: Vec<_> = fs::read_dir("/dev/dri")?.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
 
@@ -88,6 +161,7 @@ fn find_usable_card_and_crtc() -> io::Result<(Card, String, crtc::Handle)> {
         }
         let path = entry.path();
         let path_str = path.to_string_lossy().to_string();
+        let card_name = name.as_ref();
 
         let card = match Card::open_read_only(&path_str) {
             Ok(c) => c,
@@ -109,7 +183,10 @@ fn find_usable_card_and_crtc() -> io::Result<(Card, String, crtc::Handle)> {
             let Ok(conn) = card.get_connector(conn_handle, false) else {
                 continue;
             };
+            let connector_name = conn.to_string();
+            let qualified_name = format!("{card_name}:{connector_name}");
             if conn.state() != connector::State::Connected {
+                discovered.push(format!("{qualified_name} (disconnected)"));
                 continue;
             }
             let legacy_crtc = conn
@@ -123,16 +200,36 @@ fn find_usable_card_and_crtc() -> io::Result<(Card, String, crtc::Handle)> {
                 // connector's atomic CRTC_ID property.
                 None => match connector_crtc_via_atomic_prop(&card, conn_handle) {
                     Ok(Some(crtc_handle)) => crtc_handle,
-                    _ => continue,
+                    _ => {
+                        discovered.push(format!("{qualified_name} (connected, inactive)"));
+                        continue;
+                    }
                 },
             };
+            discovered.push(format!("{qualified_name} (active)"));
+            if selector.is_some_and(|wanted| !wanted.matches(card_name, &connector_name)) {
+                continue;
+            }
+            log_selected_display(card_name, &connector_name);
             return Ok((card, path_str, crtc_handle));
         }
     }
 
+    let reason = match selector {
+        Some(selector) => format!(
+            "requested display {} is not an active DRM connector",
+            selector.configured_name()
+        ),
+        None => "no usable card/connector/CRTC found (is a display actually active?)".to_string(),
+    };
+    let discovered = if discovered.is_empty() {
+        "none".to_string()
+    } else {
+        discovered.join(", ")
+    };
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "no usable card/connector/CRTC found (is a display actually active?)",
+        format!("{reason}; discovered DRM connectors: {discovered}"),
     ))
 }
 
@@ -146,7 +243,7 @@ pub struct RawFrame {
     pub data: Vec<u8>,
 }
 
-/// Grabs the current primary-plane framebuffer of the first usable
+/// Grabs the current primary-plane framebuffer of the configured
 /// card/connector/CRTC as raw BGRX8888 bytes (this is
 /// `ironrdp_server::PixelFormat::BgrX32`'s exact memory layout, so the RDP
 /// path can hand it to the encoder with no per-pixel conversion).
@@ -161,6 +258,12 @@ pub struct RawFrame {
 pub fn capture_raw_bgrx() -> io::Result<RawFrame> {
     match capture_raw_bgrx_drm() {
         Ok(frame) => Ok(frame),
+        Err(drm_err) if display_selector()?.is_some() => {
+            // NvFBC captures the X screen as a whole and cannot honor a
+            // connector selection. Falling back here would silently show
+            // a different display than the administrator requested.
+            Err(drm_err)
+        }
         Err(drm_err) => match crate::nvfbc::capture_bgrx() {
             Ok((width, height, data)) => Ok(RawFrame {
                 width,
@@ -319,4 +422,38 @@ pub fn capture_frame() -> io::Result<image::RgbImage> {
         }
     }
     Ok(img)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DisplaySelector;
+
+    #[test]
+    fn empty_display_selector_uses_default() {
+        assert_eq!(DisplaySelector::parse("").unwrap(), None);
+        assert_eq!(DisplaySelector::parse("  ").unwrap(), None);
+    }
+
+    #[test]
+    fn connector_only_selector_matches_any_card() {
+        let selector = DisplaySelector::parse(" DP-1 ").unwrap().unwrap();
+        assert!(selector.matches("card0", "DP-1"));
+        assert!(selector.matches("card1", "DP-1"));
+        assert!(!selector.matches("card0", "HDMI-A-1"));
+    }
+
+    #[test]
+    fn qualified_selector_matches_one_card_and_connector() {
+        let selector = DisplaySelector::parse("card1:DP-1").unwrap().unwrap();
+        assert!(selector.matches("card1", "DP-1"));
+        assert!(!selector.matches("card0", "DP-1"));
+        assert!(!selector.matches("card1", "DP-2"));
+    }
+
+    #[test]
+    fn malformed_qualified_selector_is_rejected() {
+        assert!(DisplaySelector::parse(":DP-1").is_err());
+        assert!(DisplaySelector::parse("card0:").is_err());
+        assert!(DisplaySelector::parse("card0:DP-1:extra").is_err());
+    }
 }
