@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -96,5 +96,10 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Fri Jul 17 2026 kmsrdp contributors <noreply@example.com> - 0.1.1-1
+- Add CAP_NET_BIND_SERVICE so the service can bind TCP 3389
+- Bind the listener before creating the uinput device to avoid
+  restart-loop uinput spam on startup failure
+
 * Wed Jul 15 2026 kmsrdp contributors <noreply@example.com> - 0.1.0-1
 - Initial packaging
