@@ -16,7 +16,8 @@ pub use error::ConnectorError;
 use rdpcore_pdu::capability_sets::{
     BitmapCapability, BitmapCodecsCapability, ConfirmActive, DeactivateAllPdu, DemandActive,
     GeneralCapability, InputCapability, MultiFragmentUpdateCapability, OrderCapability,
-    PointerCapability, ServerCapabilities, VirtualChannelCapability,
+    PointerCapability, ServerCapabilities, ShareControlHeader, ShareControlPduType,
+    VirtualChannelCapability,
 };
 use rdpcore_pdu::client_info::ClientInfoPdu;
 use rdpcore_pdu::cursor::ReadCursor;
@@ -110,11 +111,12 @@ impl StepResult {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct FinalizationProgress {
     granted_control_sent: bool,
 }
 
+#[derive(Clone)]
 enum State {
     WaitConnectionRequest,
     WaitConnectInitial,
@@ -244,6 +246,8 @@ impl Acceptor {
             .encode_indication(),
         ));
 
+        // A previous Confirm Active fragment must not leak into the re-activation.
+        self.confirm_active_buf.clear();
         self.state = State::WaitConfirmActive;
         Ok(response)
     }
@@ -258,20 +262,91 @@ impl Acceptor {
             return self.step_mcs_domain_pdus(input);
         }
 
-        match core::mem::replace(&mut self.state, State::Rejected) {
+        // Don't `mem::replace` into Rejected before returning AlreadyFinished:
+        // a single stray step after Accepted used to permanently poison the
+        // acceptor (Rejected), after which mid-session resize could never
+        // complete and the server kept feeding frames into step().
+        if matches!(self.state, State::Accepted | State::Rejected) {
+            return Err(ConnectorError::AlreadyFinished);
+        }
+
+        if matches!(
+            self.state,
+            State::WaitConfirmActive | State::WaitFinalization(_)
+        ) {
+            return self.step_reactivation(input);
+        }
+
+        let previous = core::mem::replace(&mut self.state, State::Rejected);
+        let result = match previous.clone() {
             State::WaitConnectionRequest => self.on_connection_request(input),
             State::WaitConnectInitial => self.on_connect_initial(input),
             State::WaitClientInfo => self.on_client_info(input),
             State::WaitAuthApproval => Err(ConnectorError::NotReady),
-            State::WaitConfirmActive => self.on_confirm_active(input),
-            State::WaitFinalization(progress) => self.on_finalization(input, progress),
-            State::Accepted | State::Rejected => Err(ConnectorError::AlreadyFinished),
-            State::WaitErectDomainRequest
+            State::WaitConfirmActive
+            | State::WaitFinalization(_)
+            | State::Accepted
+            | State::Rejected
+            | State::WaitErectDomainRequest
             | State::WaitAttachUserRequest
             | State::WaitChannelJoinRequest { .. } => {
                 unreachable!("handled above")
             }
+        };
+        // Transient decode errors must not leave the acceptor Rejected mid-resize;
+        // restore the phase we were in so the client can still finish the handshake.
+        if result.is_err() && matches!(self.state, State::Rejected) {
+            self.state = previous;
         }
+        result
+    }
+
+    /// Drive Confirm Active + finalization, peeling every MCS Send Data
+    /// Request packed into one X.224 payload. mstsc often batches Synchronize /
+    /// Control / FontList together; processing only the first PDU used to
+    /// drop FontList, leave the acceptor unfinished, and then spam
+    /// `AlreadyFinished` once a later frame finally completed (or left the
+    /// server calling `step` after Accept).
+    fn step_reactivation(&mut self, input: &[u8]) -> Result<StepResult, ConnectorError> {
+        let payload = x224::unwrap_data(input)?;
+        let mut cursor = ReadCursor::new(payload);
+        let mut response = Vec::new();
+        let mut event = AcceptorEvent::None;
+
+        while cursor.remaining() > 0 {
+            if matches!(self.state, State::Accepted | State::Rejected) {
+                break;
+            }
+            let send_data = match SendData::decode_request_from_cursor(&mut cursor) {
+                Ok(sd) => sd,
+                Err(e) => {
+                    // Trailing noise after a successful Accept is harmless.
+                    if matches!(event, AcceptorEvent::Accepted(_)) {
+                        break;
+                    }
+                    return Err(ConnectorError::Decode(e));
+                }
+            };
+
+            let step = match self.state.clone() {
+                State::WaitConfirmActive => self.on_confirm_active_send_data(send_data)?,
+                State::WaitFinalization(progress) => {
+                    self.on_finalization_send_data(send_data, progress)?
+                }
+                State::Accepted | State::Rejected => break,
+                other => {
+                    self.state = other;
+                    return Err(ConnectorError::NotReady);
+                }
+            };
+            response.extend(step.response);
+            if matches!(step.event, AcceptorEvent::Accepted(_)) {
+                event = step.event;
+                break;
+            }
+        }
+
+        Ok(StepResult { response, event })
     }
 
     /// mstsc may pack several MCS domain PDUs (Erect Domain, Attach User,
@@ -530,13 +605,23 @@ impl Acceptor {
         .encode()
     }
 
-    fn on_confirm_active(&mut self, input: &[u8]) -> Result<StepResult, ConnectorError> {
-        let payload = x224::unwrap_data(input)?;
-        let send_data = SendData::decode_request(payload)?;
-
+    fn on_confirm_active_send_data(
+        &mut self,
+        send_data: SendData,
+    ) -> Result<StepResult, ConnectorError> {
         // Static-channel traffic (drdynvc caps, etc.) can arrive before
         // Confirm Active; only the I/O channel carries it.
         if send_data.channel_id != IO_CHANNEL_ID {
+            self.state = State::WaitConfirmActive;
+            return Ok(StepResult::just(Vec::new()));
+        }
+
+        // Mid-session resize: mstsc may still emit Share Data (or retransmit
+        // finalization) on the I/O channel. Only Confirm Active advances this
+        // phase — anything else must be ignored, not appended into the buffer.
+        if let Ok((header, _)) = ShareControlHeader::decode(&mut ReadCursor::new(&send_data.data))
+            && header.pdu_type != ShareControlPduType::ConfirmActive
+        {
             self.state = State::WaitConfirmActive;
             return Ok(StepResult::just(Vec::new()));
         }
@@ -565,22 +650,41 @@ impl Acceptor {
         Ok(StepResult::just(response))
     }
 
-    fn on_finalization(
+    fn on_finalization_send_data(
         &mut self,
-        input: &[u8],
+        send_data: SendData,
         mut progress: FinalizationProgress,
     ) -> Result<StepResult, ConnectorError> {
-        let payload = x224::unwrap_data(input)?;
-        let send_data = SendData::decode_request(payload)?;
-        let data_pdu = DataPdu::decode(&send_data.data)?;
+        // Mid-session resize keeps cliprdr/rdpdr/drdynvc alive. Their PDUs
+        // arrive interleaved with Synchronize/Control/FontList; parsing them
+        // as Share Data aborts the handshake (Rejected) and leaves the RDP
+        // client on a blank canvas after Deactivate-All.
+        if send_data.channel_id != IO_CHANNEL_ID {
+            self.state = State::WaitFinalization(progress);
+            return Ok(StepResult::just(Vec::new()));
+        }
+
+        if let Ok((header, _)) = ShareControlHeader::decode(&mut ReadCursor::new(&send_data.data))
+            && header.pdu_type != ShareControlPduType::Data
+        {
+            self.state = State::WaitFinalization(progress);
+            return Ok(StepResult::just(Vec::new()));
+        }
+
+        let Ok(data_pdu) = DataPdu::decode(&send_data.data) else {
+            self.state = State::WaitFinalization(progress);
+            return Ok(StepResult::just(Vec::new()));
+        };
 
         let mut response = Vec::new();
 
         match data_pdu.pdu_type2 {
             ShareDataPduType::Synchronize => {}
             ShareDataPduType::Control => {
-                let control = ControlPdu::decode_body(&data_pdu.body)?;
-                if control.action == ControlPdu::REQUEST_CONTROL && !progress.granted_control_sent {
+                if let Ok(control) = ControlPdu::decode_body(&data_pdu.body)
+                    && control.action == ControlPdu::REQUEST_CONTROL
+                    && !progress.granted_control_sent
+                {
                     response.extend(send_io_indication(server_granted_control_pdu()));
                     progress.granted_control_sent = true;
                 }
@@ -1063,5 +1167,198 @@ mod tests {
             acceptor.begin_resize(1920, 1080),
             Err(ConnectorError::NotReady)
         ));
+    }
+
+    #[test]
+    fn step_after_accepted_preserves_accepted_so_resize_still_works() {
+        let (mut acceptor, _accepted, _credentials) = run_full_handshake(&[]);
+        let bogus = x224::wrap_data(
+            &SendData {
+                initiator: USER_CHANNEL_ID,
+                channel_id: IO_CHANNEL_ID,
+                data: vec![0, 1, 2, 3],
+                complete: true,
+            }
+            .encode_request(),
+        );
+        assert!(matches!(
+            acceptor.step(&bogus),
+            Err(ConnectorError::AlreadyFinished)
+        ));
+        assert!(
+            acceptor.is_finished(),
+            "AlreadyFinished must not poison Accepted into Rejected"
+        );
+        assert!(
+            acceptor.begin_resize(1280, 720).is_ok(),
+            "resize must still be possible after a stray post-Accepted step"
+        );
+    }
+
+    #[test]
+    fn resize_finalization_ignores_static_channel_traffic() {
+        let (mut acceptor, _accepted, _credentials) = run_full_handshake(&["cliprdr"]);
+        acceptor.begin_resize(1920, 1080).unwrap();
+
+        // Confirm Active first.
+        let send_data = SendData {
+            initiator: USER_CHANNEL_ID,
+            channel_id: IO_CHANNEL_ID,
+            data: confirm_active_fixture(),
+            complete: true,
+        };
+        assert!(matches!(
+            acceptor
+                .step(&x224::wrap_data(&send_data.encode_request()))
+                .unwrap()
+                .event,
+            AcceptorEvent::None
+        ));
+
+        // Interleaved cliprdr traffic (non-IO) must not abort finalization.
+        let cliprdr_noise = SendData {
+            initiator: USER_CHANNEL_ID,
+            channel_id: IO_CHANNEL_ID + 1,
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            complete: true,
+        };
+        let ignored = acceptor
+            .step(&x224::wrap_data(&cliprdr_noise.encode_request()))
+            .unwrap();
+        assert!(matches!(ignored.event, AcceptorEvent::None));
+        assert!(!acceptor.is_finished());
+
+        let resized = drive_confirm_active_and_finalization_from_sync(&mut acceptor);
+        assert_eq!(
+            (resized.desktop_width, resized.desktop_height),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn resize_finalization_accepts_batched_mcs_send_data() {
+        let (mut acceptor, _accepted, _credentials) = run_full_handshake(&[]);
+        acceptor.begin_resize(1920, 1080).unwrap();
+
+        let confirm = SendData {
+            initiator: USER_CHANNEL_ID,
+            channel_id: IO_CHANNEL_ID,
+            data: confirm_active_fixture(),
+            complete: true,
+        };
+        assert!(matches!(
+            acceptor
+                .step(&x224::wrap_data(&confirm.encode_request()))
+                .unwrap()
+                .event,
+            AcceptorEvent::None
+        ));
+
+        // mstsc often packs Synchronize + Cooperate + Request Control + FontList
+        // into a single X.224 Data TPDU. Losing FontList here used to leave the
+        // acceptor unfinished while the client already painted a blank canvas.
+        let mut mcs_payload = Vec::new();
+        for (pdu_type2, body) in [
+            (
+                ShareDataPduType::Synchronize,
+                SynchronizePdu {
+                    target_user: USER_CHANNEL_ID,
+                }
+                .encode_body(),
+            ),
+            (
+                ShareDataPduType::Control,
+                ControlPdu {
+                    action: ControlPdu::COOPERATE,
+                    grant_id: 0,
+                    control_id: 0,
+                }
+                .encode_body(),
+            ),
+            (
+                ShareDataPduType::Control,
+                ControlPdu {
+                    action: ControlPdu::REQUEST_CONTROL,
+                    grant_id: 0,
+                    control_id: 0,
+                }
+                .encode_body(),
+            ),
+            (
+                ShareDataPduType::FontList,
+                FontPdu::font_map_default().encode_body(),
+            ),
+        ] {
+            mcs_payload.extend(
+                SendData {
+                    initiator: USER_CHANNEL_ID,
+                    channel_id: IO_CHANNEL_ID,
+                    data: data_pdu_bytes(pdu_type2, body),
+                    complete: true,
+                }
+                .encode_request(),
+            );
+        }
+
+        let result = acceptor.step(&x224::wrap_data(&mcs_payload)).unwrap();
+        assert!(
+            matches!(result.event, AcceptorEvent::Accepted(_)),
+            "batched finalization must reach Accepted in one step"
+        );
+        assert!(acceptor.is_finished());
+    }
+
+    /// Like `drive_confirm_active_and_finalization`, but skips Confirm Active
+    /// (caller already sent it) and starts at Synchronize.
+    fn drive_confirm_active_and_finalization_from_sync(
+        acceptor: &mut Acceptor,
+    ) -> AcceptedConnection {
+        for (pdu_type2, body) in [
+            (
+                ShareDataPduType::Synchronize,
+                SynchronizePdu {
+                    target_user: USER_CHANNEL_ID,
+                }
+                .encode_body(),
+            ),
+            (
+                ShareDataPduType::Control,
+                ControlPdu {
+                    action: ControlPdu::COOPERATE,
+                    grant_id: 0,
+                    control_id: 0,
+                }
+                .encode_body(),
+            ),
+            (
+                ShareDataPduType::Control,
+                ControlPdu {
+                    action: ControlPdu::REQUEST_CONTROL,
+                    grant_id: 0,
+                    control_id: 0,
+                }
+                .encode_body(),
+            ),
+            (
+                ShareDataPduType::FontList,
+                FontPdu::font_map_default().encode_body(),
+            ),
+        ] {
+            let data_pdu = data_pdu_bytes(pdu_type2, body);
+            let send_data = SendData {
+                initiator: USER_CHANNEL_ID,
+                channel_id: IO_CHANNEL_ID,
+                data: data_pdu,
+                complete: true,
+            };
+            let result = acceptor
+                .step(&x224::wrap_data(&send_data.encode_request()))
+                .unwrap();
+            if let AcceptorEvent::Accepted(accepted) = result.event {
+                assert!(acceptor.is_finished());
+                return accepted;
+            }
+        }
+        panic!("finalization did not reach Accepted");
     }
 }
