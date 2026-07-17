@@ -23,7 +23,10 @@ pub fn write_fixed(out: &mut Vec<u8>, s: &str, byte_len: usize) {
 /// none) - works both for NUL-padded fixed fields and for
 /// length-includes-terminator fields (Client Info's clientAddress/clientDir).
 pub fn read_fixed(bytes: &[u8]) -> String {
-    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
     let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
     String::from_utf16_lossy(&units[..end])
 }
@@ -40,6 +43,9 @@ pub fn encode_units(s: &str) -> Vec<u8> {
 
 /// Inverse of [`encode_units`]: decodes exactly `bytes` with no NUL search.
 pub fn decode_units(bytes: &[u8]) -> String {
-    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
     String::from_utf16_lossy(&units)
 }

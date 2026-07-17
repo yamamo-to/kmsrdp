@@ -43,7 +43,10 @@ impl LocalAudioFactory {
 }
 
 impl SoundServerFactory for LocalAudioFactory {
-    fn build_backend(&self, sender: UnboundedSender<RdpsndServerMessage>) -> Box<dyn RdpsndServerHandler> {
+    fn build_backend(
+        &self,
+        sender: UnboundedSender<RdpsndServerMessage>,
+    ) -> Box<dyn RdpsndServerHandler> {
         Box::new(LocalAudioHandler {
             sender,
             formats: vec![pcm_format()],
@@ -96,7 +99,10 @@ fn run_capture(sender: UnboundedSender<RdpsndServerMessage>, child: Arc<Mutex<Op
         if stdout.read_exact(&mut buf).is_err() {
             break; // EOF/error - `parec` exited (killed by `stop()`, or itself failed).
         }
-        if sender.send(RdpsndServerMessage::Wave(buf.to_vec(), timestamp_ms)).is_err() {
+        if sender
+            .send(RdpsndServerMessage::Wave(buf.to_vec(), timestamp_ms))
+            .is_err()
+        {
             break; // server side gone.
         }
         timestamp_ms = timestamp_ms.wrapping_add(CHUNK_MS);

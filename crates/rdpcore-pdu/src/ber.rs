@@ -6,8 +6,8 @@
 //! Everything below Connect-Initial/Response (the domain PDUs, and GCC's own
 //! ConnectData wrapper) uses a different, PER-based encoding - see `per.rs`.
 
-use crate::cursor::{ReadCursor, WriteBuf};
 use crate::DecodeError;
+use crate::cursor::{ReadCursor, WriteBuf};
 
 pub const TAG_BOOLEAN: u8 = 0x01;
 pub const TAG_INTEGER: u8 = 0x02;
@@ -53,7 +53,10 @@ pub fn write_application_tag(out: &mut Vec<u8>, tag_number: u8, body_length: usi
     write_length(out, body_length);
 }
 
-pub fn read_application_tag(cursor: &mut ReadCursor<'_>, expected_tag_number: u8) -> Result<usize, DecodeError> {
+pub fn read_application_tag(
+    cursor: &mut ReadCursor<'_>,
+    expected_tag_number: u8,
+) -> Result<usize, DecodeError> {
     let marker = cursor.read_u8()?;
     if marker != 0x7F {
         return Err(DecodeError::InvalidValue {
@@ -161,7 +164,11 @@ pub fn read_octet_string<'a>(cursor: &mut ReadCursor<'a>) -> Result<&'a [u8], De
     Ok(cursor.read_slice(length)?)
 }
 
-fn expect_tag(cursor: &mut ReadCursor<'_>, expected: u8, field: &'static str) -> Result<(), DecodeError> {
+fn expect_tag(
+    cursor: &mut ReadCursor<'_>,
+    expected: u8,
+    field: &'static str,
+) -> Result<(), DecodeError> {
     let tag = cursor.read_u8()?;
     if tag != expected {
         return Err(DecodeError::InvalidValue {
@@ -178,11 +185,24 @@ mod tests {
 
     #[test]
     fn integer_round_trip_all_size_classes() {
-        for value in [0u32, 0x7F, 0x80, 0x7FFF, 0x8000, 0x007F_FFFF, 0x0080_0000, 0xFFFF_FFFF] {
+        for value in [
+            0u32,
+            0x7F,
+            0x80,
+            0x7FFF,
+            0x8000,
+            0x007F_FFFF,
+            0x0080_0000,
+            0xFFFF_FFFF,
+        ] {
             let mut buf = Vec::new();
             write_integer(&mut buf, value);
             let mut cursor = ReadCursor::new(&buf);
-            assert_eq!(read_integer(&mut cursor).unwrap(), value, "value {value:#x}");
+            assert_eq!(
+                read_integer(&mut cursor).unwrap(),
+                value,
+                "value {value:#x}"
+            );
         }
     }
 

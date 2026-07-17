@@ -12,8 +12,8 @@
 //! the one exception: they carry no channel ID at all (`cb_id` is unused,
 //! always encoded as 0).
 
-use rdpcore_pdu::cursor::{ReadCursor, WriteBuf};
 use rdpcore_pdu::DecodeError;
+use rdpcore_pdu::cursor::{ReadCursor, WriteBuf};
 
 const CMD_CREATE: u8 = 0x01;
 const CMD_DATA_FIRST: u8 = 0x02;
@@ -120,7 +120,9 @@ pub fn encode_channel_payload(channel_id: u32, payload: &[u8]) -> Vec<Vec<u8>> {
         return vec![encode_data(channel_id, payload)];
     }
     let mut chunks = payload.chunks(MAX_DATA_SIZE);
-    let first = chunks.next().expect("payload is non-empty since it exceeds MAX_DATA_SIZE");
+    let first = chunks
+        .next()
+        .expect("payload is non-empty since it exceeds MAX_DATA_SIZE");
     let mut frames = vec![encode_data_first(channel_id, payload.len() as u32, first)];
     frames.extend(chunks.map(|chunk| encode_data(channel_id, chunk)));
     frames
@@ -140,11 +142,22 @@ impl CreateResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientMessage {
-    CapabilityResponse { version: u16 },
+    CapabilityResponse {
+        version: u16,
+    },
     CreateResponse(CreateResponse),
-    Data { channel_id: u32, data: Vec<u8> },
-    DataFirst { channel_id: u32, total_length: u32, data: Vec<u8> },
-    Close { channel_id: u32 },
+    Data {
+        channel_id: u32,
+        data: Vec<u8>,
+    },
+    DataFirst {
+        channel_id: u32,
+        total_length: u32,
+        data: Vec<u8>,
+    },
+    Close {
+        channel_id: u32,
+    },
     Other,
 }
 
@@ -227,7 +240,9 @@ mod tests {
                 creation_status: 0
             })
         );
-        let ClientMessage::CreateResponse(cr) = decoded else { unreachable!() };
+        let ClientMessage::CreateResponse(cr) = decoded else {
+            unreachable!()
+        };
         assert!(cr.is_ok());
     }
 
@@ -237,7 +252,10 @@ mod tests {
         raw.write_u8(0x05 << 4);
         raw.write_u8(0);
         raw.write_u16_le(2);
-        assert_eq!(decode_client_message(&raw).unwrap(), ClientMessage::CapabilityResponse { version: 2 });
+        assert_eq!(
+            decode_client_message(&raw).unwrap(),
+            ClientMessage::CapabilityResponse { version: 2 }
+        );
     }
 
     #[test]
@@ -268,7 +286,12 @@ mod tests {
         let frames = encode_channel_payload(1, &payload);
         assert_eq!(frames.len(), 3);
 
-        let ClientMessage::DataFirst { channel_id, total_length, data } = decode_client_message(&frames[0]).unwrap() else {
+        let ClientMessage::DataFirst {
+            channel_id,
+            total_length,
+            data,
+        } = decode_client_message(&frames[0]).unwrap()
+        else {
             panic!("expected DataFirst");
         };
         assert_eq!(channel_id, 1);
@@ -289,9 +312,19 @@ mod tests {
     fn data_pdu_channel_id_sizes_selected_correctly() {
         for (channel_id, expected_selector) in [(5u32, 0u8), (1000, 1), (100_000, 2)] {
             let encoded = encode_data(channel_id, b"x");
-            assert_eq!(encoded[0] & 0x03, expected_selector, "channel_id {channel_id}");
+            assert_eq!(
+                encoded[0] & 0x03,
+                expected_selector,
+                "channel_id {channel_id}"
+            );
             let decoded = decode_client_message(&encoded).unwrap();
-            assert_eq!(decoded, ClientMessage::Data { channel_id, data: b"x".to_vec() });
+            assert_eq!(
+                decoded,
+                ClientMessage::Data {
+                    channel_id,
+                    data: b"x".to_vec()
+                }
+            );
         }
     }
 }

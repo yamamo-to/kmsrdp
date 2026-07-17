@@ -14,9 +14,9 @@
 //! neither encoded nor decoded - unrecognized incoming message types are
 //! decoded far enough to be safely skipped, never treated as an error.
 
+use rdpcore_pdu::DecodeError;
 use rdpcore_pdu::cursor::{ReadCursor, WriteBuf};
 use rdpcore_pdu::utf16;
-use rdpcore_pdu::DecodeError;
 
 pub const CB_MONITOR_READY: u16 = 0x0001;
 pub const CB_FORMAT_LIST: u16 = 0x0002;
@@ -97,7 +97,12 @@ pub fn encode_format_data_response_text(text: &str) -> Vec<u8> {
     body.write_u16_le(0); // trailing NUL terminator
 
     let mut out = Vec::with_capacity(body.len() + 8);
-    write_header(&mut out, CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, body.len());
+    write_header(
+        &mut out,
+        CB_FORMAT_DATA_RESPONSE,
+        CB_RESPONSE_OK,
+        body.len(),
+    );
     out.write_slice(&body);
     out
 }
@@ -155,7 +160,9 @@ pub fn decode_client_message(input: &[u8]) -> Result<ClientMessage, DecodeError>
             if msg_flags & CB_RESPONSE_FAIL != 0 {
                 Ok(ClientMessage::FormatDataResponse(Err(())))
             } else {
-                Ok(ClientMessage::FormatDataResponse(Ok(utf16::read_fixed(body))))
+                Ok(ClientMessage::FormatDataResponse(Ok(utf16::read_fixed(
+                    body,
+                ))))
             }
         }
         _ => Ok(ClientMessage::Other),
@@ -178,7 +185,10 @@ mod tests {
     fn format_data_response_text_round_trip() {
         let encoded = encode_format_data_response_text("hello");
         let decoded = decode_client_message(&encoded).unwrap();
-        assert_eq!(decoded, ClientMessage::FormatDataResponse(Ok("hello".to_owned())));
+        assert_eq!(
+            decoded,
+            ClientMessage::FormatDataResponse(Ok("hello".to_owned()))
+        );
     }
 
     #[test]
@@ -199,7 +209,10 @@ mod tests {
     fn format_list_response_is_recognized() {
         let mut out = Vec::new();
         write_header(&mut out, CB_FORMAT_LIST_RESPONSE, CB_RESPONSE_OK, 0);
-        assert_eq!(decode_client_message(&out).unwrap(), ClientMessage::FormatListResponse);
+        assert_eq!(
+            decode_client_message(&out).unwrap(),
+            ClientMessage::FormatListResponse
+        );
     }
 
     #[test]

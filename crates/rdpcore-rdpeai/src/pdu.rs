@@ -7,12 +7,13 @@
 //!
 //! Reference: FreeRDP's own server-side implementation
 //! (`channels/audin/server/audin.c`, `include/freerdp/channels/audin.h`)
-//! - no local IronRDP equivalent exists for this protocol, so this is the
+//!
+//! No local IronRDP equivalent exists for this protocol, so this is the
 //! one crate in this workspace verified against a different real
 //! implementation than the others.
 
-use rdpcore_pdu::cursor::{ReadCursor, WriteBuf};
 use rdpcore_pdu::DecodeError;
+use rdpcore_pdu::cursor::{ReadCursor, WriteBuf};
 pub use rdpcore_rdpsnd::pdu::AudioFormat;
 
 const MSG_SNDIN_VERSION: u8 = 0x01;
@@ -54,7 +55,11 @@ pub fn encode_formats(formats: &[AudioFormat]) -> Vec<u8> {
 /// `captureFormat` is always encoded without a WAVEFORMATEXTENSIBLE tail
 /// (`cbSize = 0`) - correct as long as it's PCM (`WAVE_FORMAT_PCM`, never
 /// `WAVE_FORMAT_EXTENSIBLE`), which is all this server ever offers.
-pub fn encode_open(frames_per_packet: u32, initial_format_index: u32, capture_format: &AudioFormat) -> Vec<u8> {
+pub fn encode_open(
+    frames_per_packet: u32,
+    initial_format_index: u32,
+    capture_format: &AudioFormat,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(9 + 18);
     out.write_u8(MSG_SNDIN_OPEN);
     out.write_u32_le(frames_per_packet);
@@ -85,7 +90,9 @@ pub fn decode_client_message(input: &[u8]) -> Result<ClientMessage, DecodeError>
         MSG_SNDIN_FORMATS => {
             let num_formats = cursor.read_u32_le()?;
             let _cb_size_formats_packet = cursor.read_u32_le()?;
-            let formats = (0..num_formats).map(|_| AudioFormat::decode(&mut cursor)).collect::<Result<_, _>>()?;
+            let formats = (0..num_formats)
+                .map(|_| AudioFormat::decode(&mut cursor))
+                .collect::<Result<_, _>>()?;
             Ok(ClientMessage::Formats { formats })
         }
         MSG_SNDIN_OPEN_REPLY => Ok(ClientMessage::OpenReply {
@@ -110,14 +117,23 @@ mod tests {
     fn version_round_trip() {
         let encoded = encode_version(VERSION_2);
         assert_eq!(encoded.len(), 5);
-        assert_eq!(decode_client_message(&encoded).unwrap(), ClientMessage::Version { version: VERSION_2 });
+        assert_eq!(
+            decode_client_message(&encoded).unwrap(),
+            ClientMessage::Version { version: VERSION_2 }
+        );
     }
 
     #[test]
     fn formats_round_trip() {
-        let formats = vec![AudioFormat::pcm(2, 44100, 16), AudioFormat::pcm(1, 16000, 16)];
+        let formats = vec![
+            AudioFormat::pcm(2, 44100, 16),
+            AudioFormat::pcm(1, 16000, 16),
+        ];
         let encoded = encode_formats(&formats);
-        assert_eq!(decode_client_message(&encoded).unwrap(), ClientMessage::Formats { formats });
+        assert_eq!(
+            decode_client_message(&encoded).unwrap(),
+            ClientMessage::Formats { formats }
+        );
     }
 
     #[test]
@@ -135,20 +151,31 @@ mod tests {
         let mut raw = Vec::new();
         raw.write_u8(MSG_SNDIN_OPEN_REPLY);
         raw.write_u32_le(0);
-        assert_eq!(decode_client_message(&raw).unwrap(), ClientMessage::OpenReply { result: 0 });
+        assert_eq!(
+            decode_client_message(&raw).unwrap(),
+            ClientMessage::OpenReply { result: 0 }
+        );
     }
 
     #[test]
     fn data_incoming_has_no_body() {
         let raw = vec![MSG_SNDIN_DATA_INCOMING];
-        assert_eq!(decode_client_message(&raw).unwrap(), ClientMessage::DataIncoming);
+        assert_eq!(
+            decode_client_message(&raw).unwrap(),
+            ClientMessage::DataIncoming
+        );
     }
 
     #[test]
     fn data_is_raw_bytes_to_end_of_message() {
         let mut raw = vec![MSG_SNDIN_DATA];
         raw.extend_from_slice(&[0xAB; 100]);
-        assert_eq!(decode_client_message(&raw).unwrap(), ClientMessage::Data { data: vec![0xAB; 100] });
+        assert_eq!(
+            decode_client_message(&raw).unwrap(),
+            ClientMessage::Data {
+                data: vec![0xAB; 100]
+            }
+        );
     }
 
     #[test]
@@ -156,7 +183,10 @@ mod tests {
         let mut raw = Vec::new();
         raw.write_u8(MSG_SNDIN_FORMATCHANGE);
         raw.write_u32_le(3);
-        assert_eq!(decode_client_message(&raw).unwrap(), ClientMessage::FormatChange { new_format: 3 });
+        assert_eq!(
+            decode_client_message(&raw).unwrap(),
+            ClientMessage::FormatChange { new_format: 3 }
+        );
     }
 
     #[test]

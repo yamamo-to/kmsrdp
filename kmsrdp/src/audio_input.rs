@@ -157,10 +157,10 @@ impl AudioInputBackend for VirtualMicBackend {
         if self.tx.is_none() {
             self.tx = spawn_writer(format);
         }
-        if let Some(tx) = &self.tx {
-            if tx.send(data.to_vec()).is_err() {
-                self.tx = None; // writer thread/child died - respawn on next chunk
-            }
+        if let Some(tx) = &self.tx
+            && tx.send(data.to_vec()).is_err()
+        {
+            self.tx = None; // writer thread/child died - respawn on next chunk
         }
     }
 }

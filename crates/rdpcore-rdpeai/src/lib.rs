@@ -40,7 +40,11 @@ fn formats_compatible(a: &AudioFormat, b: &AudioFormat) -> bool {
 fn negotiate(server_formats: &[AudioFormat], client_formats: &[AudioFormat]) -> Option<u32> {
     server_formats
         .iter()
-        .position(|server_format| client_formats.iter().any(|client_format| formats_compatible(server_format, client_format)))
+        .position(|server_format| {
+            client_formats
+                .iter()
+                .any(|client_format| formats_compatible(server_format, client_format))
+        })
         .map(|index| index as u32)
 }
 
@@ -101,17 +105,19 @@ impl DvcHandler for AudioInputHandler {
                 self.state = State::WaitFormats;
                 vec![pdu::encode_formats(&self.server_formats)]
             }
-            (pdu::ClientMessage::Formats { formats }, State::WaitFormats) => match negotiate(&self.server_formats, &formats) {
-                Some(index) => {
-                    let format = self.server_formats[index as usize].clone();
-                    self.negotiated = Some(format.clone());
-                    self.state = State::WaitOpenReply;
-                    vec![pdu::encode_open(self.frames_per_packet, index, &format)]
+            (pdu::ClientMessage::Formats { formats }, State::WaitFormats) => {
+                match negotiate(&self.server_formats, &formats) {
+                    Some(index) => {
+                        let format = self.server_formats[index as usize].clone();
+                        self.negotiated = Some(format.clone());
+                        self.state = State::WaitOpenReply;
+                        vec![pdu::encode_open(self.frames_per_packet, index, &format)]
+                    }
+                    // No compatible format - nothing more to do; the client
+                    // never receives an Open PDU and stays idle on this channel.
+                    None => Vec::new(),
                 }
-                // No compatible format - nothing more to do; the client
-                // never receives an Open PDU and stays idle on this channel.
-                None => Vec::new(),
-            },
+            }
             (pdu::ClientMessage::OpenReply { .. }, State::WaitOpenReply) => {
                 self.state = State::Streaming;
                 Vec::new()
@@ -191,7 +197,10 @@ mod tests {
 
     #[test]
     fn negotiate_picks_first_server_format_with_any_client_match() {
-        let server = vec![AudioFormat::pcm(2, 48_000, 16), AudioFormat::pcm(1, 16_000, 16)];
+        let server = vec![
+            AudioFormat::pcm(2, 48_000, 16),
+            AudioFormat::pcm(1, 16_000, 16),
+        ];
         let client = vec![AudioFormat::pcm(1, 16_000, 16)];
         assert_eq!(negotiate(&server, &client), Some(1));
     }

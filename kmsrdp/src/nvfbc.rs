@@ -25,7 +25,7 @@
 //! hard-links `-lnvidia-fbc` - that would break every build without the
 //! NVIDIA driver installed, including plain CI containers.
 
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 use std::io;
 use std::sync::OnceLock;
 
@@ -240,7 +240,12 @@ impl NvfbcCapturer {
             e_capture_type: NVFBC_CAPTURE_TO_SYS,
             e_tracking_type: NVFBC_TRACKING_DEFAULT,
             dw_output_id: 0,
-            capture_box: Box_ { x: 0, y: 0, w: 0, h: 0 },
+            capture_box: Box_ {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
             frame_size: Size { w: 0, h: 0 },
             // The RDP path renders its own client-side cursor from pointer
             // PDUs (same as the DRM primary-plane path, which never sees a
@@ -292,10 +297,7 @@ impl NvfbcCapturer {
         // during setup/grab, valid for `info.dw_byte_size` bytes until the
         // next grab call.
         let data = unsafe {
-            std::slice::from_raw_parts(
-                (*self.buffer_ptr) as *const u8,
-                info.dw_byte_size as usize,
-            )
+            std::slice::from_raw_parts((*self.buffer_ptr) as *const u8, info.dw_byte_size as usize)
         }
         .to_vec();
 
@@ -325,7 +327,8 @@ type GrabReply = io::Result<(u32, u32, Vec<u8>)>;
 // caller is a tokio blocking task, which can land on a different pool
 // thread every time, so the whole capturer instead lives on one dedicated
 // thread we spawn ourselves, and every request is proxied to it.
-static WORKER: OnceLock<std::sync::mpsc::Sender<std::sync::mpsc::Sender<GrabReply>>> = OnceLock::new();
+static WORKER: OnceLock<std::sync::mpsc::Sender<std::sync::mpsc::Sender<GrabReply>>> =
+    OnceLock::new();
 
 fn worker() -> &'static std::sync::mpsc::Sender<std::sync::mpsc::Sender<GrabReply>> {
     WORKER.get_or_init(|| {

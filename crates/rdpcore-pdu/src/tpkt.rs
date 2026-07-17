@@ -7,8 +7,8 @@
 //! bytes 3-4: total packet length, big-endian, header included
 //! ```
 
-use crate::cursor::{ReadCursor, WriteBuf};
 use crate::DecodeError;
+use crate::cursor::{ReadCursor, WriteBuf};
 
 pub const VERSION: u8 = 3;
 pub const HEADER_SIZE: usize = 4;
@@ -27,7 +27,8 @@ impl TpktHeader {
     }
 
     pub fn decode(src: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
-        src.ensure(HEADER_SIZE).map_err(DecodeError::NotEnoughBytes)?;
+        src.ensure(HEADER_SIZE)
+            .map_err(DecodeError::NotEnoughBytes)?;
         let version = src.read_u8().map_err(DecodeError::NotEnoughBytes)?;
         if version != VERSION {
             return Err(DecodeError::InvalidValue {
@@ -64,7 +65,10 @@ mod tests {
         let mut cursor = ReadCursor::new(&buf);
         assert!(matches!(
             TpktHeader::decode(&mut cursor),
-            Err(DecodeError::InvalidValue { field: "tpkt.version", .. })
+            Err(DecodeError::InvalidValue {
+                field: "tpkt.version",
+                ..
+            })
         ));
     }
 
@@ -72,6 +76,9 @@ mod tests {
     fn rejects_truncated_header() {
         let buf = [0x03, 0x00];
         let mut cursor = ReadCursor::new(&buf);
-        assert!(matches!(TpktHeader::decode(&mut cursor), Err(DecodeError::NotEnoughBytes(_))));
+        assert!(matches!(
+            TpktHeader::decode(&mut cursor),
+            Err(DecodeError::NotEnoughBytes(_))
+        ));
     }
 }

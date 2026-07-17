@@ -6,6 +6,7 @@
 //! (audio) and `cliprdr` (clipboard) static channels when a client
 //! negotiates them and a backend factory is configured. All outgoing bytes
 //! - bitmap fragments, audio, clipboard data - flow through
+//!
 //! `rdpcore-transport`'s priority scheduler rather than being written
 //! directly, so a bulk channel (graphics) can't starve a latency-sensitive
 //! one (audio).
@@ -18,7 +19,10 @@ mod server;
 mod transport;
 
 pub use credentials::{CredentialValidator, Credentials, ExactMatchCredentialValidator};
-pub use display::{BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay, RdpServerDisplayUpdates};
+pub use display::{
+    BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay,
+    RdpServerDisplayUpdates,
+};
 pub use input::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 pub use server::{RdpServer, RdpServerBuilder};
 

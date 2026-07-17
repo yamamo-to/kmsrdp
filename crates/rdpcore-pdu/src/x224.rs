@@ -6,10 +6,10 @@
 //! this module only covers what's needed to complete the initial X.224
 //! exchange.
 
+use crate::DecodeError;
 use crate::cursor::{ReadCursor, WriteBuf};
 use crate::tpdu::{TpduCode, TpduHeader};
 use crate::tpkt::{self, TpktHeader};
-use crate::DecodeError;
 
 const COOKIE_PREFIX: &str = "Cookie: mstshash=";
 const CRLF: u16 = 0x0A0D; // written little-endian -> bytes [0x0D, 0x0A] = "\r\n"
@@ -111,7 +111,11 @@ impl ConnectionRequest {
         let _length = cursor.read_u16_le()?;
         let protocol = SecurityProtocol(cursor.read_u32_le()?);
 
-        Ok(Self { cookie, flags, protocol })
+        Ok(Self {
+            cookie,
+            flags,
+            protocol,
+        })
     }
 }
 
@@ -120,8 +124,13 @@ impl ConnectionRequest {
 /// (`RDP_NEG_FAILURE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionConfirm {
-    Response { flags: ResponseFlags, protocol: SecurityProtocol },
-    Failure { code: FailureCode },
+    Response {
+        flags: ResponseFlags,
+        protocol: SecurityProtocol,
+    },
+    Failure {
+        code: FailureCode,
+    },
 }
 
 impl ConnectionConfirm {
@@ -353,7 +362,12 @@ mod tests {
         for payload in [vec![], vec![0xAB; 10], vec![0xCD; 300], vec![0xEF; 5000]] {
             let wrapped = wrap_data(&payload);
             // byte 4 is LI (after the 4-byte TPKT header) - must always be 2.
-            assert_eq!(wrapped[4], 2, "LI must stay fixed at 2 for payload len {}", payload.len());
+            assert_eq!(
+                wrapped[4],
+                2,
+                "LI must stay fixed at 2 for payload len {}",
+                payload.len()
+            );
             assert_eq!(wrapped[5], 0xF0); // code: DATA
             assert_eq!(wrapped.len(), 4 + 3 + payload.len());
 

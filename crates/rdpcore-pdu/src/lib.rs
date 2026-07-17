@@ -30,14 +30,19 @@ use cursor::NotEnoughBytes;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
     NotEnoughBytes(NotEnoughBytes),
-    InvalidValue { field: &'static str, reason: &'static str },
+    InvalidValue {
+        field: &'static str,
+        reason: &'static str,
+    },
 }
 
 impl core::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NotEnoughBytes(e) => write!(f, "not enough bytes: {e}"),
-            Self::InvalidValue { field, reason } => write!(f, "invalid value for {field}: {reason}"),
+            Self::InvalidValue { field, reason } => {
+                write!(f, "invalid value for {field}: {reason}")
+            }
         }
     }
 }

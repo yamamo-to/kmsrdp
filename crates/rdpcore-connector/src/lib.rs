@@ -13,24 +13,28 @@ mod error;
 
 pub use error::ConnectorError;
 
-use rdpcore_pdu::cursor::ReadCursor;
 use rdpcore_pdu::capability_sets::{
-    BitmapCapability, BitmapCodecsCapability, ConfirmActive, DeactivateAllPdu, DemandActive, GeneralCapability,
-    InputCapability, MultiFragmentUpdateCapability, OrderCapability, PointerCapability, ServerCapabilities,
-    VirtualChannelCapability,
+    BitmapCapability, BitmapCodecsCapability, ConfirmActive, DeactivateAllPdu, DemandActive,
+    GeneralCapability, InputCapability, MultiFragmentUpdateCapability, OrderCapability,
+    PointerCapability, ServerCapabilities, VirtualChannelCapability,
 };
 use rdpcore_pdu::client_info::ClientInfoPdu;
-use rdpcore_pdu::finalization::{ControlPdu, DataPdu, FontPdu, ShareDataPduType, SynchronizePdu, STREAM_UNDEFINED};
+use rdpcore_pdu::cursor::ReadCursor;
+use rdpcore_pdu::finalization::{
+    ControlPdu, DataPdu, FontPdu, STREAM_UNDEFINED, ShareDataPduType, SynchronizePdu,
+};
 use rdpcore_pdu::gcc::{
-    ClientGccBlocks, ConferenceCreateRequest, ConferenceCreateResponse, ServerCoreData, ServerGccBlocks,
-    ServerMessageChannelData, ServerNetworkData, ServerSecurityData,
+    ClientGccBlocks, ConferenceCreateRequest, ConferenceCreateResponse, ServerCoreData,
+    ServerGccBlocks, ServerMessageChannelData, ServerNetworkData, ServerSecurityData,
 };
 use rdpcore_pdu::licensing;
 use rdpcore_pdu::mcs::{
-    AttachUserConfirm, AttachUserRequest, ChannelJoinConfirm, ChannelJoinRequest, ConnectInitial, ConnectResponse,
-    DomainMcsPdu, DomainParameters, ErectDomainRequest, SendData, BASE_CHANNEL_ID,
+    AttachUserConfirm, AttachUserRequest, BASE_CHANNEL_ID, ChannelJoinConfirm, ChannelJoinRequest,
+    ConnectInitial, ConnectResponse, DomainMcsPdu, DomainParameters, ErectDomainRequest, SendData,
 };
-use rdpcore_pdu::x224::{self, ConnectionConfirm, ConnectionRequest, FailureCode, ResponseFlags, SecurityProtocol};
+use rdpcore_pdu::x224::{
+    self, ConnectionConfirm, ConnectionRequest, FailureCode, ResponseFlags, SecurityProtocol,
+};
 
 /// MCS user (initiator) channel id - fixed since this server design is one
 /// connection (one `Acceptor`) per TCP/TLS stream, so there's no risk of
@@ -205,7 +209,11 @@ impl Acceptor {
     /// must keep calling [`Acceptor::step`] with the client's subsequent
     /// bytes (Confirm Active, then Synchronize/Control/FontList, exactly
     /// like the initial handshake) until it reports `Accepted` again.
-    pub fn begin_resize(&mut self, desktop_width: u16, desktop_height: u16) -> Result<Vec<u8>, ConnectorError> {
+    pub fn begin_resize(
+        &mut self,
+        desktop_width: u16,
+        desktop_height: u16,
+    ) -> Result<Vec<u8>, ConnectorError> {
         if !matches!(self.state, State::Accepted) {
             return Err(ConnectorError::NotReady);
         }
@@ -243,7 +251,9 @@ impl Acceptor {
     pub fn step(&mut self, input: &[u8]) -> Result<StepResult, ConnectorError> {
         if matches!(
             self.state,
-            State::WaitErectDomainRequest | State::WaitAttachUserRequest | State::WaitChannelJoinRequest { .. }
+            State::WaitErectDomainRequest
+                | State::WaitAttachUserRequest
+                | State::WaitChannelJoinRequest { .. }
         ) {
             return self.step_mcs_domain_pdus(input);
         }
@@ -256,7 +266,9 @@ impl Acceptor {
             State::WaitConfirmActive => self.on_confirm_active(input),
             State::WaitFinalization(progress) => self.on_finalization(input, progress),
             State::Accepted | State::Rejected => Err(ConnectorError::AlreadyFinished),
-            State::WaitErectDomainRequest | State::WaitAttachUserRequest | State::WaitChannelJoinRequest { .. } => {
+            State::WaitErectDomainRequest
+            | State::WaitAttachUserRequest
+            | State::WaitChannelJoinRequest { .. } => {
                 unreachable!("handled above")
             }
         }
@@ -272,20 +284,24 @@ impl Acceptor {
         let mut event = AcceptorEvent::None;
 
         while cursor.remaining() > 0 {
-            if let Some(pdu) = Self::peek_domain_pdu(&cursor) {
-                if pdu == DomainMcsPdu::DisconnectProviderUltimatum {
-                    self.state = State::Rejected;
-                    return Err(ConnectorError::Decode(rdpcore_pdu::DecodeError::InvalidValue {
+            if let Some(pdu) = Self::peek_domain_pdu(&cursor)
+                && pdu == DomainMcsPdu::DisconnectProviderUltimatum
+            {
+                self.state = State::Rejected;
+                return Err(ConnectorError::Decode(
+                    rdpcore_pdu::DecodeError::InvalidValue {
                         field: "mcs.domain_pdu",
                         reason: "client disconnected during MCS domain setup",
-                    }));
-                }
+                    },
+                ));
             }
 
             let result = match core::mem::replace(&mut self.state, State::Rejected) {
                 State::WaitErectDomainRequest => self.handle_erect_domain_request(&mut cursor)?,
                 State::WaitAttachUserRequest => self.handle_attach_user_request(&mut cursor)?,
-                State::WaitChannelJoinRequest { remaining } => self.handle_channel_join_request(&mut cursor, remaining)?,
+                State::WaitChannelJoinRequest { remaining } => {
+                    self.handle_channel_join_request(&mut cursor, remaining)?
+                }
                 other => {
                     self.state = other;
                     return Err(ConnectorError::NotReady);
@@ -348,9 +364,10 @@ impl Acceptor {
             .map(|i| IO_CHANNEL_ID + 1 + i as u16)
             .collect();
 
-        let message_channel_id = client_blocks.message_channel.as_ref().map(|_| {
-            IO_CHANNEL_ID + 1 + self.static_channel_names.len() as u16
-        });
+        let message_channel_id = client_blocks
+            .message_channel
+            .as_ref()
+            .map(|_| IO_CHANNEL_ID + 1 + self.static_channel_names.len() as u16);
         self.message_channel_id = message_channel_id;
 
         let server_blocks = ServerGccBlocks {
@@ -364,7 +381,8 @@ impl Acceptor {
                 channel_ids: static_channel_ids,
             },
             security: ServerSecurityData,
-            message_channel: message_channel_id.map(|mcs_channel_id| ServerMessageChannelData { mcs_channel_id }),
+            message_channel: message_channel_id
+                .map(|mcs_channel_id| ServerMessageChannelData { mcs_channel_id }),
         };
         let response = ConferenceCreateResponse {
             node_id: USER_CHANNEL_ID,
@@ -377,17 +395,27 @@ impl Acceptor {
         };
 
         self.state = State::WaitErectDomainRequest;
-        Ok(StepResult::just(x224::wrap_data(&connect_response.encode())))
+        Ok(StepResult::just(x224::wrap_data(
+            &connect_response.encode(),
+        )))
     }
 
-    fn handle_erect_domain_request(&mut self, cursor: &mut ReadCursor<'_>) -> Result<StepResult, ConnectorError> {
-        let _request = ErectDomainRequest::decode_from_cursor(cursor).map_err(ConnectorError::from)?;
+    fn handle_erect_domain_request(
+        &mut self,
+        cursor: &mut ReadCursor<'_>,
+    ) -> Result<StepResult, ConnectorError> {
+        let _request =
+            ErectDomainRequest::decode_from_cursor(cursor).map_err(ConnectorError::from)?;
         self.state = State::WaitAttachUserRequest;
         Ok(StepResult::just(Vec::new()))
     }
 
-    fn handle_attach_user_request(&mut self, cursor: &mut ReadCursor<'_>) -> Result<StepResult, ConnectorError> {
-        let _request = AttachUserRequest::decode_from_cursor(cursor).map_err(ConnectorError::from)?;
+    fn handle_attach_user_request(
+        &mut self,
+        cursor: &mut ReadCursor<'_>,
+    ) -> Result<StepResult, ConnectorError> {
+        let _request =
+            AttachUserRequest::decode_from_cursor(cursor).map_err(ConnectorError::from)?;
         let confirm = AttachUserConfirm {
             result: 0,
             initiator: USER_CHANNEL_ID,
@@ -405,7 +433,8 @@ impl Acceptor {
         cursor: &mut ReadCursor<'_>,
         remaining: u32,
     ) -> Result<StepResult, ConnectorError> {
-        let request = ChannelJoinRequest::decode_from_cursor(cursor).map_err(ConnectorError::from)?;
+        let request =
+            ChannelJoinRequest::decode_from_cursor(cursor).map_err(ConnectorError::from)?;
         let confirm = ChannelJoinConfirm {
             result: 0,
             initiator: request.initiator,
@@ -536,7 +565,11 @@ impl Acceptor {
         Ok(StepResult::just(response))
     }
 
-    fn on_finalization(&mut self, input: &[u8], mut progress: FinalizationProgress) -> Result<StepResult, ConnectorError> {
+    fn on_finalization(
+        &mut self,
+        input: &[u8],
+        mut progress: FinalizationProgress,
+    ) -> Result<StepResult, ConnectorError> {
         let payload = x224::unwrap_data(input)?;
         let send_data = SendData::decode_request(payload)?;
         let data_pdu = DataPdu::decode(&send_data.data)?;
@@ -601,10 +634,10 @@ fn try_decode_confirm_active(data: &[u8]) -> Result<ConfirmActive, rdpcore_pdu::
     match ConfirmActive::decode(data) {
         Ok(c) => Ok(c),
         Err(first) => {
-            if data.len() >= 14 {
-                if let Ok(c) = ConfirmActive::decode(&data[4..]) {
-                    return Ok(c);
-                }
+            if data.len() >= 14
+                && let Ok(c) = ConfirmActive::decode(&data[4..])
+            {
+                return Ok(c);
             }
             Err(first)
         }
@@ -646,7 +679,10 @@ fn server_granted_control_pdu() -> Vec<u8> {
 }
 
 fn server_font_map_pdu() -> Vec<u8> {
-    data_pdu_bytes(ShareDataPduType::FontMap, FontPdu::font_map_default().encode_body())
+    data_pdu_bytes(
+        ShareDataPduType::FontMap,
+        FontPdu::font_map_default().encode_body(),
+    )
 }
 
 fn data_pdu_bytes(pdu_type2: ShareDataPduType, body: Vec<u8>) -> Vec<u8> {
@@ -663,10 +699,15 @@ fn data_pdu_bytes(pdu_type2: ShareDataPduType, body: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rdpcore_pdu::gcc::{ChannelDef, ClientCoreData, ClientNetworkData, ClientSecurityData, CS_MCS_MSGCHANNEL};
     use rdpcore_pdu::cursor::WriteBuf;
+    use rdpcore_pdu::gcc::{
+        CS_MCS_MSGCHANNEL, ChannelDef, ClientCoreData, ClientNetworkData, ClientSecurityData,
+    };
 
-    fn client_connect_initial(static_channel_names: &[&str], with_message_channel: bool) -> Vec<u8> {
+    fn client_connect_initial(
+        static_channel_names: &[&str],
+        with_message_channel: bool,
+    ) -> Vec<u8> {
         let client_blocks = ClientGccBlocks {
             core: ClientCoreData {
                 version: 0x0008_0004,
@@ -702,9 +743,7 @@ mod tests {
             client_gcc_blocks.write_u16_le(8); // 4-byte header + 4-byte flags body
             client_gcc_blocks.write_u32_le(0xC000_0000);
         }
-        let request = ConferenceCreateRequest {
-            client_gcc_blocks,
-        };
+        let request = ConferenceCreateRequest { client_gcc_blocks };
         let connect_initial = ConnectInitial {
             target_parameters: DomainParameters::target(),
             min_parameters: DomainParameters::min(),
@@ -717,7 +756,9 @@ mod tests {
     /// Drives an `Acceptor` all the way to `Accepted`, standing in for a
     /// real client's byte stream so the whole handshake can be tested
     /// without a socket.
-    fn run_full_handshake(static_channel_names: &[&str]) -> (Acceptor, AcceptedConnection, ClientCredentials) {
+    fn run_full_handshake(
+        static_channel_names: &[&str],
+    ) -> (Acceptor, AcceptedConnection, ClientCredentials) {
         run_full_handshake_inner(static_channel_names, false)
     }
 
@@ -735,15 +776,28 @@ mod tests {
         let result = acceptor.step(&request.encode()).unwrap();
         assert_eq!(result.event, AcceptorEvent::TlsUpgrade);
 
-        let result = acceptor.step(&client_connect_initial(static_channel_names, with_message_channel)).unwrap();
-        assert!(matches!(result.event, AcceptorEvent::None));
-
         let result = acceptor
-            .step(&x224::wrap_data(&ErectDomainRequest { sub_height: 0, sub_interval: 0 }.encode()))
+            .step(&client_connect_initial(
+                static_channel_names,
+                with_message_channel,
+            ))
             .unwrap();
         assert!(matches!(result.event, AcceptorEvent::None));
 
-        let result = acceptor.step(&x224::wrap_data(&AttachUserRequest.encode())).unwrap();
+        let result = acceptor
+            .step(&x224::wrap_data(
+                &ErectDomainRequest {
+                    sub_height: 0,
+                    sub_interval: 0,
+                }
+                .encode(),
+            ))
+            .unwrap();
+        assert!(matches!(result.event, AcceptorEvent::None));
+
+        let result = acceptor
+            .step(&x224::wrap_data(&AttachUserRequest.encode()))
+            .unwrap();
         assert!(matches!(result.event, AcceptorEvent::None));
 
         let mut channel_ids = vec![USER_CHANNEL_ID, IO_CHANNEL_ID];
@@ -774,7 +828,9 @@ mod tests {
             data: client_info_pdu.encode(),
             complete: true,
         };
-        let result = acceptor.step(&x224::wrap_data(&send_data.encode_request())).unwrap();
+        let result = acceptor
+            .step(&x224::wrap_data(&send_data.encode_request()))
+            .unwrap();
         let AcceptorEvent::ClientInfoReceived(credentials) = result.event else {
             panic!("expected ClientInfoReceived, got {:?}", result.event);
         };
@@ -796,9 +852,14 @@ mod tests {
             data: confirm_active_fixture(),
             complete: true,
         };
-        let result = acceptor.step(&x224::wrap_data(&send_data.encode_request())).unwrap();
+        let result = acceptor
+            .step(&x224::wrap_data(&send_data.encode_request()))
+            .unwrap();
         assert!(matches!(result.event, AcceptorEvent::None));
-        assert!(!result.response.is_empty(), "server must answer Confirm Active with Synchronize + Cooperate");
+        assert!(
+            !result.response.is_empty(),
+            "server must answer Confirm Active with Synchronize + Cooperate"
+        );
 
         for (pdu_type2, body) in [
             (
@@ -826,7 +887,10 @@ mod tests {
                 }
                 .encode_body(),
             ),
-            (ShareDataPduType::FontList, FontPdu::font_map_default().encode_body()),
+            (
+                ShareDataPduType::FontList,
+                FontPdu::font_map_default().encode_body(),
+            ),
         ] {
             let data_pdu = data_pdu_bytes(pdu_type2, body);
             let send_data = SendData {
@@ -835,7 +899,9 @@ mod tests {
                 data: data_pdu,
                 complete: true,
             };
-            let result = acceptor.step(&x224::wrap_data(&send_data.encode_request())).unwrap();
+            let result = acceptor
+                .step(&x224::wrap_data(&send_data.encode_request()))
+                .unwrap();
             if let AcceptorEvent::Accepted(accepted) = result.event {
                 assert!(acceptor.is_finished());
                 return accepted;
@@ -871,7 +937,10 @@ mod tests {
         let mut payload = vec![(10 << 2) | 2];
         payload.extend_from_slice(&[0x00, 0x00]);
         let mut cursor = ReadCursor::new(&payload);
-        assert_eq!(AttachUserRequest::decode_from_cursor(&mut cursor).unwrap(), AttachUserRequest);
+        assert_eq!(
+            AttachUserRequest::decode_from_cursor(&mut cursor).unwrap(),
+            AttachUserRequest
+        );
         assert_eq!(cursor.remaining(), 0);
     }
 
@@ -901,7 +970,10 @@ mod tests {
         );
 
         let result = acceptor.step(&x224::wrap_data(&mcs_payload)).unwrap();
-        assert!(!result.response.is_empty(), "attach user + first join must be answered");
+        assert!(
+            !result.response.is_empty(),
+            "attach user + first join must be answered"
+        );
         assert!(matches!(result.event, AcceptorEvent::None));
     }
 
@@ -929,7 +1001,10 @@ mod tests {
         let (_acceptor, accepted, _credentials) = run_full_handshake(&["cliprdr", "rdpsnd"]);
         assert_eq!(
             accepted.static_channels,
-            vec![("cliprdr".to_owned(), IO_CHANNEL_ID + 1), ("rdpsnd".to_owned(), IO_CHANNEL_ID + 2)]
+            vec![
+                ("cliprdr".to_owned(), IO_CHANNEL_ID + 1),
+                ("rdpsnd".to_owned(), IO_CHANNEL_ID + 2)
+            ]
         );
     }
 
@@ -957,21 +1032,36 @@ mod tests {
     #[test]
     fn begin_resize_round_trips_to_accepted_with_new_dimensions() {
         let (mut acceptor, first_accepted, _credentials) = run_full_handshake(&[]);
-        assert_eq!((first_accepted.desktop_width, first_accepted.desktop_height), (1024, 768));
+        assert_eq!(
+            (first_accepted.desktop_width, first_accepted.desktop_height),
+            (1024, 768)
+        );
 
         let response = acceptor.begin_resize(1920, 1080).unwrap();
         assert!(!response.is_empty());
-        assert!(!acceptor.is_finished(), "begin_resize must reopen the connection sequence");
+        assert!(
+            !acceptor.is_finished(),
+            "begin_resize must reopen the connection sequence"
+        );
 
         let resized = drive_confirm_active_and_finalization(&mut acceptor);
-        assert_eq!((resized.desktop_width, resized.desktop_height), (1920, 1080));
-        assert_eq!(resized.share_id, first_accepted.share_id, "share_id doesn't change across a resize");
+        assert_eq!(
+            (resized.desktop_width, resized.desktop_height),
+            (1920, 1080)
+        );
+        assert_eq!(
+            resized.share_id, first_accepted.share_id,
+            "share_id doesn't change across a resize"
+        );
         assert!(acceptor.is_finished());
     }
 
     #[test]
     fn begin_resize_before_accepted_is_rejected() {
         let mut acceptor = Acceptor::new(1024, 768);
-        assert!(matches!(acceptor.begin_resize(1920, 1080), Err(ConnectorError::NotReady)));
+        assert!(matches!(
+            acceptor.begin_resize(1920, 1080),
+            Err(ConnectorError::NotReady)
+        ));
     }
 }

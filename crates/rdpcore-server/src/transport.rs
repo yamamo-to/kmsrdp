@@ -26,7 +26,10 @@ pub async fn read_tpkt_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::R
 /// byte hasn't been read yet; see [`read_steady_state_frame`] for the
 /// steady-state case, where the header byte must be peeked first to tell
 /// this framing apart from TPKT.
-async fn read_fastpath_frame_after<R: AsyncRead + Unpin>(reader: &mut R, header_byte: u8) -> std::io::Result<Vec<u8>> {
+async fn read_fastpath_frame_after<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    header_byte: u8,
+) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![header_byte, 0u8];
     reader.read_exact(&mut buf[1..2]).await?;
 
@@ -75,12 +78,18 @@ pub enum SteadyStateFrame {
     SlowPath(Vec<u8>),
 }
 
-pub async fn read_steady_state_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<SteadyStateFrame> {
+pub async fn read_steady_state_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<SteadyStateFrame> {
     let mut header_byte = [0u8; 1];
     reader.read_exact(&mut header_byte).await?;
     if header_byte[0] == 0x03 {
-        Ok(SteadyStateFrame::SlowPath(read_tpkt_frame_after(reader).await?))
+        Ok(SteadyStateFrame::SlowPath(
+            read_tpkt_frame_after(reader).await?,
+        ))
     } else {
-        Ok(SteadyStateFrame::FastPathInput(read_fastpath_frame_after(reader, header_byte[0]).await?))
+        Ok(SteadyStateFrame::FastPathInput(
+            read_fastpath_frame_after(reader, header_byte[0]).await?,
+        ))
     }
 }

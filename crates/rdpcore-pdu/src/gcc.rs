@@ -13,7 +13,7 @@
 
 use crate::cursor::{ReadCursor, WriteBuf};
 use crate::utf16::{read_fixed as read_utf16_fixed, write_fixed as write_utf16_fixed};
-use crate::{per, DecodeError};
+use crate::{DecodeError, per};
 
 const GCC_CONFERENCE_OBJECT_ID: [u8; 6] = [0, 0, 20, 124, 0, 1];
 const CLIENT_TO_SERVER_H221: &[u8; 4] = b"Duca";
@@ -204,7 +204,9 @@ impl ClientNetworkData {
 
     fn decode(cursor: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
         let count = (cursor.read_u32_le()? as usize).min(CHANNELS_MAX);
-        let channels = (0..count).map(|_| ChannelDef::decode(cursor)).collect::<Result<_, _>>()?;
+        let channels = (0..count)
+            .map(|_| ChannelDef::decode(cursor))
+            .collect::<Result<_, _>>()?;
         Ok(Self { channels })
     }
 }
@@ -284,7 +286,9 @@ impl ClientGccBlocks {
                 CS_SECURITY => security = Some(ClientSecurityData::decode(&mut body_cursor)?),
                 CS_NET => network = Some(ClientNetworkData::decode(&mut body_cursor)?),
                 CS_CLUSTER => cluster = Some(ClientClusterData::decode(&mut body_cursor)?),
-                CS_MCS_MSGCHANNEL => message_channel = Some(ClientMessageChannelData::decode(&mut body_cursor)?),
+                CS_MCS_MSGCHANNEL => {
+                    message_channel = Some(ClientMessageChannelData::decode(&mut body_cursor)?)
+                }
                 CS_MONITOR => {} // client-only; no server response block exists.
                 _ => {}
             }
@@ -424,11 +428,16 @@ impl ServerNetworkData {
     fn decode(cursor: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
         let io_channel_id = cursor.read_u16_le()?;
         let count = cursor.read_u16_le()? as usize;
-        let channel_ids = (0..count).map(|_| cursor.read_u16_le()).collect::<Result<_, _>>()?;
+        let channel_ids = (0..count)
+            .map(|_| cursor.read_u16_le())
+            .collect::<Result<_, _>>()?;
         if count % 2 == 1 && cursor.remaining() >= 2 {
             cursor.advance(2); // padding
         }
-        Ok(Self { io_channel_id, channel_ids })
+        Ok(Self {
+            io_channel_id,
+            channel_ids,
+        })
     }
 }
 
@@ -488,7 +497,9 @@ impl ServerGccBlocks {
                 SC_CORE => core = Some(ServerCoreData::decode(&mut body_cursor)?),
                 SC_NET => network = Some(ServerNetworkData::decode(&mut body_cursor)?),
                 SC_SECURITY => security = Some(ServerSecurityData::decode(&mut body_cursor)?),
-                SC_MCS_MSGCHANNEL => message_channel = Some(ServerMessageChannelData::decode(&mut body_cursor)?),
+                SC_MCS_MSGCHANNEL => {
+                    message_channel = Some(ServerMessageChannelData::decode(&mut body_cursor)?)
+                }
                 _ => {}
             }
         }
@@ -528,7 +539,10 @@ impl ConferenceCreateRequest {
         let mut out = Vec::new();
         out.write_u8(0x00); // ConnectData::Key CHOICE = object
         per::write_object_id(&mut out, GCC_CONFERENCE_OBJECT_ID);
-        per::write_length(&mut out, self.client_gcc_blocks.len() + CONFERENCE_REQUEST_CONNECT_PDU_OVERHEAD);
+        per::write_length(
+            &mut out,
+            self.client_gcc_blocks.len() + CONFERENCE_REQUEST_CONNECT_PDU_OVERHEAD,
+        );
         out.write_u8(0x00); // ConnectGCCPDU CHOICE = conferenceCreateRequest
         out.write_u8(0x08); // optional-field selection: userData present
         per::write_numeric_string(&mut out, CONFERENCE_NAME, 1);
@@ -572,7 +586,10 @@ impl ConferenceCreateResponse {
         let mut out = Vec::new();
         out.write_u8(0x00); // ConnectData::Key CHOICE = object
         per::write_object_id(&mut out, GCC_CONFERENCE_OBJECT_ID);
-        per::write_length(&mut out, self.server_gcc_blocks.len() + CONFERENCE_RESPONSE_CONNECT_PDU_OVERHEAD);
+        per::write_length(
+            &mut out,
+            self.server_gcc_blocks.len() + CONFERENCE_RESPONSE_CONNECT_PDU_OVERHEAD,
+        );
         out.write_u8(Self::CHOICE); // ConnectGCCPDU CHOICE = conferenceCreateResponse
         per::write_u16(&mut out, self.node_id, 1001);
         per::write_u32(&mut out, 1); // tag, fixed
@@ -590,7 +607,11 @@ impl ConferenceCreateResponse {
         expect_byte(&mut cursor, 0x00, "gcc.conference_response.key_choice")?;
         let _oid = per::read_object_id(&mut cursor)?;
         let _connect_pdu_len = per::read_length(&mut cursor)?;
-        expect_byte(&mut cursor, Self::CHOICE, "gcc.conference_response.gcc_pdu_choice")?;
+        expect_byte(
+            &mut cursor,
+            Self::CHOICE,
+            "gcc.conference_response.gcc_pdu_choice",
+        )?;
         let node_id = per::read_u16(&mut cursor, 1001)?;
         let _tag = per::read_u32(&mut cursor)?;
         let _result = per::read_enum(&mut cursor)?;
@@ -599,11 +620,18 @@ impl ConferenceCreateResponse {
         let _h221_id = per::read_octet_string(&mut cursor, 4)?;
         let blocks_len = per::read_length(&mut cursor)?;
         let server_gcc_blocks = cursor.read_slice(blocks_len)?.to_vec();
-        Ok(Self { node_id, server_gcc_blocks })
+        Ok(Self {
+            node_id,
+            server_gcc_blocks,
+        })
     }
 }
 
-fn expect_byte(cursor: &mut ReadCursor<'_>, expected: u8, field: &'static str) -> Result<(), DecodeError> {
+fn expect_byte(
+    cursor: &mut ReadCursor<'_>,
+    expected: u8,
+    field: &'static str,
+) -> Result<(), DecodeError> {
     let got = cursor.read_u8()?;
     if got != expected {
         return Err(DecodeError::InvalidValue {
@@ -705,7 +733,10 @@ mod tests {
         let encoded = request.encode();
         let decoded = ConferenceCreateRequest::decode(&encoded).unwrap();
         assert_eq!(decoded, request);
-        assert_eq!(ClientGccBlocks::decode(&decoded.client_gcc_blocks).unwrap(), sample_client_blocks());
+        assert_eq!(
+            ClientGccBlocks::decode(&decoded.client_gcc_blocks).unwrap(),
+            sample_client_blocks()
+        );
     }
 
     #[test]
@@ -730,7 +761,11 @@ mod tests {
 
         let mut blocks = Vec::new();
         write_block(&mut blocks, CS_CORE, &body);
-        write_block(&mut blocks, CS_SECURITY, &ClientSecurityData::default().encode());
+        write_block(
+            &mut blocks,
+            CS_SECURITY,
+            &ClientSecurityData::default().encode(),
+        );
         let client = ClientGccBlocks::decode(&blocks).unwrap();
         assert_eq!(client.early_capability_flags, Some(CS_SUPPORT_ERRINFO_PDU));
 
@@ -774,15 +809,26 @@ mod tests {
 
         let mut blocks = Vec::new();
         write_block(&mut blocks, CS_CORE, &body);
-        write_block(&mut blocks, CS_SECURITY, &ClientSecurityData::default().encode());
+        write_block(
+            &mut blocks,
+            CS_SECURITY,
+            &ClientSecurityData::default().encode(),
+        );
         let decoded = ClientGccBlocks::decode(&blocks).unwrap();
-        assert_eq!(decoded.early_capability_flags, Some(CS_SUPPORT_ERRINFO_PDU | CS_WANT_32BPP_SESSION));
+        assert_eq!(
+            decoded.early_capability_flags,
+            Some(CS_SUPPORT_ERRINFO_PDU | CS_WANT_32BPP_SESSION)
+        );
     }
 
     #[test]
     fn cs_cluster_is_not_mistaken_for_message_channel() {
         let mut wire = sample_client_blocks().encode();
-        write_block(&mut wire, CS_CLUSTER, &[0x0D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        write_block(
+            &mut wire,
+            CS_CLUSTER,
+            &[0x0D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        );
         let decoded = ClientGccBlocks::decode(&wire).unwrap();
         assert!(decoded.cluster.is_some());
         assert_eq!(decoded.message_channel, None);
@@ -793,7 +839,10 @@ mod tests {
         let mut wire = sample_client_blocks().encode();
         write_block(&mut wire, CS_MCS_MSGCHANNEL, &0xC000_0000u32.to_le_bytes());
         let decoded = ClientGccBlocks::decode(&wire).unwrap();
-        assert_eq!(decoded.message_channel, Some(ClientMessageChannelData { flags: 0xC000_0000 }));
+        assert_eq!(
+            decoded.message_channel,
+            Some(ClientMessageChannelData { flags: 0xC000_0000 })
+        );
 
         let server = ServerGccBlocks {
             core: ServerCoreData {
@@ -806,7 +855,9 @@ mod tests {
                 channel_ids: vec![1004, 1005, 1006, 1007],
             },
             security: ServerSecurityData,
-            message_channel: Some(ServerMessageChannelData { mcs_channel_id: 1008 }),
+            message_channel: Some(ServerMessageChannelData {
+                mcs_channel_id: 1008,
+            }),
         };
         let encoded = server.encode();
         let decoded = ServerGccBlocks::decode(&encoded).unwrap();

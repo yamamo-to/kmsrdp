@@ -66,14 +66,18 @@ impl Scheduler {
     }
 
     pub fn enqueue(&mut self, frame: Frame) {
-        let idx = self.queues.iter().position(|q| q.key == frame.channel).unwrap_or_else(|| {
-            self.queues.push(ChannelQueue {
-                key: frame.channel,
-                priority: frame.priority,
-                pending: VecDeque::new(),
+        let idx = self
+            .queues
+            .iter()
+            .position(|q| q.key == frame.channel)
+            .unwrap_or_else(|| {
+                self.queues.push(ChannelQueue {
+                    key: frame.channel,
+                    priority: frame.priority,
+                    pending: VecDeque::new(),
+                });
+                self.queues.len() - 1
             });
-            self.queues.len() - 1
-        });
         self.queues[idx].pending.push_back(frame.bytes);
     }
 
@@ -88,7 +92,11 @@ impl Scheduler {
     /// bounds how long a burst of bulk frames can delay a latency frame
     /// that arrives mid-burst.
     pub fn pop_next(&mut self) -> Option<Vec<u8>> {
-        for q in self.queues.iter_mut().filter(|q| q.priority == Priority::Latency) {
+        for q in self
+            .queues
+            .iter_mut()
+            .filter(|q| q.priority == Priority::Latency)
+        {
             if let Some(bytes) = q.pending.pop_front() {
                 return Some(bytes);
             }

@@ -5,8 +5,8 @@
 //! from `ber.rs`, which only covers Connect-Initial/Connect-Response's outer
 //! framing.
 
-use crate::cursor::{ReadCursor, WriteBuf};
 use crate::DecodeError;
+use crate::cursor::{ReadCursor, WriteBuf};
 
 /// 1 byte if `<=0x7F`; otherwise 2 bytes, big-endian, with the top bit of
 /// the 16-bit value forced set to mark the long form. This is *not* the
@@ -124,7 +124,10 @@ pub fn write_octet_string(out: &mut Vec<u8>, bytes: &[u8], min: usize) {
     out.write_slice(bytes);
 }
 
-pub fn read_octet_string<'a>(cursor: &mut ReadCursor<'a>, min: usize) -> Result<&'a [u8], DecodeError> {
+pub fn read_octet_string<'a>(
+    cursor: &mut ReadCursor<'a>,
+    min: usize,
+) -> Result<&'a [u8], DecodeError> {
     let excess = read_length(cursor)?;
     Ok(cursor.read_slice(excess + min)?)
 }

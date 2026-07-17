@@ -10,8 +10,8 @@ use std::fs;
 use std::io;
 use std::os::unix::io::{AsFd, AsRawFd};
 
-use drm::control::{connector, crtc, plane, property, Device as ControlDevice};
 use drm::Device;
+use drm::control::{Device as ControlDevice, connector, crtc, plane, property};
 use drm_fourcc::{DrmFourcc, DrmModifier};
 use memmap2::MmapOptions;
 
@@ -169,7 +169,9 @@ pub fn capture_raw_bgrx() -> io::Result<RawFrame> {
                 data,
             }),
             Err(nvfbc_err) => {
-                eprintln!("DRM/KMS capture failed ({drm_err}), NvFBC fallback also failed ({nvfbc_err})");
+                eprintln!(
+                    "DRM/KMS capture failed ({drm_err}), NvFBC fallback also failed ({nvfbc_err})"
+                );
                 Err(drm_err)
             }
         },

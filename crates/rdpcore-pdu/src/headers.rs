@@ -5,8 +5,8 @@
 //! (external/TLS security, never RDP Standard Security), `ENCRYPT` is never
 //! set on anything this crate builds.
 
-use crate::cursor::{ReadCursor, WriteBuf};
 use crate::DecodeError;
+use crate::cursor::{ReadCursor, WriteBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BasicSecurityHeaderFlags(pub u16);

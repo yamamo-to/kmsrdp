@@ -27,7 +27,9 @@ impl ExactMatchCredentialValidator {
 impl CredentialValidator for ExactMatchCredentialValidator {
     fn validate(&self, username: &str, password: &str, domain: &str) -> bool {
         let (client_domain, client_user) = normalize_client_identity(username, domain);
-        if !client_user.eq_ignore_ascii_case(&self.expected.username) || password != self.expected.password {
+        if !client_user.eq_ignore_ascii_case(&self.expected.username)
+            || password != self.expected.password
+        {
             return false;
         }
         match &self.expected.domain {

@@ -3,9 +3,9 @@
 //! immediately after the Client Info PDU to skip real licensing entirely.
 //! Every field is a fixed constant - there is nothing to configure.
 
+use crate::DecodeError;
 use crate::cursor::{ReadCursor, WriteBuf};
 use crate::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
-use crate::DecodeError;
 
 const PREAMBLE_ERROR_ALERT: u8 = 0xFF;
 const PREAMBLE_VERSION_3: u8 = 3;

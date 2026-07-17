@@ -5,10 +5,10 @@
 //! Unicode-only: real clients (xfreerdp, mstsc) always set `INFO_UNICODE`;
 //! the legacy ANSI encoding path is a phase-1 simplification left out.
 
+use crate::DecodeError;
 use crate::cursor::{ReadCursor, WriteBuf};
 use crate::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
 use crate::utf16::{decode_units, encode_units, read_fixed as read_utf16_fixed};
-use crate::DecodeError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClientInfoFlags(pub u32);
@@ -100,7 +100,13 @@ impl ClientInfo {
         out.write_u16_le(shell_bytes.len() as u16);
         out.write_u16_le(dir_bytes.len() as u16);
 
-        for bytes in [domain_bytes, username_bytes, password_bytes, shell_bytes, dir_bytes] {
+        for bytes in [
+            domain_bytes,
+            username_bytes,
+            password_bytes,
+            shell_bytes,
+            dir_bytes,
+        ] {
             out.write_slice(&bytes);
             out.write_u16_le(0); // NUL terminator
         }
@@ -236,7 +242,10 @@ mod tests {
         assert_eq!(decoded.info.working_dir, "");
         assert_eq!(decoded.info.extended.address_family, 0x0002);
         assert_eq!(decoded.info.extended.address, "127.0.0.1");
-        assert_eq!(decoded.info.extended.dir, "C:\\Windows\\System32\\mstscax.dll");
+        assert_eq!(
+            decoded.info.extended.dir,
+            "C:\\Windows\\System32\\mstscax.dll"
+        );
     }
 
     #[test]
@@ -244,7 +253,9 @@ mod tests {
         let pdu = ClientInfoPdu {
             info: ClientInfo {
                 code_page: 0,
-                flags: ClientInfoFlags::MOUSE | ClientInfoFlags::AUTOLOGON | ClientInfoFlags::UNICODE,
+                flags: ClientInfoFlags::MOUSE
+                    | ClientInfoFlags::AUTOLOGON
+                    | ClientInfoFlags::UNICODE,
                 domain: String::new(),
                 username: "kmsrdp".to_owned(),
                 password: "hunter2".to_owned(),

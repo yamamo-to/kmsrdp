@@ -27,7 +27,9 @@ impl EchoHandler {
 
 impl core::fmt::Debug for EchoHandler {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("EchoHandler").field("payload_len", &self.payload.len()).finish()
+        f.debug_struct("EchoHandler")
+            .field("payload_len", &self.payload.len())
+            .finish()
     }
 }
 

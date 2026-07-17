@@ -78,7 +78,9 @@ impl RdpServerInputHandler for Input {
             }
         };
 
-        let Some((code, extended, down)) = scancode else { return };
+        let Some((code, extended, down)) = scancode else {
+            return;
+        };
         match uinput::linux_keycode_from_rdp_scancode(code, extended) {
             Some(keycode) => {
                 if let Err(e) = self.device.key(keycode, down) {
@@ -93,7 +95,8 @@ impl RdpServerInputHandler for Input {
         let result = match event {
             MouseEvent::Move { x, y } => {
                 let (width, height) = *self.mouse_scale.lock().unwrap();
-                self.device.move_abs(f64::from(x) / width, f64::from(y) / height)
+                self.device
+                    .move_abs(f64::from(x) / width, f64::from(y) / height)
             }
             MouseEvent::LeftPressed => self.device.button(uinput::BTN_LEFT, true),
             MouseEvent::LeftReleased => self.device.button(uinput::BTN_LEFT, false),
@@ -101,7 +104,7 @@ impl RdpServerInputHandler for Input {
             MouseEvent::RightReleased => self.device.button(uinput::BTN_RIGHT, false),
             MouseEvent::MiddlePressed => self.device.button(uinput::BTN_MIDDLE, true),
             MouseEvent::MiddleReleased => self.device.button(uinput::BTN_MIDDLE, false),
-            MouseEvent::VerticalScroll { value } => self.device.scroll(value.into()),
+            MouseEvent::VerticalScroll { value } => self.device.scroll(value),
         };
         if let Err(e) = result {
             eprintln!("mouse injection failed: {e}");
@@ -165,7 +168,9 @@ async fn main() -> Result<()> {
         .with_tls(acceptor)
         .with_input_handler(input)
         .with_display_handler(display)
-        .with_cliprdr_factory(Some(Box::new(LocalClipboardFactory::new(session_rx.clone()))))
+        .with_cliprdr_factory(Some(Box::new(LocalClipboardFactory::new(
+            session_rx.clone(),
+        ))))
         .with_sound_factory(Some(Box::new(LocalAudioFactory::new())))
         .with_audio_input_factory(Some(Box::new(VirtualMicFactory::new())))
         .with_credential_validator(Some(Arc::new(validator)))

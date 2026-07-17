@@ -12,9 +12,9 @@
 //! carries every field a `stat()`-like consumer needs per file
 //! (timestamps, size, attributes), which covers the common case.
 
+use rdpcore_pdu::DecodeError;
 use rdpcore_pdu::cursor::{ReadCursor, WriteBuf};
 use rdpcore_pdu::utf16;
-use rdpcore_pdu::DecodeError;
 
 use crate::pdu;
 
@@ -59,7 +59,14 @@ const FILE_DIRECTORY_INFORMATION_CLASS: u32 = 1;
 /// status for a `QUERY_DIRECTORY` loop.
 pub const STATUS_NO_MORE_FILES: u32 = 0x8000_0006;
 
-fn write_io_request_header(out: &mut Vec<u8>, device_id: u32, file_id: u32, completion_id: u32, major_function: u32, minor_function: u32) {
+fn write_io_request_header(
+    out: &mut Vec<u8>,
+    device_id: u32,
+    file_id: u32,
+    completion_id: u32,
+    major_function: u32,
+    minor_function: u32,
+) {
     out.write_u16_le(pdu::RDPDR_CTYP_CORE);
     out.write_u16_le(pdu::PAKID_CORE_DEVICE_IOREQUEST);
     out.write_u32_le(device_id);
@@ -73,7 +80,14 @@ fn zero_padding(out: &mut Vec<u8>, n: usize) {
     out.resize(out.len() + n, 0u8);
 }
 
-pub fn encode_create_request(device_id: u32, completion_id: u32, path: &str, desired_access: u32, create_disposition: u32, create_options: u32) -> Vec<u8> {
+pub fn encode_create_request(
+    device_id: u32,
+    completion_id: u32,
+    path: &str,
+    desired_access: u32,
+    create_disposition: u32,
+    create_options: u32,
+) -> Vec<u8> {
     let mut path_bytes = utf16::encode_units(path);
     path_bytes.write_u16_le(0); // NUL terminator
 
@@ -101,7 +115,10 @@ pub fn decode_create_reply(body: &[u8]) -> Result<CreateReply, DecodeError> {
     let mut cursor = ReadCursor::new(body);
     let file_id = cursor.read_u32_le()?;
     let information = cursor.read_u8()?;
-    Ok(CreateReply { file_id, information })
+    Ok(CreateReply {
+        file_id,
+        information,
+    })
 }
 
 /// 32 bytes of trailing padding (confirmed against both the reference
@@ -120,7 +137,13 @@ pub fn encode_close_request(device_id: u32, file_id: u32, completion_id: u32) ->
 
 /// `offset`'s high dword is always sent as 0 - the reference server's own
 /// request-sending API only supports 32-bit offsets.
-pub fn encode_read_request(device_id: u32, file_id: u32, completion_id: u32, length: u32, offset: u64) -> Vec<u8> {
+pub fn encode_read_request(
+    device_id: u32,
+    file_id: u32,
+    completion_id: u32,
+    length: u32,
+    offset: u64,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + 20 + 32);
     write_io_request_header(&mut out, device_id, file_id, completion_id, IRP_MJ_READ, 0);
     out.write_u32_le(length);
@@ -135,7 +158,13 @@ pub fn decode_read_reply(body: &[u8]) -> Result<Vec<u8>, DecodeError> {
     Ok(cursor.read_slice(length)?.to_vec())
 }
 
-pub fn encode_write_request(device_id: u32, file_id: u32, completion_id: u32, offset: u64, data: &[u8]) -> Vec<u8> {
+pub fn encode_write_request(
+    device_id: u32,
+    file_id: u32,
+    completion_id: u32,
+    offset: u64,
+    data: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + 20 + 32 + data.len());
     write_io_request_header(&mut out, device_id, file_id, completion_id, IRP_MJ_WRITE, 0);
     out.write_u32_le(data.len() as u32);
@@ -156,7 +185,12 @@ pub fn decode_write_reply(body: &[u8]) -> Result<u32, DecodeError> {
 /// entry (`InitialQuery = 0`) - matches the reference server's own
 /// convention of re-issuing one request per directory entry rather than
 /// consuming a `NextEntryOffset`-linked batch from a single reply.
-pub fn encode_query_directory_request(device_id: u32, file_id: u32, completion_id: u32, path: Option<&str>) -> Vec<u8> {
+pub fn encode_query_directory_request(
+    device_id: u32,
+    file_id: u32,
+    completion_id: u32,
+    path: Option<&str>,
+) -> Vec<u8> {
     let path_bytes = match path {
         Some(p) => {
             let mut b = utf16::encode_units(p);
@@ -166,7 +200,14 @@ pub fn encode_query_directory_request(device_id: u32, file_id: u32, completion_i
         None => Vec::new(),
     };
     let mut out = Vec::with_capacity(4 + 20 + 32 + path_bytes.len());
-    write_io_request_header(&mut out, device_id, file_id, completion_id, IRP_MJ_DIRECTORY_CONTROL, IRP_MN_QUERY_DIRECTORY);
+    write_io_request_header(
+        &mut out,
+        device_id,
+        file_id,
+        completion_id,
+        IRP_MJ_DIRECTORY_CONTROL,
+        IRP_MN_QUERY_DIRECTORY,
+    );
     out.write_u32_le(FILE_DIRECTORY_INFORMATION_CLASS);
     out.write_u8(u8::from(path.is_some()));
     out.write_u32_le(path_bytes.len() as u32);
@@ -256,7 +297,10 @@ mod tests {
     fn create_request_round_trip_layout() {
         let encoded = encode_create_request(1, 5, "\\foo.txt", GENERIC_READ, FILE_OPEN, 0);
         assert_eq!(&encoded[0..2], &pdu::RDPDR_CTYP_CORE.to_le_bytes());
-        assert_eq!(&encoded[2..4], &pdu::PAKID_CORE_DEVICE_IOREQUEST.to_le_bytes());
+        assert_eq!(
+            &encoded[2..4],
+            &pdu::PAKID_CORE_DEVICE_IOREQUEST.to_le_bytes()
+        );
         assert_eq!(&encoded[4..8], &1u32.to_le_bytes()); // DeviceId
         assert_eq!(&encoded[8..12], &0u32.to_le_bytes()); // FileId (unknown yet)
         assert_eq!(&encoded[12..16], &5u32.to_le_bytes()); // CompletionId
@@ -273,7 +317,13 @@ mod tests {
         body.write_u32_le(42);
         body.write_u8(FILE_OPENED);
         let decoded = decode_create_reply(&body).unwrap();
-        assert_eq!(decoded, CreateReply { file_id: 42, information: FILE_OPENED });
+        assert_eq!(
+            decoded,
+            CreateReply {
+                file_id: 42,
+                information: FILE_OPENED
+            }
+        );
     }
 
     #[test]

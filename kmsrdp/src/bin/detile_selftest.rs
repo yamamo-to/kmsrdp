@@ -39,7 +39,9 @@ unsafe fn sym<T: Copy>(lib: &Library, name: &str) -> T {
 fn main() {
     let mut args = std::env::args().skip(1);
     let card_path = args.next().unwrap_or_else(|| "/dev/dri/card0".to_string());
-    let render_path = args.next().unwrap_or_else(|| "/dev/dri/renderD128".to_string());
+    let render_path = args
+        .next()
+        .unwrap_or_else(|| "/dev/dri/renderD128".to_string());
 
     println!("opening {render_path} for GBM allocation, {card_path} for the detile pass");
     let fd = std::fs::OpenOptions::new()
@@ -54,8 +56,7 @@ fn main() {
 
     type GbmCreateDevice = unsafe extern "C" fn(c_int) -> *mut c_void;
     type GbmDeviceDestroy = unsafe extern "C" fn(*mut c_void);
-    type GbmBoCreate =
-        unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32) -> *mut c_void;
+    type GbmBoCreate = unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32) -> *mut c_void;
     type GbmBoDestroy = unsafe extern "C" fn(*mut c_void);
     type GbmBoMap = unsafe extern "C" fn(
         *mut c_void,
@@ -159,10 +160,18 @@ fn main() {
         Ok(data) => {
             let px = &data[0..4];
             println!("readback pixel 0: {px:02x?} (expected [00, 00, ff, ..])");
-            assert_eq!(&px[0..3], &[0x00, 0x00, 0xFF], "color mismatch after detile round-trip");
+            assert_eq!(
+                &px[0..3],
+                &[0x00, 0x00, 0xFF],
+                "color mismatch after detile round-trip"
+            );
             let mid = (H as usize / 2) * W as usize * 4 + (W as usize / 2) * 4;
             let px_mid = &data[mid..mid + 4];
-            assert_eq!(&px_mid[0..3], &[0x00, 0x00, 0xFF], "color mismatch at center pixel");
+            assert_eq!(
+                &px_mid[0..3],
+                &[0x00, 0x00, 0xFF],
+                "color mismatch at center pixel"
+            );
             println!("OK: GBM/EGL detile round-trip produced the expected color.");
         }
         Err(e) => {

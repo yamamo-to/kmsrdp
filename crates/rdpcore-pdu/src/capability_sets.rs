@@ -8,8 +8,8 @@
 //! around for round-trip tests, cross-checked against a real
 //! implementation's exact byte layout).
 
-use crate::cursor::{ReadCursor, WriteBuf};
 use crate::DecodeError;
+use crate::cursor::{ReadCursor, WriteBuf};
 
 // ---------------------------------------------------------------------
 // Share Control Header
@@ -67,6 +67,7 @@ impl ShareControlHeader {
 
     /// Returns the header and the declared total body length (`totalLength
     /// - 10`), which may be larger than what a decoder actually consumes -
+    ///
     /// some clients pad Data PDUs with trailing bytes; callers should treat
     /// leftover bytes as harmless rather than erroring.
     pub fn decode(cursor: &mut ReadCursor<'_>) -> Result<(Self, usize), DecodeError> {
@@ -454,7 +455,11 @@ impl ServerCapabilities {
         count += 1;
         write_capset(out, CAPSET_INPUT, &self.input.encode_body());
         count += 1;
-        write_capset(out, CAPSET_VIRTUAL_CHANNEL, &self.virtual_channel.encode_body());
+        write_capset(
+            out,
+            CAPSET_VIRTUAL_CHANNEL,
+            &self.virtual_channel.encode_body(),
+        );
         count += 1;
         write_capset(
             out,
@@ -659,7 +664,10 @@ mod tests {
             refresh_rect_support: true,
             suppress_output_support: true,
         };
-        assert_eq!(GeneralCapability::decode_body(&cap.encode_body()).unwrap(), cap);
+        assert_eq!(
+            GeneralCapability::decode_body(&cap.encode_body()).unwrap(),
+            cap
+        );
         assert_eq!(cap.encode_body().len(), 20);
     }
 
@@ -671,7 +679,10 @@ mod tests {
             desktop_height: 1080,
             desktop_resize_flag: true,
         };
-        assert_eq!(BitmapCapability::decode_body(&cap.encode_body()).unwrap(), cap);
+        assert_eq!(
+            BitmapCapability::decode_body(&cap.encode_body()).unwrap(),
+            cap
+        );
         assert_eq!(cap.encode_body().len(), 24);
     }
 
@@ -688,7 +699,10 @@ mod tests {
             color_pointer_cache_size: 2048,
             pointer_cache_size: 2048,
         };
-        assert_eq!(PointerCapability::decode_body(&cap.encode_body()).unwrap(), cap);
+        assert_eq!(
+            PointerCapability::decode_body(&cap.encode_body()).unwrap(),
+            cap
+        );
         assert_eq!(cap.encode_body().len(), 6);
     }
 
@@ -701,14 +715,20 @@ mod tests {
             keyboard_subtype: 0,
             keyboard_function_key: 12,
         };
-        assert_eq!(InputCapability::decode_body(&cap.encode_body()).unwrap(), cap);
+        assert_eq!(
+            InputCapability::decode_body(&cap.encode_body()).unwrap(),
+            cap
+        );
         assert_eq!(cap.encode_body().len(), 84);
     }
 
     #[test]
     fn virtual_channel_and_multifragment_round_trip() {
         let vc = VirtualChannelCapability { flags: 0 };
-        assert_eq!(VirtualChannelCapability::decode_body(&vc.encode_body()).unwrap(), vc);
+        assert_eq!(
+            VirtualChannelCapability::decode_body(&vc.encode_body()).unwrap(),
+            vc
+        );
 
         let mfu = MultiFragmentUpdateCapability {
             max_request_size: 8 * 1024 * 1024,
@@ -753,7 +773,17 @@ mod tests {
         let confirm = ConfirmActive::decode(&with_originator).unwrap();
         assert_eq!(confirm.share_id, 0x1000);
         assert_eq!(confirm.capabilities.len(), 8);
-        assert!(confirm.capabilities.iter().any(|c| c.set_type == CAPSET_GENERAL));
-        assert!(confirm.capabilities.iter().any(|c| c.set_type == CAPSET_BITMAP_CODECS));
+        assert!(
+            confirm
+                .capabilities
+                .iter()
+                .any(|c| c.set_type == CAPSET_GENERAL)
+        );
+        assert!(
+            confirm
+                .capabilities
+                .iter()
+                .any(|c| c.set_type == CAPSET_BITMAP_CODECS)
+        );
     }
 }

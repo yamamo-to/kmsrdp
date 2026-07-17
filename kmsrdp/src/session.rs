@@ -30,17 +30,16 @@ impl Session {
 /// 3. `.mutter-Xwaylandauth.*` in `xdg_runtime_dir` – GNOME Wayland+XWayland.
 /// 4. `~/.Xauthority` – classic X11 fallback.
 pub fn find_xauthority(username: &str, xdg_runtime_dir: &Path, leader_pid: u32) -> Option<PathBuf> {
-    if let Ok(environ) = std::fs::read(format!("/proc/{leader_pid}/environ")) {
-        if let Some(path) = environ
+    if let Ok(environ) = std::fs::read(format!("/proc/{leader_pid}/environ"))
+        && let Some(path) = environ
             .split(|&b| b == 0)
             .filter_map(|entry| {
                 let s = std::str::from_utf8(entry).ok()?;
                 s.strip_prefix("XAUTHORITY=").map(PathBuf::from)
             })
             .find(|p| p.exists())
-        {
-            return Some(path);
-        }
+    {
+        return Some(path);
     }
 
     let gdm_xauthority = xdg_runtime_dir.join("gdm/Xauthority");
@@ -48,8 +47,8 @@ pub fn find_xauthority(username: &str, xdg_runtime_dir: &Path, leader_pid: u32) 
         return Some(gdm_xauthority);
     }
 
-    if let Ok(entries) = std::fs::read_dir(xdg_runtime_dir) {
-        if let Some(path) = entries
+    if let Ok(entries) = std::fs::read_dir(xdg_runtime_dir)
+        && let Some(path) = entries
             .flatten()
             .filter(|e| {
                 e.file_name()
@@ -59,9 +58,8 @@ pub fn find_xauthority(username: &str, xdg_runtime_dir: &Path, leader_pid: u32) 
             })
             .map(|e| e.path())
             .next()
-        {
-            return Some(path);
-        }
+    {
+        return Some(path);
     }
 
     let xauth = PathBuf::from(format!("/home/{username}/.Xauthority"));

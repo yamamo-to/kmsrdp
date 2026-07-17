@@ -11,8 +11,8 @@
 //! byte 3 (Data only): EOT (0x80, always end-of-transmission for RDP)
 //! ```
 
-use crate::cursor::{ReadCursor, WriteBuf};
 use crate::DecodeError;
+use crate::cursor::{ReadCursor, WriteBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TpduCode(pub u8);
@@ -135,7 +135,10 @@ mod tests {
         let mut cursor = ReadCursor::new(&buf);
         assert!(matches!(
             TpduHeader::decode(&mut cursor, TpduCode::CONNECTION_CONFIRM),
-            Err(DecodeError::InvalidValue { field: "tpdu.code", .. })
+            Err(DecodeError::InvalidValue {
+                field: "tpdu.code",
+                ..
+            })
         ));
     }
 }

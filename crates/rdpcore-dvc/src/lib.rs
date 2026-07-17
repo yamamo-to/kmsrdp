@@ -12,7 +12,7 @@ pub mod echo;
 pub mod pdu;
 
 use rdpcore_pdu::mcs::SendData;
-use rdpcore_pdu::{svc, x224, DecodeError};
+use rdpcore_pdu::{DecodeError, svc, x224};
 
 /// One dynamic channel's behavior. `on_open`/`on_data` return payloads to
 /// send in response, if any - [`DvcMux`] takes care of DVC-layer framing
@@ -53,7 +53,11 @@ impl DvcMux {
     /// caller should send immediately - the server always speaks first on
     /// this channel, before waiting for anything from the client.
     pub fn new(channel_id: u16, user_channel_id: u16) -> (Self, Vec<Vec<u8>>) {
-        let initial = wrap_indication(user_channel_id, channel_id, pdu::encode_capability_request());
+        let initial = wrap_indication(
+            user_channel_id,
+            channel_id,
+            pdu::encode_capability_request(),
+        );
         (
             Self {
                 channel_id,
@@ -94,7 +98,11 @@ impl DvcMux {
             handler,
             reassembly: None,
         });
-        wrap_indication(self.user_channel_id, self.channel_id, pdu::encode_create_request(id, &name))
+        wrap_indication(
+            self.user_channel_id,
+            self.channel_id,
+            pdu::encode_create_request(id, &name),
+        )
     }
 
     /// `payload` is one SVC chunk (Channel PDU Header included) of
@@ -126,14 +134,20 @@ impl DvcMux {
                     return Ok(Vec::new());
                 }
                 let payloads = {
-                    let Some(slot) = self.channels.iter_mut().find(|slot| slot.id == response.channel_id) else {
+                    let Some(slot) = self
+                        .channels
+                        .iter_mut()
+                        .find(|slot| slot.id == response.channel_id)
+                    else {
                         return Ok(Vec::new());
                     };
                     slot.handler.on_open()
                 };
                 Ok(self.encode_payloads(response.channel_id, payloads))
             }
-            pdu::ClientMessage::Data { channel_id, data } => self.handle_incoming_data(channel_id, data, None),
+            pdu::ClientMessage::Data { channel_id, data } => {
+                self.handle_incoming_data(channel_id, data, None)
+            }
             pdu::ClientMessage::DataFirst {
                 channel_id,
                 total_length,
@@ -147,7 +161,12 @@ impl DvcMux {
         }
     }
 
-    fn handle_incoming_data(&mut self, channel_id: u32, data: Vec<u8>, starts_new: Option<u32>) -> Result<Vec<Vec<u8>>, DecodeError> {
+    fn handle_incoming_data(
+        &mut self,
+        channel_id: u32,
+        data: Vec<u8>,
+        starts_new: Option<u32>,
+    ) -> Result<Vec<Vec<u8>>, DecodeError> {
         let payloads = {
             let Some(slot) = self.channels.iter_mut().find(|slot| slot.id == channel_id) else {
                 return Ok(Vec::new());

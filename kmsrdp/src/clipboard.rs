@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use rdpcore_cliprdr::pdu::CF_UNICODETEXT;
 use rdpcore_cliprdr::{
-    CliprdrBackend, CliprdrBackendFactory, ClipboardFormat, ClipboardMessage, FormatDataRequest,
+    ClipboardFormat, ClipboardMessage, CliprdrBackend, CliprdrBackendFactory, FormatDataRequest,
     FormatDataResponse,
 };
 use tokio::sync::mpsc::UnboundedSender;
@@ -33,7 +33,9 @@ fn set_local_text(text: String) {
 fn advertise_local_text(sender: &UnboundedSender<ClipboardMessage>) -> bool {
     if matches!(local_text(), Some(t) if !t.is_empty()) {
         return sender
-            .send(ClipboardMessage::SendInitiateCopy(vec![ClipboardFormat::unicode_text()]))
+            .send(ClipboardMessage::SendInitiateCopy(vec![
+                ClipboardFormat::unicode_text(),
+            ]))
             .is_ok();
     }
     true
@@ -55,11 +57,10 @@ fn spawn_local_clipboard_watcher(
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(750)) => {
                     let current = tokio::task::spawn_blocking(local_text).await.unwrap_or(None);
-                    if current != last && matches!(&current, Some(t) if !t.is_empty()) {
-                        if !advertise_local_text(&sender) {
+                    if current != last && matches!(&current, Some(t) if !t.is_empty())
+                        && !advertise_local_text(&sender) {
                             break;
                         }
-                    }
                     last = current;
                 }
                 changed = session_rx.changed() => {
@@ -89,7 +90,10 @@ impl LocalClipboardFactory {
 }
 
 impl CliprdrBackendFactory for LocalClipboardFactory {
-    fn build_cliprdr_backend(&self, sender: UnboundedSender<ClipboardMessage>) -> Box<dyn CliprdrBackend> {
+    fn build_cliprdr_backend(
+        &self,
+        sender: UnboundedSender<ClipboardMessage>,
+    ) -> Box<dyn CliprdrBackend> {
         spawn_local_clipboard_watcher(sender.clone(), self.session_rx.clone());
         Box::new(LocalClipboardBackend {
             sender,
@@ -119,7 +123,9 @@ impl CliprdrBackend for LocalClipboardBackend {
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
         self.remote_has_text = available_formats.iter().any(|f| f.id == CF_UNICODETEXT);
         if self.remote_has_text {
-            let _ = self.sender.send(ClipboardMessage::SendInitiatePaste(CF_UNICODETEXT));
+            let _ = self
+                .sender
+                .send(ClipboardMessage::SendInitiatePaste(CF_UNICODETEXT));
         }
     }
 

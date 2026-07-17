@@ -19,6 +19,8 @@ impl DriveConsumerFactory for DiagnosticDriveFactory {
     }
 
     fn build_drive_consumer(&self) -> Box<dyn DriveConsumer> {
-        Box::new(DirectoryListingSelfTest::new(|event| println!("rdpdr self-test: {event}")))
+        Box::new(DirectoryListingSelfTest::new(|event| {
+            println!("rdpdr self-test: {event}")
+        }))
     }
 }

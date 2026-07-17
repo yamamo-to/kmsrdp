@@ -14,8 +14,8 @@
 //! corrupting reassembly (confirmed by crashing a real client's channel
 //! stream-capacity check during this crate's own development).
 
-use crate::cursor::{ReadCursor, WriteBuf};
 use crate::DecodeError;
+use crate::cursor::{ReadCursor, WriteBuf};
 
 pub const CHANNEL_FLAG_FIRST: u32 = 0x0000_0001;
 pub const CHANNEL_FLAG_LAST: u32 = 0x0000_0002;

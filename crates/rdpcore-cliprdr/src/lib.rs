@@ -5,7 +5,7 @@
 pub mod pdu;
 
 use rdpcore_pdu::mcs::SendData;
-use rdpcore_pdu::{svc, x224, DecodeError};
+use rdpcore_pdu::{DecodeError, svc, x224};
 
 /// One clipboard format, identified by its standard numeric ID (this
 /// crate only ever produces/expects `pdu::CF_UNICODETEXT`).
@@ -16,7 +16,9 @@ pub struct ClipboardFormat {
 
 impl ClipboardFormat {
     pub fn unicode_text() -> Self {
-        Self { id: pdu::CF_UNICODETEXT }
+        Self {
+            id: pdu::CF_UNICODETEXT,
+        }
     }
 }
 
@@ -109,10 +111,18 @@ impl CliprdrChannel {
     /// Returns the channel plus the initial Capabilities + Monitor Ready
     /// frames the caller should send immediately, in order - the server
     /// always speaks first on this channel (MS-RDPECLIP 3.2.5.1).
-    pub fn new(channel_id: u16, user_channel_id: u16, mut backend: Box<dyn CliprdrBackend>) -> (Self, Vec<Vec<u8>>) {
+    pub fn new(
+        channel_id: u16,
+        user_channel_id: u16,
+        mut backend: Box<dyn CliprdrBackend>,
+    ) -> (Self, Vec<Vec<u8>>) {
         backend.on_ready();
         let mut initial = wrap_indication(user_channel_id, channel_id, pdu::encode_capabilities());
-        initial.extend(wrap_indication(user_channel_id, channel_id, pdu::encode_monitor_ready()));
+        initial.extend(wrap_indication(
+            user_channel_id,
+            channel_id,
+            pdu::encode_monitor_ready(),
+        ));
         (
             Self {
                 channel_id,
@@ -143,13 +153,21 @@ impl CliprdrChannel {
         let message = core::mem::take(&mut self.incoming_buffer);
         match pdu::decode_client_message(&message)? {
             pdu::ClientMessage::FormatList(format_ids) => {
-                let formats: Vec<ClipboardFormat> = format_ids.into_iter().map(|id| ClipboardFormat { id }).collect();
+                let formats: Vec<ClipboardFormat> = format_ids
+                    .into_iter()
+                    .map(|id| ClipboardFormat { id })
+                    .collect();
                 self.backend.on_remote_copy(&formats);
-                Ok(wrap_indication(self.user_channel_id, self.channel_id, pdu::encode_format_list_response_ok()))
+                Ok(wrap_indication(
+                    self.user_channel_id,
+                    self.channel_id,
+                    pdu::encode_format_list_response_ok(),
+                ))
             }
             pdu::ClientMessage::FormatListResponse => Ok(Vec::new()), // ack for a list we sent - nothing to do
             pdu::ClientMessage::FormatDataRequest(format) => {
-                self.backend.on_format_data_request(FormatDataRequest { format });
+                self.backend
+                    .on_format_data_request(FormatDataRequest { format });
                 Ok(Vec::new()) // the response comes asynchronously via encode_message
             }
             pdu::ClientMessage::FormatDataResponse(result) => {
@@ -175,7 +193,9 @@ impl CliprdrChannel {
                 }
                 pdu::encode_format_list_unicode_text()
             }
-            ClipboardMessage::SendInitiatePaste(format_id) => pdu::encode_format_data_request(format_id),
+            ClipboardMessage::SendInitiatePaste(format_id) => {
+                pdu::encode_format_data_request(format_id)
+            }
             ClipboardMessage::SendFormatData(response) => match response.to_unicode_string() {
                 Some(text) => pdu::encode_format_data_response_text(&text),
                 None => pdu::encode_format_data_response_error(),
@@ -238,7 +258,8 @@ mod tests {
 
     #[test]
     fn incoming_format_list_triggers_on_remote_copy_and_acks() {
-        let (mut channel, _initial) = CliprdrChannel::new(1004, 1002, Box::new(FakeBackend::default()));
+        let (mut channel, _initial) =
+            CliprdrChannel::new(1004, 1002, Box::new(FakeBackend::default()));
 
         let wire = svc::chunkify(&pdu::encode_format_list_unicode_text());
         assert_eq!(wire.len(), 1);
@@ -248,7 +269,8 @@ mod tests {
 
     #[test]
     fn multi_chunk_incoming_message_is_reassembled_before_dispatch() {
-        let (mut channel, _initial) = CliprdrChannel::new(1004, 1002, Box::new(FakeBackend::default()));
+        let (mut channel, _initial) =
+            CliprdrChannel::new(1004, 1002, Box::new(FakeBackend::default()));
 
         let full = pdu::encode_format_list_unicode_text();
         // Force a two-chunk split to exercise reassembly, mirroring what a
@@ -270,23 +292,33 @@ mod tests {
 
     #[test]
     fn encode_initiate_copy_only_for_unicode_text() {
-        let (mut channel, _initial) = CliprdrChannel::new(1004, 1002, Box::new(FakeBackend::default()));
-        let frames = channel.encode_message(ClipboardMessage::SendInitiateCopy(vec![ClipboardFormat::unicode_text()]));
+        let (mut channel, _initial) =
+            CliprdrChannel::new(1004, 1002, Box::new(FakeBackend::default()));
+        let frames = channel.encode_message(ClipboardMessage::SendInitiateCopy(vec![
+            ClipboardFormat::unicode_text(),
+        ]));
         assert_eq!(frames.len(), 1);
 
         // A format this crate doesn't know how to advertise: nothing sent.
-        let frames = channel.encode_message(ClipboardMessage::SendInitiateCopy(vec![ClipboardFormat { id: 2 }]));
+        let frames =
+            channel.encode_message(ClipboardMessage::SendInitiateCopy(vec![ClipboardFormat {
+                id: 2,
+            }]));
         assert!(frames.is_empty());
     }
 
     #[test]
     fn format_data_request_response_round_trip_via_wire() {
-        let (mut channel, _initial) = CliprdrChannel::new(1004, 1002, Box::new(FakeBackend::default()));
+        let (mut channel, _initial) =
+            CliprdrChannel::new(1004, 1002, Box::new(FakeBackend::default()));
 
-        let request_wire = channel.encode_message(ClipboardMessage::SendInitiatePaste(pdu::CF_UNICODETEXT));
+        let request_wire =
+            channel.encode_message(ClipboardMessage::SendInitiatePaste(pdu::CF_UNICODETEXT));
         assert_eq!(request_wire.len(), 1);
 
-        let response_wire = channel.encode_message(ClipboardMessage::SendFormatData(FormatDataResponse::new_unicode_string("hello")));
+        let response_wire = channel.encode_message(ClipboardMessage::SendFormatData(
+            FormatDataResponse::new_unicode_string("hello"),
+        ));
         assert_eq!(response_wire.len(), 1);
     }
 }

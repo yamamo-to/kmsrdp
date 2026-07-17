@@ -15,7 +15,7 @@
 //! sizes and guessing wrong would desync the whole PDU.
 
 use crate::cursor::{ReadCursor, WriteBuf};
-use crate::{per, DecodeError};
+use crate::{DecodeError, per};
 
 /// The chunk size this server uses to fragment large updates (e.g. a
 /// full-screen bitmap), matching a real implementation's own hardcoded
@@ -38,24 +38,40 @@ pub mod keyboard_flags {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastPathInputEvent {
-    Scancode { flags: u8, code: u8 },
-    Mouse { pointer_flags: u16, x: u16, y: u16 },
-    Sync { flags: u8 },
+    Scancode {
+        flags: u8,
+        code: u8,
+    },
+    Mouse {
+        pointer_flags: u16,
+        x: u16,
+        y: u16,
+    },
+    Sync {
+        flags: u8,
+    },
     /// `TS_UNICODE_KEYBOARD_EVENT` (MS-RDPBCGR 2.2.8.1.2.2.2) - `code` is a
     /// single UTF-16 code unit, not a full codepoint; characters outside
     /// the BMP arrive as a surrogate pair across two events. `flags` only
     /// ever carries `keyboard_flags::RELEASE`, never `EXTENDED[1]`.
-    Unicode { flags: u8, code: u16 },
+    Unicode {
+        flags: u8,
+        code: u16,
+    },
 }
 
 impl FastPathInputEvent {
     fn encode(&self, out: &mut Vec<u8>) {
         match *self {
             Self::Scancode { flags, code } => {
-                out.write_u8((flags & 0x1F) | (0 << 5));
+                out.write_u8(flags & 0x1F);
                 out.write_u8(code);
             }
-            Self::Mouse { pointer_flags, x, y } => {
+            Self::Mouse {
+                pointer_flags,
+                x,
+                y,
+            } => {
                 out.write_u8(1 << 5);
                 out.write_u16_le(pointer_flags);
                 out.write_u16_le(x);
@@ -111,10 +127,18 @@ impl FastPathInput {
         }
 
         let count = self.events.len();
-        let (num_events_nibble, extra_count_byte) = if count < 15 { (count as u8, false) } else { (0, true) };
+        let (num_events_nibble, extra_count_byte) = if count < 15 {
+            (count as u8, false)
+        } else {
+            (0, true)
+        };
 
         let fixed_prefix = 1 + usize::from(extra_count_byte) + events_bytes.len();
-        let total = if fixed_prefix + 1 <= 0x7F { fixed_prefix + 1 } else { fixed_prefix + 2 };
+        let total = if fixed_prefix < 0x7F {
+            fixed_prefix + 1
+        } else {
+            fixed_prefix + 2
+        };
 
         let mut out = Vec::with_capacity(total);
         out.write_u8(num_events_nibble << 2); // action=0, flags=0
@@ -143,8 +167,14 @@ impl FastPathInput {
         }
         let num_events_nibble = (header >> 2) & 0x0F;
         let _total_length = per::read_length(&mut cursor)?;
-        let num_events = if num_events_nibble == 0 { cursor.read_u8()? } else { num_events_nibble };
-        let events = (0..num_events).map(|_| FastPathInputEvent::decode(&mut cursor)).collect::<Result<_, _>>()?;
+        let num_events = if num_events_nibble == 0 {
+            cursor.read_u8()?
+        } else {
+            num_events_nibble
+        };
+        let events = (0..num_events)
+            .map(|_| FastPathInputEvent::decode(&mut cursor))
+            .collect::<Result<_, _>>()?;
         Ok(Self { events })
     }
 }
@@ -200,10 +230,11 @@ impl FastPathUpdatePdu {
     fn decode(cursor: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
         let header = cursor.read_u8()?;
         let update_code = header & 0x0F;
-        let fragmentation = Fragmentation::from_u8((header >> 4) & 0x3).ok_or(DecodeError::InvalidValue {
-            field: "fast_path_update.fragmentation",
-            reason: "invalid fragmentation value",
-        })?;
+        let fragmentation =
+            Fragmentation::from_u8((header >> 4) & 0x3).ok_or(DecodeError::InvalidValue {
+                field: "fast_path_update.fragmentation",
+                reason: "invalid fragmentation value",
+            })?;
         if (header >> 6) & 0x2 != 0 {
             return Err(DecodeError::InvalidValue {
                 field: "fast_path_update.compression",
@@ -233,7 +264,11 @@ impl FastPathOutput {
         }
 
         let fixed_prefix = 1 + inner.len();
-        let total = if fixed_prefix + 1 <= 0x7F { fixed_prefix + 1 } else { fixed_prefix + 2 };
+        let total = if fixed_prefix < 0x7F {
+            fixed_prefix + 1
+        } else {
+            fixed_prefix + 2
+        };
 
         let mut out = Vec::with_capacity(total);
         out.write_u8(0); // action=0, encryption flags=0
@@ -369,10 +404,15 @@ impl BitmapRect {
             let cb_comp_main_body_size = cursor.read_u16_le()?;
             let cb_scan_width = cursor.read_u16_le()?;
             let _cb_uncompressed_size = cursor.read_u16_le()?;
-            let data = cursor.read_slice(usize::from(cb_comp_main_body_size))?.to_vec();
+            let data = cursor
+                .read_slice(usize::from(cb_comp_main_body_size))?
+                .to_vec();
             (data, Some(cb_scan_width))
         } else {
-            (cursor.read_slice(usize::from(bitmap_length))?.to_vec(), None)
+            (
+                cursor.read_slice(usize::from(bitmap_length))?.to_vec(),
+                None,
+            )
         };
 
         Ok(Self {
@@ -415,7 +455,9 @@ impl BitmapUpdateData {
             });
         }
         let count = cursor.read_u16_le()?;
-        let rectangles = (0..count).map(|_| BitmapRect::decode(&mut cursor)).collect::<Result<_, _>>()?;
+        let rectangles = (0..count)
+            .map(|_| BitmapRect::decode(&mut cursor))
+            .collect::<Result<_, _>>()?;
         Ok(Self { rectangles })
     }
 }
@@ -519,7 +561,10 @@ mod tests {
         let encoded = output.encode();
         let decoded = FastPathOutput::decode(&encoded).unwrap();
         assert_eq!(decoded, output);
-        assert_eq!(BitmapUpdateData::decode(&decoded.updates[0].data).unwrap(), bitmap);
+        assert_eq!(
+            BitmapUpdateData::decode(&decoded.updates[0].data).unwrap(),
+            bitmap
+        );
     }
 
     #[test]

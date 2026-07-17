@@ -6,9 +6,9 @@
 
 pub mod pdu;
 
+use rdpcore_pdu::DecodeError;
 use rdpcore_pdu::mcs::SendData;
 use rdpcore_pdu::x224;
-use rdpcore_pdu::DecodeError;
 
 pub trait RdpsndError: std::error::Error + Send {}
 impl<T: std::error::Error + Send> RdpsndError for T {}
@@ -68,8 +68,16 @@ pub struct RdpsndChannel {
 impl RdpsndChannel {
     /// Returns the channel plus the initial Server Audio Formats frame(s)
     /// the caller should send immediately, in order.
-    pub fn new(channel_id: u16, user_channel_id: u16, handler: Box<dyn RdpsndServerHandler>) -> (Self, Vec<Vec<u8>>) {
-        let initial = wrap_indication(user_channel_id, channel_id, pdu::encode_server_audio_formats(handler.get_formats()));
+    pub fn new(
+        channel_id: u16,
+        user_channel_id: u16,
+        handler: Box<dyn RdpsndServerHandler>,
+    ) -> (Self, Vec<Vec<u8>>) {
+        let initial = wrap_indication(
+            user_channel_id,
+            channel_id,
+            pdu::encode_server_audio_formats(handler.get_formats()),
+        );
         (
             Self {
                 channel_id,
@@ -99,10 +107,15 @@ impl RdpsndChannel {
 
         match (pdu::decode_client_message(body)?, &self.state) {
             (pdu::ClientMessage::AudioFormats(client_formats), State::WaitFormats) => {
-                let negotiated = pdu::negotiate_formats(self.handler.get_formats(), &client_formats.formats);
+                let negotiated =
+                    pdu::negotiate_formats(self.handler.get_formats(), &client_formats.formats);
                 self.negotiated = self.handler.choose_format(&negotiated);
                 self.state = State::WaitTrainingConfirm;
-                Ok(wrap_indication(self.user_channel_id, self.channel_id, pdu::encode_training()))
+                Ok(wrap_indication(
+                    self.user_channel_id,
+                    self.channel_id,
+                    pdu::encode_training(),
+                ))
             }
             (pdu::ClientMessage::TrainingConfirm, State::WaitTrainingConfirm) => {
                 if let Some(negotiated) = self.negotiated.clone() {
@@ -180,7 +193,10 @@ mod tests {
             &self.formats
         }
 
-        fn choose_format(&mut self, common: &[pdu::NegotiatedFormat]) -> Option<pdu::NegotiatedFormat> {
+        fn choose_format(
+            &mut self,
+            common: &[pdu::NegotiatedFormat],
+        ) -> Option<pdu::NegotiatedFormat> {
             common.first().cloned()
         }
 
@@ -259,10 +275,17 @@ mod tests {
         // No wave frames before negotiation completes.
         assert!(channel.encode_wave(vec![0; 10], 0).is_empty());
 
-        let training = channel.on_channel_data(&client_audio_formats_payload(&formats)).unwrap();
+        let training = channel
+            .on_channel_data(&client_audio_formats_payload(&formats))
+            .unwrap();
         assert!(!training.is_empty(), "expects a Training PDU in response");
 
-        assert!(channel.on_channel_data(&training_confirm_payload()).unwrap().is_empty());
+        assert!(
+            channel
+                .on_channel_data(&training_confirm_payload())
+                .unwrap()
+                .is_empty()
+        );
 
         // Now negotiated and started - a wave chunk should encode.
         let wave = channel.encode_wave(vec![0xAB; 100], 1234);
@@ -283,7 +306,12 @@ mod tests {
         wave_confirm.write_u8(0);
         wave_confirm.write_u8(0);
 
-        assert!(channel.on_channel_data(&as_single_incoming_chunk(&wave_confirm)).unwrap().is_empty());
+        assert!(
+            channel
+                .on_channel_data(&as_single_incoming_chunk(&wave_confirm))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -294,13 +322,21 @@ mod tests {
             ..Default::default()
         });
         let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
-        channel.on_channel_data(&client_audio_formats_payload(&formats)).unwrap();
-        channel.on_channel_data(&training_confirm_payload()).unwrap();
+        channel
+            .on_channel_data(&client_audio_formats_payload(&formats))
+            .unwrap();
+        channel
+            .on_channel_data(&training_confirm_payload())
+            .unwrap();
 
         // A 20ms/48kHz/stereo/16-bit chunk is 3840 bytes of PCM - plus the
         // 12-byte Wave2 header, well over the 1600-byte default SVC chunk
         // size, so this must come back as more than one wire frame.
         let wave_frames = channel.encode_wave(vec![0x11; 3840], 0);
-        assert!(wave_frames.len() > 1, "expected multiple SVC chunks, got {}", wave_frames.len());
+        assert!(
+            wave_frames.len() > 1,
+            "expected multiple SVC chunks, got {}",
+            wave_frames.len()
+        );
     }
 }

@@ -102,7 +102,11 @@ impl VirtualInput {
             )
         };
         let written = unsafe {
-            libc::write(fd, dev_bytes.as_ptr() as *const libc::c_void, dev_bytes.len())
+            libc::write(
+                fd,
+                dev_bytes.as_ptr() as *const libc::c_void,
+                dev_bytes.len(),
+            )
         };
         if written != dev_bytes.len() as isize {
             return Err(io::Error::last_os_error());

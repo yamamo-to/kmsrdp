@@ -14,8 +14,8 @@
 //! compressed bitmap from a client) - `decode` exists purely so the
 //! encoder can be round-trip tested without a live client.
 
-use crate::cursor::ReadCursor;
 use crate::DecodeError;
+use crate::cursor::ReadCursor;
 
 pub const FORMAT_HEADER_RLE_NO_ALPHA_ARGB: u8 = 0x30;
 
@@ -103,7 +103,11 @@ fn encode_plane(plane: &[u8], width: usize, height: usize, out: &mut Vec<u8>) {
     }
 }
 
-fn decode_plane(cursor: &mut ReadCursor<'_>, width: usize, height: usize) -> Result<Vec<u8>, DecodeError> {
+fn decode_plane(
+    cursor: &mut ReadCursor<'_>,
+    width: usize,
+    height: usize,
+) -> Result<Vec<u8>, DecodeError> {
     let mut delta = vec![0u8; width * height];
     for row in 0..height {
         decode_scanline_rle(cursor, &mut delta[row * width..(row + 1) * width])?;
@@ -199,7 +203,10 @@ fn emit_run(byte: u8, count: usize, out: &mut Vec<u8>) {
     }
 }
 
-fn decode_scanline_rle(cursor: &mut ReadCursor<'_>, scanline: &mut [u8]) -> Result<(), DecodeError> {
+fn decode_scanline_rle(
+    cursor: &mut ReadCursor<'_>,
+    scanline: &mut [u8],
+) -> Result<(), DecodeError> {
     let mut last_byte = 0u8;
     let mut pos = 0;
     while pos < scanline.len() {
@@ -248,7 +255,11 @@ fn decode_scanline_rle(cursor: &mut ReadCursor<'_>, scanline: &mut [u8]) -> Resu
 mod tests {
     use super::*;
 
-    fn make_tile(width: usize, height: usize, mut pixel: impl FnMut(usize, usize) -> (u8, u8, u8)) -> Vec<u8> {
+    fn make_tile(
+        width: usize,
+        height: usize,
+        mut pixel: impl FnMut(usize, usize) -> (u8, u8, u8),
+    ) -> Vec<u8> {
         let mut out = vec![0u8; width * height * 4];
         for row in 0..height {
             for col in 0..width {
@@ -274,14 +285,20 @@ mod tests {
     fn solid_color_tile_round_trips_and_compresses_well() {
         let bgrx = make_tile(64, 64, |_, _| (10, 20, 30));
         let compressed = encode(&bgrx, 64, 64);
-        assert!(compressed.len() < bgrx.len() / 10, "solid color should compress at least 10x, got {} bytes", compressed.len());
+        assert!(
+            compressed.len() < bgrx.len() / 10,
+            "solid color should compress at least 10x, got {} bytes",
+            compressed.len()
+        );
         let decoded = decode(&compressed, 64, 64).unwrap();
         assert_eq!(decoded, bgrx);
     }
 
     #[test]
     fn gradient_tile_round_trips() {
-        let bgrx = make_tile(64, 64, |x, y| ((x * 4) as u8, (y * 4) as u8, ((x + y) * 2) as u8));
+        let bgrx = make_tile(64, 64, |x, y| {
+            ((x * 4) as u8, (y * 4) as u8, ((x + y) * 2) as u8)
+        });
         let compressed = encode(&bgrx, 64, 64);
         let decoded = decode(&compressed, 64, 64).unwrap();
         assert_eq!(decoded, bgrx);
@@ -308,7 +325,13 @@ mod tests {
         // boundaries this encoder deliberately avoids) and past it.
         for &run_len in &[3usize, 4, 15, 16, 17, 31, 32, 33, 60] {
             let width = run_len + 5;
-            let bgrx = make_tile(width, 3, |x, _| if x < run_len { (7, 7, 7) } else { (200, 200, 200) });
+            let bgrx = make_tile(width, 3, |x, _| {
+                if x < run_len {
+                    (7, 7, 7)
+                } else {
+                    (200, 200, 200)
+                }
+            });
             let compressed = encode(&bgrx, width, 3);
             let decoded = decode(&compressed, width, 3).unwrap();
             assert_eq!(decoded, bgrx, "run length {run_len}");
@@ -333,13 +356,25 @@ mod tests {
     #[test]
     fn decode_rejects_unsupported_format_header() {
         let err = decode(&[0x00, 0, 0, 0], 4, 1).unwrap_err();
-        assert!(matches!(err, DecodeError::InvalidValue { field: "rdp6.format_header", .. }));
+        assert!(matches!(
+            err,
+            DecodeError::InvalidValue {
+                field: "rdp6.format_header",
+                ..
+            }
+        ));
     }
 
     #[test]
     fn decode_rejects_zero_control_byte() {
         // FormatHeader + a lone 0x00 control byte for the R plane.
         let err = decode(&[FORMAT_HEADER_RLE_NO_ALPHA_ARGB, 0x00], 4, 1).unwrap_err();
-        assert!(matches!(err, DecodeError::InvalidValue { field: "rdp6.rle.control", .. }));
+        assert!(matches!(
+            err,
+            DecodeError::InvalidValue {
+                field: "rdp6.rle.control",
+                ..
+            }
+        ));
     }
 }

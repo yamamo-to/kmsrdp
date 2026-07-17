@@ -13,8 +13,8 @@
 //! only enough to skip over it - a real server implementation doesn't wait
 //! for it before sending more audio, so this one doesn't either.
 
-use rdpcore_pdu::cursor::{ReadCursor, WriteBuf};
 use rdpcore_pdu::DecodeError;
+use rdpcore_pdu::cursor::{ReadCursor, WriteBuf};
 
 pub const SNDC_WAVE2: u8 = 0x0D;
 pub const SNDC_WAVECONFIRM: u8 = 0x05;
@@ -151,7 +151,9 @@ fn decode_client_audio_formats(body: &[u8]) -> Result<ClientAudioFormats, Decode
     let _last_block_confirmed = cursor.read_u8()?;
     let _version = cursor.read_u16_le()?;
     let _pad = cursor.read_u8()?;
-    let formats = (0..count).map(|_| AudioFormat::decode(&mut cursor)).collect::<Result<_, _>>()?;
+    let formats = (0..count)
+        .map(|_| AudioFormat::decode(&mut cursor))
+        .collect::<Result<_, _>>()?;
     Ok(ClientAudioFormats { formats })
 }
 
@@ -193,7 +195,10 @@ pub struct NegotiatedFormat {
 /// Server formats this crate can produce that the client also advertised
 /// support for, in client format-list order (so `format_no` matches what
 /// `Wave2` needs to reference).
-pub fn negotiate_formats(server_formats: &[AudioFormat], client_formats: &[AudioFormat]) -> Vec<NegotiatedFormat> {
+pub fn negotiate_formats(
+    server_formats: &[AudioFormat],
+    client_formats: &[AudioFormat],
+) -> Vec<NegotiatedFormat> {
     client_formats
         .iter()
         .enumerate()
@@ -228,7 +233,9 @@ pub fn decode_client_message(input: &[u8]) -> Result<ClientMessage, DecodeError>
     let body = cursor.read_slice(body_len)?;
 
     match msg_type {
-        SNDC_FORMATS => Ok(ClientMessage::AudioFormats(decode_client_audio_formats(body)?)),
+        SNDC_FORMATS => Ok(ClientMessage::AudioFormats(decode_client_audio_formats(
+            body,
+        )?)),
         SNDC_TRAINING => Ok(ClientMessage::TrainingConfirm),
         _ => Ok(ClientMessage::Other),
     }
@@ -286,7 +293,10 @@ mod tests {
         write_header(&mut pdu, SNDC_TRAINING, 4);
         pdu.write_u16_le(0);
         pdu.write_u16_le(0);
-        assert_eq!(decode_client_message(&pdu).unwrap(), ClientMessage::TrainingConfirm);
+        assert_eq!(
+            decode_client_message(&pdu).unwrap(),
+            ClientMessage::TrainingConfirm
+        );
     }
 
     #[test]
@@ -310,7 +320,10 @@ mod tests {
         let body = &encoded[4..];
         assert_eq!(u16::from_le_bytes([body[2], body[3]]), 3);
         assert_eq!(body[4], 7);
-        assert_eq!(u32::from_le_bytes([body[8], body[9], body[10], body[11]]), 0x1000);
+        assert_eq!(
+            u32::from_le_bytes([body[8], body[9], body[10], body[11]]),
+            0x1000
+        );
         assert_eq!(&encoded[16..], &data[..]);
     }
 

@@ -20,11 +20,23 @@ pub struct Rect {
 
 impl Rect {
     pub fn new(x: usize, y: usize, width: usize, height: usize) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 }
 
-fn tile_differs(image1: &[u8], stride1: usize, image2: &[u8], stride2: usize, bpp: usize, tile: Rect) -> bool {
+fn tile_differs(
+    image1: &[u8],
+    stride1: usize,
+    image2: &[u8],
+    stride2: usize,
+    bpp: usize,
+    tile: Rect,
+) -> bool {
     (tile.y..tile.y + tile.height).any(|row| {
         let start1 = row * stride1 + tile.x * bpp;
         let end1 = start1 + tile.width * bpp;
@@ -38,7 +50,15 @@ fn tile_differs(image1: &[u8], stride1: usize, image2: &[u8], stride2: usize, bp
 /// `stride >= width * bpp`; `bpp` is bytes per pixel (4 for BGRX32).
 /// Returns the changed regions, each a multiple of one tile except at the
 /// frame's right/bottom edge.
-pub fn find_dirty_rects(image1: &[u8], stride1: usize, image2: &[u8], stride2: usize, width: usize, height: usize, bpp: usize) -> Vec<Rect> {
+pub fn find_dirty_rects(
+    image1: &[u8],
+    stride1: usize,
+    image2: &[u8],
+    stride2: usize,
+    width: usize,
+    height: usize,
+    bpp: usize,
+) -> Vec<Rect> {
     if width == 0 || height == 0 {
         return Vec::new();
     }
@@ -97,7 +117,12 @@ pub fn find_dirty_rects(image1: &[u8], stride1: usize, image2: &[u8], stride2: u
             run_height * TILE_SIZE
         };
 
-        rects.push(Rect::new(start_x * TILE_SIZE, start_y * TILE_SIZE, pixel_width, pixel_height));
+        rects.push(Rect::new(
+            start_x * TILE_SIZE,
+            start_y * TILE_SIZE,
+            pixel_width,
+            pixel_height,
+        ));
 
         for y in 0..run_height {
             for x in 0..run_width {

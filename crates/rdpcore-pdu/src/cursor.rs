@@ -12,7 +12,11 @@ pub struct NotEnoughBytes {
 
 impl fmt::Display for NotEnoughBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "needed {} bytes, only {} remaining", self.needed, self.remaining)
+        write!(
+            f,
+            "needed {} bytes, only {} remaining",
+            self.needed, self.remaining
+        )
     }
 }
 
@@ -53,7 +57,10 @@ impl<'a> ReadCursor<'a> {
 
     pub fn peek_u16_be(&self) -> Result<u16, NotEnoughBytes> {
         self.ensure(2)?;
-        Ok(u16::from_be_bytes([self.buf[self.pos], self.buf[self.pos + 1]]))
+        Ok(u16::from_be_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+        ]))
     }
 
     /// Looks at the next `n` bytes without advancing the position.

@@ -10,7 +10,7 @@
 //! the identical CREATE/WRITE/CLOSE mechanism also round-trips for
 //! RDPDR_DTYP_PRINT. Every step is reported through `on_event`.
 
-use crate::{irp, pdu, DriveCommand, DriveConsumer};
+use crate::{DriveCommand, DriveConsumer, irp, pdu};
 
 const LIST_ALL_PATTERN: &str = "\\*";
 const SAMPLE_READ_LENGTH: u32 = 4096;
@@ -47,11 +47,18 @@ impl DirectoryListingSelfTest {
 }
 
 impl DriveConsumer for DirectoryListingSelfTest {
-    fn on_device_ready(&mut self, device_id: u32, device_type: u32, dos_name: &str) -> Vec<DriveCommand> {
+    fn on_device_ready(
+        &mut self,
+        device_id: u32,
+        device_type: u32,
+        dos_name: &str,
+    ) -> Vec<DriveCommand> {
         self.device_id = device_id;
 
         if device_type == pdu::RDPDR_DTYP_PRINT {
-            self.log(format!("printer {device_id} ({dos_name}) ready - opening a test print job"));
+            self.log(format!(
+                "printer {device_id} ({dos_name}) ready - opening a test print job"
+            ));
             return vec![DriveCommand::Create {
                 device_id,
                 path: String::new(), // print jobs aren't addressed by path
@@ -62,7 +69,9 @@ impl DriveConsumer for DirectoryListingSelfTest {
             }];
         }
 
-        self.log(format!("device {device_id} ({dos_name}) ready - opening root directory"));
+        self.log(format!(
+            "device {device_id} ({dos_name}) ready - opening root directory"
+        ));
         vec![
             DriveCommand::Create {
                 device_id,
@@ -83,7 +92,11 @@ impl DriveConsumer for DirectoryListingSelfTest {
         ]
     }
 
-    fn on_create_reply(&mut self, request_tag: u64, result: Result<irp::CreateReply, u32>) -> Vec<DriveCommand> {
+    fn on_create_reply(
+        &mut self,
+        request_tag: u64,
+        result: Result<irp::CreateReply, u32>,
+    ) -> Vec<DriveCommand> {
         match (request_tag, result) {
             (1, Ok(reply)) => {
                 self.root_file_id = Some(reply.file_id);
@@ -96,12 +109,17 @@ impl DriveConsumer for DirectoryListingSelfTest {
                 }]
             }
             (1, Err(status)) => {
-                self.log(format!("failed to open root directory: NTSTATUS {status:#010x}"));
+                self.log(format!(
+                    "failed to open root directory: NTSTATUS {status:#010x}"
+                ));
                 Vec::new()
             }
             (3, Ok(reply)) => {
                 self.sample_file_id = Some(reply.file_id);
-                self.log(format!("sample file opened (FileId {}) - reading first {SAMPLE_READ_LENGTH} bytes", reply.file_id));
+                self.log(format!(
+                    "sample file opened (FileId {}) - reading first {SAMPLE_READ_LENGTH} bytes",
+                    reply.file_id
+                ));
                 vec![DriveCommand::Read {
                     device_id: self.device_id,
                     file_id: reply.file_id,
@@ -111,12 +129,18 @@ impl DriveConsumer for DirectoryListingSelfTest {
                 }]
             }
             (3, Err(status)) => {
-                self.log(format!("failed to open sample file: NTSTATUS {status:#010x}"));
+                self.log(format!(
+                    "failed to open sample file: NTSTATUS {status:#010x}"
+                ));
                 Vec::new()
             }
             (7, Ok(reply)) => {
                 self.write_test_file_id = Some(reply.file_id);
-                self.log(format!("write-test file created (FileId {}) - writing {} bytes", reply.file_id, WRITE_TEST_CONTENTS.len()));
+                self.log(format!(
+                    "write-test file created (FileId {}) - writing {} bytes",
+                    reply.file_id,
+                    WRITE_TEST_CONTENTS.len()
+                ));
                 vec![DriveCommand::Write {
                     device_id: self.device_id,
                     file_id: reply.file_id,
@@ -126,12 +150,18 @@ impl DriveConsumer for DirectoryListingSelfTest {
                 }]
             }
             (7, Err(status)) => {
-                self.log(format!("failed to create write-test file: NTSTATUS {status:#010x}"));
+                self.log(format!(
+                    "failed to create write-test file: NTSTATUS {status:#010x}"
+                ));
                 Vec::new()
             }
             (10, Ok(reply)) => {
                 self.print_job_file_id = Some(reply.file_id);
-                self.log(format!("print job opened (FileId {}) - writing {} bytes", reply.file_id, PRINT_JOB_TEST_CONTENTS.len()));
+                self.log(format!(
+                    "print job opened (FileId {}) - writing {} bytes",
+                    reply.file_id,
+                    PRINT_JOB_TEST_CONTENTS.len()
+                ));
                 vec![DriveCommand::Write {
                     device_id: self.device_id,
                     file_id: reply.file_id,
@@ -148,7 +178,11 @@ impl DriveConsumer for DirectoryListingSelfTest {
         }
     }
 
-    fn on_query_directory_reply(&mut self, request_tag: u64, result: Result<Option<irp::DirectoryEntry>, u32>) -> Vec<DriveCommand> {
+    fn on_query_directory_reply(
+        &mut self,
+        request_tag: u64,
+        result: Result<Option<irp::DirectoryEntry>, u32>,
+    ) -> Vec<DriveCommand> {
         if request_tag != 2 {
             return Vec::new();
         }
@@ -162,7 +196,10 @@ impl DriveConsumer for DirectoryListingSelfTest {
                     entry.end_of_file
                 ));
 
-                let should_sample = !is_dir && !self.sampled_a_file && entry.file_name != "." && entry.file_name != "..";
+                let should_sample = !is_dir
+                    && !self.sampled_a_file
+                    && entry.file_name != "."
+                    && entry.file_name != "..";
                 if should_sample {
                     self.sampled_a_file = true;
                     return vec![DriveCommand::Create {
@@ -175,7 +212,9 @@ impl DriveConsumer for DirectoryListingSelfTest {
                     }];
                 }
 
-                let Some(root_file_id) = self.root_file_id else { return Vec::new() };
+                let Some(root_file_id) = self.root_file_id else {
+                    return Vec::new();
+                };
                 vec![DriveCommand::QueryDirectory {
                     device_id: self.device_id,
                     file_id: root_file_id,
@@ -185,8 +224,14 @@ impl DriveConsumer for DirectoryListingSelfTest {
             }
             Ok(None) => {
                 self.log("directory listing complete");
-                let Some(root_file_id) = self.root_file_id.take() else { return Vec::new() };
-                vec![DriveCommand::Close { device_id: self.device_id, file_id: root_file_id, request_tag: 5 }]
+                let Some(root_file_id) = self.root_file_id.take() else {
+                    return Vec::new();
+                };
+                vec![DriveCommand::Close {
+                    device_id: self.device_id,
+                    file_id: root_file_id,
+                    request_tag: 5,
+                }]
             }
             Err(status) => {
                 self.log(format!("directory query failed: NTSTATUS {status:#010x}"));
@@ -195,38 +240,71 @@ impl DriveConsumer for DirectoryListingSelfTest {
         }
     }
 
-    fn on_read_reply(&mut self, request_tag: u64, result: Result<Vec<u8>, u32>) -> Vec<DriveCommand> {
+    fn on_read_reply(
+        &mut self,
+        request_tag: u64,
+        result: Result<Vec<u8>, u32>,
+    ) -> Vec<DriveCommand> {
         if request_tag != 4 {
             return Vec::new();
         }
         match result {
             Ok(data) => {
                 let preview = String::from_utf8_lossy(&data[..data.len().min(200)]);
-                self.log(format!("read {} bytes from sample file - preview: {preview:?}", data.len()));
+                self.log(format!(
+                    "read {} bytes from sample file - preview: {preview:?}",
+                    data.len()
+                ));
             }
             Err(status) => self.log(format!("sample file read failed: NTSTATUS {status:#010x}")),
         }
-        let Some(file_id) = self.sample_file_id.take() else { return Vec::new() };
-        vec![DriveCommand::Close { device_id: self.device_id, file_id, request_tag: 6 }]
+        let Some(file_id) = self.sample_file_id.take() else {
+            return Vec::new();
+        };
+        vec![DriveCommand::Close {
+            device_id: self.device_id,
+            file_id,
+            request_tag: 6,
+        }]
     }
 
     fn on_write_reply(&mut self, request_tag: u64, result: Result<u32, u32>) -> Vec<DriveCommand> {
         match request_tag {
             8 => {
                 match result {
-                    Ok(bytes_written) => self.log(format!("wrote {bytes_written} bytes to write-test file")),
-                    Err(status) => self.log(format!("write-test write failed: NTSTATUS {status:#010x}")),
+                    Ok(bytes_written) => {
+                        self.log(format!("wrote {bytes_written} bytes to write-test file"))
+                    }
+                    Err(status) => {
+                        self.log(format!("write-test write failed: NTSTATUS {status:#010x}"))
+                    }
                 }
-                let Some(file_id) = self.write_test_file_id.take() else { return Vec::new() };
-                vec![DriveCommand::Close { device_id: self.device_id, file_id, request_tag: 9 }]
+                let Some(file_id) = self.write_test_file_id.take() else {
+                    return Vec::new();
+                };
+                vec![DriveCommand::Close {
+                    device_id: self.device_id,
+                    file_id,
+                    request_tag: 9,
+                }]
             }
             11 => {
                 match result {
-                    Ok(bytes_written) => self.log(format!("wrote {bytes_written} bytes to print job")),
-                    Err(status) => self.log(format!("print job write failed: NTSTATUS {status:#010x}")),
+                    Ok(bytes_written) => {
+                        self.log(format!("wrote {bytes_written} bytes to print job"))
+                    }
+                    Err(status) => {
+                        self.log(format!("print job write failed: NTSTATUS {status:#010x}"))
+                    }
                 }
-                let Some(file_id) = self.print_job_file_id.take() else { return Vec::new() };
-                vec![DriveCommand::Close { device_id: self.device_id, file_id, request_tag: 12 }]
+                let Some(file_id) = self.print_job_file_id.take() else {
+                    return Vec::new();
+                };
+                vec![DriveCommand::Close {
+                    device_id: self.device_id,
+                    file_id,
+                    request_tag: 12,
+                }]
             }
             _ => Vec::new(),
         }
@@ -235,9 +313,13 @@ impl DriveConsumer for DirectoryListingSelfTest {
     fn on_close_reply(&mut self, request_tag: u64, status: u32) -> Vec<DriveCommand> {
         match request_tag {
             5 => self.log(format!("root directory closed (status {status:#010x})")),
-            6 => self.log(format!("sample file closed (status {status:#010x}) - self-test complete")),
+            6 => self.log(format!(
+                "sample file closed (status {status:#010x}) - self-test complete"
+            )),
             9 => self.log(format!("write-test file closed (status {status:#010x})")),
-            12 => self.log(format!("print job closed (status {status:#010x}) - print self-test complete")),
+            12 => self.log(format!(
+                "print job closed (status {status:#010x}) - print self-test complete"
+            )),
             _ => {}
         }
         Vec::new()

@@ -18,15 +18,15 @@ use zbus::proxy;
 
 use crate::session::{Session, find_display_fallback, find_xauthority};
 
+type LogindSession = (String, u32, String, String, zbus::zvariant::OwnedObjectPath);
+
 #[proxy(
     interface = "org.freedesktop.login1.Manager",
     default_service = "org.freedesktop.login1",
     default_path = "/org/freedesktop/login1"
 )]
 trait LoginManager {
-    fn list_sessions(
-        &self,
-    ) -> zbus::Result<Vec<(String, u32, String, String, zbus::zvariant::OwnedObjectPath)>>;
+    fn list_sessions(&self) -> zbus::Result<Vec<LogindSession>>;
 
     #[zbus(signal)]
     fn session_new(
@@ -102,7 +102,13 @@ async fn find_active_session(conn: &Connection) -> Option<Session> {
         let xdg_runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
         let xauthority = find_xauthority(&username, &xdg_runtime_dir, leader);
 
-        return Some(Session { uid, username, display, xauthority, xdg_runtime_dir });
+        return Some(Session {
+            uid,
+            username,
+            display,
+            xauthority,
+            xdg_runtime_dir,
+        });
     }
 
     None

@@ -2,9 +2,9 @@
 //! 2.2.1.14-2.2.1.20): Synchronize, Control, Font List/Map. All four ride
 //! inside a Share Control Header `DataPdu` (type 0x7).
 
+use crate::DecodeError;
 use crate::capability_sets::{ShareControlHeader, ShareControlPduType};
 use crate::cursor::{ReadCursor, WriteBuf};
-use crate::DecodeError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareDataPduType {
@@ -56,13 +56,20 @@ impl ShareDataHeader {
         let _pad1 = cursor.read_u8()?;
         let stream_id = cursor.read_u8()?;
         let uncompressed_length = cursor.read_u16_le()?;
-        let pdu_type2 = ShareDataPduType::from_u8(cursor.read_u8()?).ok_or(DecodeError::InvalidValue {
-            field: "share_data_header.pdu_type2",
-            reason: "unrecognized data PDU subtype",
-        })?;
+        let pdu_type2 =
+            ShareDataPduType::from_u8(cursor.read_u8()?).ok_or(DecodeError::InvalidValue {
+                field: "share_data_header.pdu_type2",
+                reason: "unrecognized data PDU subtype",
+            })?;
         let _compressed_type = cursor.read_u8()?;
         let _compressed_length = cursor.read_u16_le()?;
-        Ok((Self { stream_id, pdu_type2 }, uncompressed_length))
+        Ok((
+            Self {
+                stream_id,
+                pdu_type2,
+            },
+            uncompressed_length,
+        ))
     }
 }
 
@@ -119,7 +126,9 @@ impl DataPdu {
         let before_share_data = cursor.pos();
         let (share_data_header, _uncompressed_length) = ShareDataHeader::decode(&mut cursor)?;
         let share_data_consumed = cursor.pos() - before_share_data;
-        let body_len = declared_body_len.saturating_sub(share_data_consumed).min(cursor.remaining());
+        let body_len = declared_body_len
+            .saturating_sub(share_data_consumed)
+            .min(cursor.remaining());
         let body = cursor.read_slice(body_len)?.to_vec();
         Ok(Self {
             share_id: header.share_id,
@@ -269,7 +278,10 @@ mod tests {
         let encoded = pdu.encode();
         let decoded = DataPdu::decode(&encoded).unwrap();
         assert_eq!(decoded, pdu);
-        assert_eq!(SynchronizePdu::decode_body(&decoded.body).unwrap(), SynchronizePdu { target_user: 0 });
+        assert_eq!(
+            SynchronizePdu::decode_body(&decoded.body).unwrap(),
+            SynchronizePdu { target_user: 0 }
+        );
     }
 
     #[test]
@@ -293,7 +305,10 @@ mod tests {
     #[test]
     fn font_map_default_round_trip() {
         let font_map = FontPdu::font_map_default();
-        assert_eq!(FontPdu::decode_body(&font_map.encode_body()).unwrap(), font_map);
+        assert_eq!(
+            FontPdu::decode_body(&font_map.encode_body()).unwrap(),
+            font_map
+        );
         assert_eq!(font_map.flags, FontPdu::FIRST | FontPdu::LAST);
         assert_eq!(font_map.entry_size, 4);
     }

@@ -40,7 +40,13 @@ impl BitmapUpdate {
     /// Extracts a sub-rectangle, re-packing it tightly (`stride = width *
     /// 4`) regardless of `self`'s own stride - so downstream wire encoding
     /// never has to deal with row padding.
-    pub fn sub(&self, x: u16, y: u16, width: NonZeroU16, height: NonZeroU16) -> Option<BitmapUpdate> {
+    pub fn sub(
+        &self,
+        x: u16,
+        y: u16,
+        width: NonZeroU16,
+        height: NonZeroU16,
+    ) -> Option<BitmapUpdate> {
         const BYTES_PER_PIXEL: usize = 4;
         let (bx, by) = (usize::from(x), usize::from(y));
         let (bw, bh) = (usize::from(width.get()), usize::from(height.get()));

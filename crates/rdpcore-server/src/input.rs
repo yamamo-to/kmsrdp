@@ -4,8 +4,14 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyboardEvent {
-    Pressed { code: u8, extended: bool },
-    Released { code: u8, extended: bool },
+    Pressed {
+        code: u8,
+        extended: bool,
+    },
+    Released {
+        code: u8,
+        extended: bool,
+    },
     /// A `TS_UNICODE_KEYBOARD_EVENT` key-down (`rdpcore_pdu::fastpath`
     /// drops the paired key-up, which carries no useful information for
     /// this event type) - a single UTF-16 code unit, for CJK/IME text

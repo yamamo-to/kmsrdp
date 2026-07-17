@@ -16,13 +16,18 @@ pub fn build_acceptor() -> io::Result<TlsAcceptor> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let hostnames = tls_hostnames();
-    eprintln!("kmsrdp: TLS certificate hostnames: {}", hostnames.join(", "));
+    eprintln!(
+        "kmsrdp: TLS certificate hostnames: {}",
+        hostnames.join(", ")
+    );
 
-    let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(hostnames)
-        .map_err(|e| io::Error::other(format!("certificate generation failed: {e}")))?;
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(hostnames)
+            .map_err(|e| io::Error::other(format!("certificate generation failed: {e}")))?;
 
     let cert_der: CertificateDer<'static> = cert.der().clone();
-    let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into();
+    let key_der: PrivateKeyDer<'static> =
+        PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into();
 
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()

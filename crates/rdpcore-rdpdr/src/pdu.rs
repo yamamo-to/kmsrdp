@@ -12,9 +12,9 @@
 //! Name Request, not by Client Announce Reply), and a conditional
 //! "Server User Logged On" message follows the Client Capability Response.
 
+use rdpcore_pdu::DecodeError;
 use rdpcore_pdu::cursor::{ReadCursor, WriteBuf};
 use rdpcore_pdu::utf16;
-use rdpcore_pdu::DecodeError;
 
 pub const CHANNEL_NAME: &str = "rdpdr";
 
@@ -140,7 +140,9 @@ pub fn encode_server_capability_request(supported: u32) -> Vec<u8> {
     out.write_u16_le(VERSION_MINOR);
     out.write_u32_le(0xFFFF_FFFF); // ioCode1: advertise every IRP_MJ_* op
     out.write_u32_le(0); // ioCode2 (reserved)
-    out.write_u32_le(RDPDR_DEVICE_REMOVE_PDUS | RDPDR_CLIENT_DISPLAY_NAME_PDU | RDPDR_USER_LOGGEDON_PDU);
+    out.write_u32_le(
+        RDPDR_DEVICE_REMOVE_PDUS | RDPDR_CLIENT_DISPLAY_NAME_PDU | RDPDR_USER_LOGGEDON_PDU,
+    );
     out.write_u32_le(ENABLE_ASYNCIO); // extraFlags1
     out.write_u32_le(0); // extraFlags2
     out.write_u32_le(0); // SpecialTypeDeviceCap
@@ -224,7 +226,11 @@ pub fn decode_printer_device_data(data: &[u8]) -> Option<PrinterDeviceData> {
 
 fn decode_printer_string(cursor: &mut ReadCursor, len: usize, ascii: bool) -> Option<String> {
     let bytes = cursor.read_slice(len).ok()?;
-    let decoded = if ascii { String::from_utf8_lossy(bytes).into_owned() } else { utf16::decode_units(bytes) };
+    let decoded = if ascii {
+        String::from_utf8_lossy(bytes).into_owned()
+    } else {
+        utf16::decode_units(bytes)
+    };
     Some(decoded.trim_end_matches('\0').to_owned())
 }
 
@@ -238,7 +244,12 @@ pub enum ClientMessage {
     /// Header stripped, body left raw - the caller (which remembers what
     /// `MajorFunction` this `CompletionId` corresponds to) decodes the
     /// rest via `crate::irp`.
-    DeviceIoCompletion { device_id: u32, completion_id: u32, io_status: u32, body: Vec<u8> },
+    DeviceIoCompletion {
+        device_id: u32,
+        completion_id: u32,
+        io_status: u32,
+        body: Vec<u8>,
+    },
     Other,
 }
 
@@ -254,7 +265,12 @@ fn decode_device_list_announce(body: &[u8]) -> Result<Vec<DeviceAnnounce>, Decod
         let preferred_dos_name = String::from_utf8_lossy(&dos_name_raw[..end]).into_owned();
         let device_data_length = cursor.read_u32_le()?;
         let device_data = cursor.read_slice(device_data_length as usize)?.to_vec();
-        devices.push(DeviceAnnounce { device_type, device_id, preferred_dos_name, device_data });
+        devices.push(DeviceAnnounce {
+            device_type,
+            device_id,
+            preferred_dos_name,
+            device_data,
+        });
     }
     Ok(devices)
 }
@@ -269,14 +285,21 @@ pub fn decode_client_message(input: &[u8]) -> Result<ClientMessage, DecodeError>
         PAKID_CORE_CLIENTID_CONFIRM => Ok(ClientMessage::AnnounceReply),
         PAKID_CORE_CLIENT_NAME => Ok(ClientMessage::ClientName),
         PAKID_CORE_CLIENT_CAPABILITY => Ok(ClientMessage::ClientCapability),
-        PAKID_CORE_DEVICELIST_ANNOUNCE => Ok(ClientMessage::DeviceListAnnounce(decode_device_list_announce(body)?)),
+        PAKID_CORE_DEVICELIST_ANNOUNCE => Ok(ClientMessage::DeviceListAnnounce(
+            decode_device_list_announce(body)?,
+        )),
         PAKID_CORE_USER_LOGGEDON => Ok(ClientMessage::UserLoggedOn),
         PAKID_CORE_DEVICE_IOCOMPLETION => {
             let mut cursor = ReadCursor::new(body);
             let device_id = cursor.read_u32_le()?;
             let completion_id = cursor.read_u32_le()?;
             let io_status = cursor.read_u32_le()?;
-            Ok(ClientMessage::DeviceIoCompletion { device_id, completion_id, io_status, body: cursor.read_rest().to_vec() })
+            Ok(ClientMessage::DeviceIoCompletion {
+                device_id,
+                completion_id,
+                io_status,
+                body: cursor.read_rest().to_vec(),
+            })
         }
         _ => Ok(ClientMessage::Other),
     }
@@ -326,7 +349,8 @@ mod tests {
         assert_eq!(encoded.len(), 4 + 4 + 44 + 8 + 8); // + printer capset (header-only, like drive)
         assert_eq!(&encoded[4..6], &3u16.to_le_bytes()); // numCapabilities
         let printer_offset = 8 + 44 + 8;
-        let printer_type = u16::from_le_bytes([encoded[printer_offset], encoded[printer_offset + 1]]);
+        let printer_type =
+            u16::from_le_bytes([encoded[printer_offset], encoded[printer_offset + 1]]);
         assert_eq!(printer_type, CAP_PRINTER_TYPE);
     }
 
@@ -464,19 +488,31 @@ mod tests {
     fn simple_header_only_messages_are_recognized() {
         let mut announce_reply = Vec::new();
         write_header(&mut announce_reply, PAKID_CORE_CLIENTID_CONFIRM);
-        assert_eq!(decode_client_message(&announce_reply).unwrap(), ClientMessage::AnnounceReply);
+        assert_eq!(
+            decode_client_message(&announce_reply).unwrap(),
+            ClientMessage::AnnounceReply
+        );
 
         let mut client_name = Vec::new();
         write_header(&mut client_name, PAKID_CORE_CLIENT_NAME);
-        assert_eq!(decode_client_message(&client_name).unwrap(), ClientMessage::ClientName);
+        assert_eq!(
+            decode_client_message(&client_name).unwrap(),
+            ClientMessage::ClientName
+        );
 
         let mut client_cap = Vec::new();
         write_header(&mut client_cap, PAKID_CORE_CLIENT_CAPABILITY);
-        assert_eq!(decode_client_message(&client_cap).unwrap(), ClientMessage::ClientCapability);
+        assert_eq!(
+            decode_client_message(&client_cap).unwrap(),
+            ClientMessage::ClientCapability
+        );
 
         let mut user_logged_on = Vec::new();
         write_header(&mut user_logged_on, PAKID_CORE_USER_LOGGEDON);
-        assert_eq!(decode_client_message(&user_logged_on).unwrap(), ClientMessage::UserLoggedOn);
+        assert_eq!(
+            decode_client_message(&user_logged_on).unwrap(),
+            ClientMessage::UserLoggedOn
+        );
     }
 
     #[test]

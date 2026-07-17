@@ -14,7 +14,10 @@ impl fmt::Display for ConnectorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Decode(e) => write!(f, "PDU decode error: {e}"),
-            Self::AlreadyFinished => write!(f, "Acceptor::step called after the connection sequence finished"),
+            Self::AlreadyFinished => write!(
+                f,
+                "Acceptor::step called after the connection sequence finished"
+            ),
             Self::NotReady => write!(f, "Acceptor is not ready for this operation"),
         }
     }

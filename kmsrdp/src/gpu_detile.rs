@@ -435,6 +435,7 @@ impl GpuDetiler {
     /// Import `fd` (a plane's dma-buf, single-plane RGB only) as an
     /// `EGLImage`, draw it full-frame into the offscreen FBO, and read the
     /// result back as tightly-packed BGRX8888.
+    #[allow(clippy::too_many_arguments)] // Parameters describe one DRM framebuffer plane.
     fn detile(
         &mut self,
         fd: RawFd,
@@ -510,9 +511,7 @@ impl GpuDetiler {
             let status = (gl.check_framebuffer_status)(GL_FRAMEBUFFER);
             if status != GL_FRAMEBUFFER_COMPLETE {
                 (gl.delete_textures)(1, &texture);
-                return Err(io::Error::other(format!(
-                    "FBO incomplete: {status:#x}"
-                )));
+                return Err(io::Error::other(format!("FBO incomplete: {status:#x}")));
             }
 
             (gl.viewport)(0, 0, self.width as i32, self.height as i32);
@@ -524,7 +523,14 @@ impl GpuDetiler {
             let pos_loc = (gl.get_attrib_location)(self.program, c"in_position".as_ptr());
             let tex_loc = (gl.get_attrib_location)(self.program, c"in_texcoord".as_ptr());
             let stride = 4 * std::mem::size_of::<f32>() as i32;
-            (gl.vertex_attrib_pointer)(pos_loc as u32, 2, GL_FLOAT, GL_FALSE as u8, stride, std::ptr::null());
+            (gl.vertex_attrib_pointer)(
+                pos_loc as u32,
+                2,
+                GL_FLOAT,
+                GL_FALSE as u8,
+                stride,
+                std::ptr::null(),
+            );
             (gl.enable_vertex_attrib_array)(pos_loc as u32);
             (gl.vertex_attrib_pointer)(
                 tex_loc as u32,
@@ -571,6 +577,7 @@ static DETILER: OnceLock<Mutex<io::Result<GpuDetiler>>> = OnceLock::new();
 /// Only single-plane formats are supported (`XRGB8888`/`ARGB8888` with a
 /// vendor modifier) - multi-plane YUV framebuffers aren't handled since
 /// nothing upstream of this in `capture.rs` produces or expects them.
+#[allow(clippy::too_many_arguments)] // Public boundary accepts the DRM plane metadata directly.
 pub fn detile_to_bgrx(
     card_path: &str,
     fd: RawFd,

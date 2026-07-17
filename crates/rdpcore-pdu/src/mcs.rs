@@ -5,7 +5,7 @@
 //! encoded, per `per.rs`).
 
 use crate::cursor::{ReadCursor, WriteBuf};
-use crate::{ber, per, DecodeError};
+use crate::{DecodeError, ber, per};
 
 /// The MCS user (initiator) channel id and every subsequent domain-PDU
 /// "initiator"/channel-id field is encoded relative to this base.
@@ -241,7 +241,10 @@ fn write_choice_byte(out: &mut Vec<u8>, pdu: DomainMcsPdu, options: u8) {
     per::write_choice(out, (pdu.as_u8() << 2) | options);
 }
 
-fn read_choice_byte(cursor: &mut ReadCursor<'_>, expected: DomainMcsPdu) -> Result<u8, DecodeError> {
+fn read_choice_byte(
+    cursor: &mut ReadCursor<'_>,
+    expected: DomainMcsPdu,
+) -> Result<u8, DecodeError> {
     let byte = per::read_choice(cursor)?;
     let (pdu, options) = (DomainMcsPdu::from_u8(byte >> 2), byte & 0x3);
     if pdu != Some(expected) {
@@ -470,7 +473,8 @@ pub struct DisconnectProviderUltimatum {
 
 impl DisconnectProviderUltimatum {
     pub fn encode(&self) -> Vec<u8> {
-        let byte1 = (DomainMcsPdu::DisconnectProviderUltimatum.as_u8() << 2) | ((self.reason >> 1) & 0x03);
+        let byte1 =
+            (DomainMcsPdu::DisconnectProviderUltimatum.as_u8() << 2) | ((self.reason >> 1) & 0x03);
         let byte2 = ((u16::from(self.reason) << 7) & 0xFF) as u8;
         vec![byte1, byte2]
     }
@@ -540,10 +544,19 @@ mod tests {
 
     #[test]
     fn attach_user_round_trip() {
-        assert_eq!(AttachUserRequest::decode(&AttachUserRequest.encode()).unwrap(), AttachUserRequest);
+        assert_eq!(
+            AttachUserRequest::decode(&AttachUserRequest.encode()).unwrap(),
+            AttachUserRequest
+        );
 
-        let confirm = AttachUserConfirm { result: 0, initiator: 1002 };
-        assert_eq!(AttachUserConfirm::decode(&confirm.encode()).unwrap(), confirm);
+        let confirm = AttachUserConfirm {
+            result: 0,
+            initiator: 1002,
+        };
+        assert_eq!(
+            AttachUserConfirm::decode(&confirm.encode()).unwrap(),
+            confirm
+        );
     }
 
     #[test]
@@ -552,7 +565,10 @@ mod tests {
             initiator: 1002,
             channel_id: 1003,
         };
-        assert_eq!(ChannelJoinRequest::decode(&request.encode()).unwrap(), request);
+        assert_eq!(
+            ChannelJoinRequest::decode(&request.encode()).unwrap(),
+            request
+        );
 
         let confirm = ChannelJoinConfirm {
             result: 0,
@@ -560,7 +576,10 @@ mod tests {
             requested_channel_id: 1003,
             channel_id: 1003,
         };
-        assert_eq!(ChannelJoinConfirm::decode(&confirm.encode()).unwrap(), confirm);
+        assert_eq!(
+            ChannelJoinConfirm::decode(&confirm.encode()).unwrap(),
+            confirm
+        );
     }
 
     #[test]
@@ -571,8 +590,14 @@ mod tests {
             data: b"hello virtual channel".to_vec(),
             complete: true,
         };
-        assert_eq!(SendData::decode_request(&msg.encode_request()).unwrap(), msg);
-        assert_eq!(SendData::decode_indication(&msg.encode_indication()).unwrap(), msg);
+        assert_eq!(
+            SendData::decode_request(&msg.encode_request()).unwrap(),
+            msg
+        );
+        assert_eq!(
+            SendData::decode_indication(&msg.encode_indication()).unwrap(),
+            msg
+        );
     }
 
     #[test]
@@ -583,7 +608,10 @@ mod tests {
             data: vec![0xAB; 5000],
             complete: true,
         };
-        assert_eq!(SendData::decode_request(&msg.encode_request()).unwrap(), msg);
+        assert_eq!(
+            SendData::decode_request(&msg.encode_request()).unwrap(),
+            msg
+        );
     }
 
     #[test]
@@ -591,6 +619,9 @@ mod tests {
         // From MS-RDPBCGR's own worked example: choice=8, reason=3 -> `21 80`.
         let pdu = DisconnectProviderUltimatum { reason: 3 };
         assert_eq!(pdu.encode(), [0x21, 0x80]);
-        assert_eq!(DisconnectProviderUltimatum::decode(&pdu.encode()).unwrap(), pdu);
+        assert_eq!(
+            DisconnectProviderUltimatum::decode(&pdu.encode()).unwrap(),
+            pdu
+        );
     }
 }

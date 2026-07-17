@@ -9,7 +9,8 @@ use std::time::Duration;
 use anyhow::Result;
 use rdpcore_server::diff::find_dirty_rects;
 use rdpcore_server::{
-    BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay, RdpServerDisplayUpdates,
+    BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay,
+    RdpServerDisplayUpdates,
 };
 use tokio::sync::broadcast;
 
@@ -71,8 +72,10 @@ impl DisplayHub {
                         // dimensions. Update the mouse scale now too.
                         negotiated_size = current_size;
                         *self.size.lock().unwrap() = current_size;
-                        *self.mouse_scale.lock().unwrap() =
-                            (f64::from(current_size.width), f64::from(current_size.height));
+                        *self.mouse_scale.lock().unwrap() = (
+                            f64::from(current_size.width),
+                            f64::from(current_size.height),
+                        );
                         previous = Some(raw);
                         let _ = self.tx.send(DisplayUpdate::Resized(current_size));
                         tokio::time::sleep(Duration::from_millis(50)).await;

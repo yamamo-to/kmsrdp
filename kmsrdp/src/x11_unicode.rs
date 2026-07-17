@@ -57,7 +57,12 @@ impl X11Connection {
         for (i, slot) in scratch_keycodes.iter_mut().enumerate() {
             *slot = highest.saturating_sub(i as u8).max(setup.min_keycode);
         }
-        Ok(Self { conn, scratch_keycodes, next_slot: 0, root })
+        Ok(Self {
+            conn,
+            scratch_keycodes,
+            next_slot: 0,
+            root,
+        })
     }
 
     fn type_char(&mut self, codepoint: u32) -> io::Result<()> {
@@ -114,7 +119,10 @@ pub struct X11UnicodeTyper {
 
 impl X11UnicodeTyper {
     pub fn new(session_rx: watch::Receiver<Option<Session>>) -> Self {
-        Self { session_rx, conn: None }
+        Self {
+            session_rx,
+            conn: None,
+        }
     }
 
     /// Inject `codepoint` into the current X11 session.
@@ -146,11 +154,11 @@ impl X11UnicodeTyper {
             }
         }
 
-        if let Some(ref mut conn) = self.conn {
-            if let Err(e) = conn.type_char(codepoint) {
-                eprintln!("kmsrdp: unicode injection failed for U+{codepoint:04X}: {e}");
-                self.conn = None; // Force reconnect on next call.
-            }
+        if let Some(ref mut conn) = self.conn
+            && let Err(e) = conn.type_char(codepoint)
+        {
+            eprintln!("kmsrdp: unicode injection failed for U+{codepoint:04X}: {e}");
+            self.conn = None; // Force reconnect on next call.
         }
     }
 }
