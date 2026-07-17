@@ -16,5 +16,22 @@ RestartSec=2
 # package docs.
 EnvironmentFile=-/etc/kmsrdp/kmsrdp.env
 
+# Keep only the capabilities required for DRM capture and /dev/uinput.
+# Device and network namespaces cannot be isolated because kmsrdp must reach
+# the host GPU/input devices and the active desktop session.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+UMask=0077
+
 [Install]
 WantedBy=multi-user.target

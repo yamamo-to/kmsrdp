@@ -250,7 +250,7 @@ is not needed.
 
 If you discover a security vulnerability, please report it privately
 through GitHub's security advisory interface rather than opening a public
-issue.
+issue. See [SECURITY.md](SECURITY.md) for the reporting policy.
 
 ## License
 
