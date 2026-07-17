@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use rdpcore_server::diff::find_dirty_rects;
+use rdpcore_server::diff::{Rect, find_dirty_rects};
 use rdpcore_server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay,
     RdpServerDisplayUpdates,
@@ -22,13 +22,20 @@ pub type MouseScale = Arc<Mutex<(f64, f64)>>;
 
 const BROADCAST_CAPACITY: usize = 64;
 
+/// When more than this fraction of the frame is dirty, send one full-frame
+/// update instead of many tile updates. Large scene changes (logout, VT
+/// switch, app fullscreen) otherwise flood the broadcast channel; lagged
+/// subscribers would then keep stale tiles forever.
+const FULL_FRAME_DIRTY_RATIO_NUM: usize = 1;
+const FULL_FRAME_DIRTY_RATIO_DEN: usize = 4;
+
 pub struct DisplayHub {
     size: Mutex<DesktopSize>,
     tx: broadcast::Sender<DisplayUpdate>,
     mouse_scale: MouseScale,
-    /// Latest full-frame bitmap, so a late subscriber can paint immediately
-    /// instead of waiting for the next dirty-rect change.
-    latest_full: Mutex<Option<BitmapUpdate>>,
+    /// Latest full-frame bitmap, so a late or lagged subscriber can paint
+    /// a consistent canvas instead of waiting for the next dirty-rect change.
+    latest_full: Arc<Mutex<Option<BitmapUpdate>>>,
 }
 
 impl DisplayHub {
@@ -39,7 +46,7 @@ impl DisplayHub {
             size: Mutex::new(DesktopSize { width, height }),
             tx,
             mouse_scale,
-            latest_full: Mutex::new(None),
+            latest_full: Arc::new(Mutex::new(None)),
         });
         let capture_hub = Arc::clone(&hub);
         tokio::spawn(async move {
@@ -51,6 +58,7 @@ impl DisplayHub {
     pub fn subscribe(&self) -> DisplayUpdates {
         DisplayUpdates {
             initial: self.latest_full.lock().unwrap().clone(),
+            latest_full: Arc::clone(&self.latest_full),
             rx: self.tx.subscribe(),
         }
     }
@@ -76,7 +84,11 @@ impl DisplayHub {
                             f64::from(current_size.width),
                             f64::from(current_size.height),
                         );
-                        previous = Some(raw);
+                        // Forget the previous frame so the next capture is
+                        // forced through as a full-frame update after the
+                        // client confirms the new desktop size.
+                        previous = None;
+                        *self.latest_full.lock().unwrap() = None;
                         let _ = self.tx.send(DisplayUpdate::Resized(current_size));
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
@@ -102,22 +114,21 @@ impl DisplayHub {
 
                     let dirty_rects = match &previous {
                         Some(prev) if prev.width == raw.width && prev.height == raw.height => {
-                            find_dirty_rects(
-                                &prev.data,
-                                prev.stride,
-                                &raw.data,
-                                raw.stride,
+                            coalesce_dirty_rects(
+                                find_dirty_rects(
+                                    &prev.data,
+                                    prev.stride,
+                                    &raw.data,
+                                    raw.stride,
+                                    raw.width as usize,
+                                    raw.height as usize,
+                                    4,
+                                ),
                                 raw.width as usize,
                                 raw.height as usize,
-                                4,
                             )
                         }
-                        _ => vec![rdpcore_server::diff::Rect::new(
-                            0,
-                            0,
-                            raw.width as usize,
-                            raw.height as usize,
-                        )],
+                        _ => vec![Rect::new(0, 0, raw.width as usize, raw.height as usize)],
                     };
 
                     for rect in &dirty_rects {
@@ -143,6 +154,32 @@ impl DisplayHub {
     }
 }
 
+fn dirty_area(rects: &[Rect]) -> usize {
+    rects
+        .iter()
+        .map(|rect| rect.width.saturating_mul(rect.height))
+        .sum()
+}
+
+/// Collapse a heavily-dirty frame into a single full-frame rect so the
+/// broadcast channel carries one update instead of dozens of tiles.
+fn coalesce_dirty_rects(rects: Vec<Rect>, width: usize, height: usize) -> Vec<Rect> {
+    if rects.is_empty() {
+        return rects;
+    }
+    let frame_area = width.saturating_mul(height);
+    if frame_area == 0 {
+        return rects;
+    }
+    if dirty_area(&rects).saturating_mul(FULL_FRAME_DIRTY_RATIO_DEN)
+        >= frame_area.saturating_mul(FULL_FRAME_DIRTY_RATIO_NUM)
+    {
+        vec![Rect::new(0, 0, width, height)]
+    } else {
+        rects
+    }
+}
+
 /// Thin `RdpServerDisplay` handle around a shared [`DisplayHub`].
 pub struct Display {
     hub: Arc<DisplayHub>,
@@ -157,6 +194,8 @@ impl Display {
 pub struct DisplayUpdates {
     /// One-shot full frame for late joiners (taken at subscribe time).
     initial: Option<BitmapUpdate>,
+    /// Shared latest frame used to recover after broadcast lag.
+    latest_full: Arc<Mutex<Option<BitmapUpdate>>>,
     rx: broadcast::Receiver<DisplayUpdate>,
 }
 
@@ -169,9 +208,15 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
         loop {
             match self.rx.recv().await {
                 Ok(update) => return Ok(Some(update)),
-                // Lagged subscribers skip missed frames and keep going;
-                // a closed channel ends the connection's display stream.
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // Dropped frames leave the client canvas inconsistent with
+                // the server's previous-frame baseline; resync from the
+                // latest complete frame instead of keeping stale tiles.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    if let Some(full) = self.latest_full.lock().unwrap().clone() {
+                        return Ok(Some(DisplayUpdate::Bitmap(full)));
+                    }
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Closed) => return Ok(None),
             }
         }
@@ -186,5 +231,33 @@ impl RdpServerDisplay for Display {
 
     async fn updates(&self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
         Ok(Box::new(self.hub.subscribe()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{coalesce_dirty_rects, dirty_area};
+    use rdpcore_server::diff::Rect;
+
+    #[test]
+    fn light_dirty_frames_keep_individual_rects() {
+        let rects = vec![Rect::new(0, 0, 64, 64), Rect::new(64, 0, 64, 64)];
+        let coalesced = coalesce_dirty_rects(rects.clone(), 1920, 1080);
+        assert_eq!(coalesced, rects);
+    }
+
+    #[test]
+    fn heavily_dirty_frames_collapse_to_full_frame() {
+        let rects = vec![Rect::new(0, 0, 1920, 400)];
+        assert!(dirty_area(&rects) * 4 >= 1920 * 1080);
+        assert_eq!(
+            coalesce_dirty_rects(rects, 1920, 1080),
+            vec![Rect::new(0, 0, 1920, 1080)]
+        );
+    }
+
+    #[test]
+    fn empty_dirty_frames_stay_empty() {
+        assert!(coalesce_dirty_rects(Vec::new(), 1920, 1080).is_empty());
     }
 }
