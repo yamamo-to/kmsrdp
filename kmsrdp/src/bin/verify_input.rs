@@ -25,7 +25,7 @@ fn main() -> std::io::Result<()> {
         sleep(Duration::from_millis(300));
 
         let img = capture::capture_frame()?;
-        let out_path = format!("/home/foo/Documents/kmsrdp/verify_{name}.png");
+        let out_path = format!("verify_{name}.png");
         img.save(&out_path)
             .map_err(|e| std::io::Error::other(format!("PNG save failed: {e}")))?;
         println!("moved to {name} ({fx}, {fy}) -> {out_path}");

@@ -7,6 +7,15 @@ capturing the screen directly from the kernel's DRM/KMS subsystem (no
 compositor cooperation needed, works on the login screen, headless, over
 NVIDIA) and injecting input via `uinput` - but speaking RDP instead of VNC.
 
+> [!WARNING]
+> kmsrdp is experimental software. It can capture the complete desktop,
+> inject keyboard and mouse input, and access the clipboard while running
+> with powerful Linux capabilities. It does not implement NLA/CredSSP and
+> currently generates a new self-signed TLS certificate on every start.
+> Do not expose TCP port 3389 directly to the public Internet. Restrict it
+> with a firewall and use it only on a trusted LAN or through a VPN or SSH
+> tunnel.
+
 The RDP protocol stack itself (`crates/rdpcore-*`) is a from-scratch
 implementation - TPKT/X.224/MCS/GCC framing, capability negotiation,
 fast-path input/output, RDPSND, CLIPRDR, MS-RDPEAI (audio input), MS-RDPDR
@@ -38,11 +47,23 @@ kmsrdp's own DRM/uinput glue.
 - Audio output redirection (RDPSND <-> PipeWire monitor source via `parec`)
 - Microphone/audio input redirection (MS-RDPEAI <-> a virtual PipeWire
   microphone source other local apps can select as their input device)
+- Concurrent RDP sessions sharing one capture stream and one serialized
+  keyboard/mouse input device; audio and clipboard channels remain
+  connection-local
 - Priority-aware write scheduling: a bulk graphics fragment can never
   starve a latency-sensitive audio frame, even mid-burst
 
 ## Known limitations
 
+- NLA/CredSSP is not implemented. Authentication uses the RDP Client Info
+  credentials inside TLS instead.
+- A fresh self-signed TLS certificate is generated at every start; there is
+  currently no configuration for a persistent certificate or private key.
+- The server listens on `0.0.0.0:3389` and has no bind-address option yet.
+  Apply host/network firewall rules before starting it.
+- Concurrent clients see and control the same desktop. Input from every
+  authenticated client is accepted and serialized into the same virtual
+  input device; sessions are not isolated from each other.
 - Only single-plane XRGB8888/ARGB8888 framebuffers are handled (Linear via
   CPU mmap, tiled via GBM/EGL) - multi-plane formats (e.g. YUV) aren't
   supported by either path.
@@ -109,6 +130,8 @@ Requires:
   require an X11 session (`DISPLAY`/`XAUTHORITY` in the environment).
 - `parec`/`paplay`/`pactl` (`pulseaudio-utils`) on `$PATH` for audio
   output/input redirection.
+- TCP port 3389 restricted to trusted clients with a firewall, VPN, or SSH
+  tunnel.
 
 ```
 KMSRDP_USER=myuser KMSRDP_PASSWORD=mypassword ./target/release/rdp_server
@@ -116,6 +139,35 @@ KMSRDP_USER=myuser KMSRDP_PASSWORD=mypassword ./target/release/rdp_server
 
 Connect with any RDP client, e.g. `xfreerdp /v:<host> /sec:tls /cert:ignore
 /u:myuser /p:mypassword`.
+
+`KMSRDP_TLS_HOSTS` optionally adds comma-separated hostnames or IP addresses
+to the generated certificate's Subject Alternative Name list:
+
+```
+KMSRDP_TLS_HOSTS=server.example.test,192.0.2.10 \
+KMSRDP_USER=myuser KMSRDP_PASSWORD=mypassword \
+./target/release/rdp_server
+```
+
+### Windows Remote Desktop (mstsc)
+
+kmsrdp does not support NLA/CredSSP. Windows Remote Desktop may also skip
+its password prompt when NLA is unavailable and consequently send an empty
+password. Store the credentials first, then connect:
+
+```bat
+cmdkey /generic:TERMSRV/<host> /user:myuser /pass:mypassword
+mstsc /v:<host>
+```
+
+Remove the stored credential when it is no longer needed:
+
+```bat
+cmdkey /delete:TERMSRV/<host>
+```
+
+Accept the self-signed certificate warning only after confirming that you
+are connecting through a trusted network path.
 
 ## Packaging (AlmaLinux / RHEL 9 RPM)
 
@@ -125,12 +177,11 @@ make rpm                  # -> .rpmbuild/RPMS/x86_64/kmsrdp-*.rpm
 sudo dnf install .rpmbuild/RPMS/x86_64/kmsrdp-*.rpm
 ```
 
-The repository is private, so `codeload.github.com` archive URLs 404
-without an auth token: `make rpm`/`make srpm` regenerate both the plain
-source tarball and the vendored Rust dependencies locally (`make vendor`)
-from the current checkout instead of fetching them from GitHub, so the
-actual `rpmbuild` step needs no network access (as a mock/COPR build
-wouldn't have).
+`make rpm`/`make srpm` generate both the source archive and a vendored Rust
+dependency archive from the current checkout. The subsequent `rpmbuild`
+step therefore needs no network access. Tagged releases (`v*.*.*`) also
+trigger the GitHub Actions RPM build and attach the resulting RPM to the
+GitHub release.
 
 Other targets: `make srpm` (source RPM only), `make lint` (rpmlint the
 spec), `make clean`.
@@ -188,3 +239,24 @@ systemctl enable --now kmsrdp.service
 `KMSRDP_USER`/`KMSRDP_PASSWORD` here are the RDP login credentials
 presented to the RDP client - unrelated to which Linux account's screen
 gets captured, since that's auto-detected via logind.
+
+## Security
+
+Running kmsrdp grants remote clients access equivalent to someone sitting
+at the machine: they can view the screen, inject input, and exchange
+clipboard and audio data. Use a strong unique password, keep the environment
+file mode at `0600`, restrict network access, and stop the service when it
+is not needed.
+
+If you discover a security vulnerability, please report it privately
+through GitHub's security advisory interface rather than opening a public
+issue.
+
+## License
+
+Licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
