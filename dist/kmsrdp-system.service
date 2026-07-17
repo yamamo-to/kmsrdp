@@ -1,0 +1,20 @@
+[Unit]
+Description=kmsrdp RDP remote desktop server (root, follows the active login session)
+# Needs systemd-logind up so the D-Bus session watcher can find the active
+# graphical session to attach to.
+After=multi-user.target systemd-logind.service
+Wants=systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/kmsrdp/kmsrdp-server
+Restart=on-failure
+RestartSec=2
+# KMSRDP_USER / KMSRDP_PASSWORD (RDP login credentials - unrelated to which
+# Linux user's session gets captured, that's auto-detected via logind) live
+# here rather than in this unit file - see kmsrdp-system.env.example in the
+# package docs.
+EnvironmentFile=-/etc/kmsrdp/kmsrdp.env
+
+[Install]
+WantedBy=multi-user.target

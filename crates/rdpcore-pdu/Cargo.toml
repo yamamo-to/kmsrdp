@@ -1,0 +1,10 @@
+[package]
+name = "rdpcore-pdu"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "From-scratch RDP wire-format codecs (TPKT/X.224/...) - no I/O, no async"
+
+[dependencies]
+
+[dev-dependencies]

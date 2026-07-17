@@ -1,0 +1,9 @@
+[package]
+name = "rdpcore-connector"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Sans-io RDP server-side connection-sequence state machine"
+
+[dependencies]
+rdpcore-pdu = { path = "../rdpcore-pdu" }

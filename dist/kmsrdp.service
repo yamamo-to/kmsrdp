@@ -1,0 +1,20 @@
+[Unit]
+Description=kmsrdp RDP remote desktop server
+# Needs the graphical session's DISPLAY/XAUTHORITY/XDG_RUNTIME_DIR, which a
+# systemd --user manager on a GDM/GNOME session already imports; on other
+# session managers you may need to import them yourself (see README).
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/kmsrdp/kmsrdp-server
+Restart=on-failure
+RestartSec=2
+# KMSRDP_USER / KMSRDP_PASSWORD (and anything else the binary reads from the
+# environment) live here rather than in this unit file - see
+# kmsrdp.env.example in the package docs.
+EnvironmentFile=-%h/.config/kmsrdp/kmsrdp.env
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,11 @@
+[package]
+name = "rdpcore-rdpeai"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "From-scratch MS-RDPEAI (audio input / microphone redirection) over the AUDIO_INPUT dynamic virtual channel"
+
+[dependencies]
+rdpcore-dvc = { path = "../rdpcore-dvc" }
+rdpcore-pdu = { path = "../rdpcore-pdu" }
+rdpcore-rdpsnd = { path = "../rdpcore-rdpsnd" }

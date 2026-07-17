@@ -1,0 +1,32 @@
+[package]
+name = "kmsrdp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "DRM/KMS-based RDP remote desktop server in pure Rust"
+repository = "https://github.com/yamamo-to/kmsrdp"
+
+[dependencies]
+anyhow = "1.0.103"
+arboard = "3.6.1"
+async-trait = "0.1.89"
+drm = "0.15.0"
+drm-fourcc = "2.2.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+khronos-egl = { version = "6.0.0", features = ["dynamic"] }
+libc = "0.2.186"
+libloading = "0.8.9"
+memmap2 = { version = "0.9.11", default-features = false }
+rand = "0.10.2"
+rdpcore-cliprdr = { path = "../crates/rdpcore-cliprdr" }
+rdpcore-rdpdr = { path = "../crates/rdpcore-rdpdr" }
+rdpcore-rdpeai = { path = "../crates/rdpcore-rdpeai" }
+rdpcore-rdpsnd = { path = "../crates/rdpcore-rdpsnd" }
+rdpcore-server = { path = "../crates/rdpcore-server" }
+rcgen = "0.14.8"
+rustls = "0.23.42"
+futures-util = "0.3"
+tokio = { version = "1.52.3", features = ["full"] }
+uinput-sys = "0.1.7"
+x11rb = { version = "0.13.2", features = ["xtest"] }
+zbus = { version = "4", default-features = false, features = ["tokio"] }

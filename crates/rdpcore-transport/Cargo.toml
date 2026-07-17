@@ -1,0 +1,12 @@
+[package]
+name = "rdpcore-transport"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Priority-aware per-connection write scheduler: bulk graphics can't starve latency-sensitive channels like audio"
+
+[dependencies]
+tokio = { version = "1.52.3", features = ["io-util", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["full"] }

@@ -1,0 +1,9 @@
+[package]
+name = "rdpcore-rdpdr"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "From-scratch MS-RDPEFS (RDPDR) device redirection, drive (filesystem) devices only"
+
+[dependencies]
+rdpcore-pdu = { path = "../rdpcore-pdu" }

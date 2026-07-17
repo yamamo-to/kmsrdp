@@ -1,0 +1,20 @@
+[package]
+name = "rdpcore-server"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Async RDP server built on rdpcore-connector: TLS glue, accept loop, Display/Input traits"
+
+[dependencies]
+anyhow = "1.0.103"
+async-trait = "0.1.89"
+rdpcore-cliprdr = { path = "../rdpcore-cliprdr" }
+rdpcore-connector = { path = "../rdpcore-connector" }
+rdpcore-dvc = { path = "../rdpcore-dvc" }
+rdpcore-rdpeai = { path = "../rdpcore-rdpeai" }
+rdpcore-rdpdr = { path = "../rdpcore-rdpdr" }
+rdpcore-pdu = { path = "../rdpcore-pdu" }
+rdpcore-rdpsnd = { path = "../rdpcore-rdpsnd" }
+rdpcore-transport = { path = "../rdpcore-transport" }
+tokio = { version = "1.52.3", features = ["rt", "net", "io-util", "macros", "sync"] }
+tokio-rustls = "0.26"
