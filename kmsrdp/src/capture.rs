@@ -267,6 +267,13 @@ pub struct RawFrame {
     pub height: u32,
     pub stride: usize,
     pub data: Vec<u8>,
+    /// True when the DRM primary plane swapped to a different framebuffer
+    /// object (e.g. Xorg exited and fbcon restored the console FB). Existing
+    /// RDP clients only receive dirty-rect updates, so a scene change that
+    /// happens without a large pixel-diff in one tick would leave them
+    /// showing the previous tiles; the display hub treats this as a
+    /// mandatory full-frame refresh.
+    pub force_full: bool,
 }
 
 /// Stateful screen capturer. The DRM card fd stays open for this object's
@@ -316,6 +323,7 @@ impl Capturer {
                 height,
                 stride: width as usize * 4,
                 data,
+                force_full: false,
             }),
             Err(nvfbc_err) => Err(io::Error::other(format!(
                 "DRM/KMS capture failed ({drm_error}), \
@@ -331,6 +339,9 @@ struct DrmCapturer {
     card_name: String,
     crtc: crtc::Handle,
     connector: String,
+    /// Last primary-plane framebuffer handle we successfully captured.
+    /// `None` until the first frame; a change forces a full-frame refresh.
+    last_fb: Option<u32>,
 }
 
 impl DrmCapturer {
@@ -360,6 +371,7 @@ impl DrmCapturer {
             card_name: opened.name,
             crtc: opened.crtc,
             connector: opened.connector,
+            last_fb: None,
         })
     }
 
@@ -395,6 +407,16 @@ impl DrmCapturer {
                 "primary plane has no framebuffer attached (screen off / locked?)",
             )
         })?;
+        let fb_id = u32::from(fb_handle);
+        let force_full = self.last_fb.is_some_and(|prev| prev != fb_id);
+        if force_full {
+            eprintln!(
+                "kmsrdp: primary-plane framebuffer changed ({:?} -> {fb_id}); \
+                 forcing full-frame refresh for connected clients",
+                self.last_fb
+            );
+        }
+        self.last_fb = Some(fb_id);
 
         // Prefer GetFB2 (fourcc + modifier + per-plane offsets/pitches), fall
         // back to legacy GetFB, exactly like export_fb2()/export_fb() upstream.
@@ -461,6 +483,7 @@ impl DrmCapturer {
                 height,
                 stride: pitch,
                 data: mmap.to_vec(),
+                force_full,
             });
         }
 
@@ -480,6 +503,7 @@ impl DrmCapturer {
                 height,
                 stride: width as usize * 4,
                 data,
+                force_full,
             });
         }
 

@@ -25,9 +25,11 @@ const BROADCAST_CAPACITY: usize = 64;
 /// When more than this fraction of the frame is dirty, send one full-frame
 /// update instead of many tile updates. Large scene changes (logout, VT
 /// switch, app fullscreen) otherwise flood the broadcast channel; lagged
-/// subscribers would then keep stale tiles forever.
+/// subscribers would then keep stale tiles forever. 1/16 (~6%) is low enough
+/// that an X-session → console transition still forces a full refresh even
+/// when only part of the wallpaper is overwritten in a single tick.
 const FULL_FRAME_DIRTY_RATIO_NUM: usize = 1;
-const FULL_FRAME_DIRTY_RATIO_DEN: usize = 4;
+const FULL_FRAME_DIRTY_RATIO_DEN: usize = 16;
 
 pub struct DisplayHub {
     size: Mutex<DesktopSize>,
@@ -148,7 +150,11 @@ impl DisplayHub {
                     };
 
                     let dirty_rects = match &previous {
-                        Some(prev) if prev.width == raw.width && prev.height == raw.height => {
+                        Some(prev)
+                            if !raw.force_full
+                                && prev.width == raw.width
+                                && prev.height == raw.height =>
+                        {
                             coalesce_dirty_rects(
                                 find_dirty_rects(
                                     &prev.data,
@@ -282,8 +288,10 @@ mod tests {
 
     #[test]
     fn heavily_dirty_frames_collapse_to_full_frame() {
-        let rects = vec![Rect::new(0, 0, 1920, 400)];
-        assert!(dirty_area(&rects) * 4 >= 1920 * 1080);
+        // One 1920x120 strip is ~6.25% of 1920x1080 — just above the 1/16
+        // full-frame threshold.
+        let rects = vec![Rect::new(0, 0, 1920, 120)];
+        assert!(dirty_area(&rects) * 16 >= 1920 * 1080);
         assert_eq!(
             coalesce_dirty_rects(rects, 1920, 1080),
             vec![Rect::new(0, 0, 1920, 1080)]

@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.2
+Version:        0.1.3
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -96,6 +96,10 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Fri Jul 17 2026 kmsrdp contributors <noreply@example.com> - 0.1.3-1
+- Force a full-frame refresh when the DRM framebuffer changes
+- Lower the dirty-area threshold to prevent stale tiles after X logout
+
 * Fri Jul 17 2026 kmsrdp contributors <noreply@example.com> - 0.1.2-1
 - Keep the DRM card fd open across captures so the text console is
   restored after an X session logs out (no more stale X wallpaper)
