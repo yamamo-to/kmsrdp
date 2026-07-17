@@ -20,6 +20,7 @@ use crate::transport::{SteadyStateFrame, read_steady_state_frame, read_tpkt_fram
 
 pub struct RdpServerBuilder {
     addr: Option<SocketAddr>,
+    listener: Option<TcpListener>,
     tls: Option<TlsAcceptor>,
     display: Option<Arc<dyn RdpServerDisplay>>,
     input: Option<Arc<Mutex<dyn RdpServerInputHandler>>>,
@@ -35,6 +36,7 @@ impl RdpServerBuilder {
     fn new() -> Self {
         Self {
             addr: None,
+            listener: None,
             tls: None,
             display: None,
             input: None,
@@ -49,6 +51,13 @@ impl RdpServerBuilder {
 
     pub fn with_addr(mut self, addr: SocketAddr) -> Self {
         self.addr = Some(addr);
+        self
+    }
+
+    /// Use an already-bound listener (e.g. so the caller can fail bind
+    /// before allocating other resources such as a uinput device).
+    pub fn with_listener(mut self, listener: TcpListener) -> Self {
+        self.listener = Some(listener);
         self
     }
 
@@ -108,8 +117,13 @@ impl RdpServerBuilder {
     }
 
     pub fn build(self) -> RdpServer {
+        assert!(
+            self.addr.is_some() || self.listener.is_some(),
+            "with_addr or with_listener is required"
+        );
         RdpServer {
-            addr: self.addr.expect("with_addr is required"),
+            addr: self.addr,
+            listener: self.listener,
             tls: self.tls.expect("with_tls is required"),
             display: self.display.expect("with_display_handler is required"),
             input: self.input.expect("with_input_handler is required"),
@@ -124,7 +138,8 @@ impl RdpServerBuilder {
 }
 
 pub struct RdpServer {
-    addr: SocketAddr,
+    addr: Option<SocketAddr>,
+    listener: Option<TcpListener>,
     tls: TlsAcceptor,
     display: Arc<dyn RdpServerDisplay>,
     input: Arc<Mutex<dyn RdpServerInputHandler>>,
@@ -174,8 +189,14 @@ impl RdpServer {
     /// and input injection are shared across sessions (see kmsrdp's
     /// `DisplayHub` / `SharedInput`); audio and clipboard backends are
     /// built per connection.
-    pub async fn run(self) -> anyhow::Result<()> {
-        let listener = TcpListener::bind(self.addr).await?;
+    pub async fn run(mut self) -> anyhow::Result<()> {
+        let listener = match self.listener.take() {
+            Some(listener) => listener,
+            None => {
+                let addr = self.addr.expect("with_addr or with_listener is required");
+                TcpListener::bind(addr).await?
+            }
+        };
         let server = Arc::new(self);
         loop {
             let (tcp, peer) = listener.accept().await?;

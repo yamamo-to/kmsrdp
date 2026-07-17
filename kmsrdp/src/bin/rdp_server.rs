@@ -124,18 +124,9 @@ async fn main() -> Result<()> {
     let height = initial.height as u16;
     println!("desktop size: {width}x{height}");
 
-    let device = VirtualInput::create()?;
-    println!("virtual input device created");
-
     let mouse_scale: MouseScale = Arc::new(Mutex::new((f64::from(width), f64::from(height))));
     let hub = DisplayHub::start(width, height, mouse_scale.clone());
     let display = Display::new(hub);
-
-    let input = SharedInput::new(Input {
-        device,
-        mouse_scale,
-        x11_typer: X11UnicodeTyper::new(session_rx.clone()),
-    });
 
     let username = std::env::var("KMSRDP_USER").unwrap_or_else(|_| "kmsrdp".to_string());
     let password = match std::env::var("KMSRDP_PASSWORD") {
@@ -162,9 +153,25 @@ async fn main() -> Result<()> {
 
     let acceptor = tls::build_acceptor()?;
 
+    // Bind before creating the uinput device so a missing CAP_NET_BIND_SERVICE
+    // (or a busy port) fails without spamming `input: kmsrdp as ...` on every
+    // systemd restart.
     let addr: SocketAddr = "0.0.0.0:3389".parse()?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
+
+    let device = VirtualInput::create()?;
+    println!("virtual input device created");
+
+    let input = SharedInput::new(Input {
+        device,
+        mouse_scale,
+        x11_typer: X11UnicodeTyper::new(session_rx.clone()),
+    });
+
     let server: RdpServer = RdpServer::builder()
-        .with_addr(addr)
+        .with_listener(listener)
         .with_tls(acceptor)
         .with_input_handler(input)
         .with_display_handler(display)

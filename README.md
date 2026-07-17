@@ -89,9 +89,9 @@ kmsrdp's own DRM/uinput glue.
   That's a planned follow-up.
 - Extended-key (arrow keys, etc.) scancode mapping covers only the common
   cases, not the full table.
-- Single-process design requires `CAP_SYS_ADMIN` (DRM) and `CAP_DAC_OVERRIDE`
-  (`/dev/uinput` is `root:root` 0600) as file capabilities on the binary -
-  see the systemd unit below.
+- Single-process design requires `CAP_SYS_ADMIN` (DRM), `CAP_DAC_OVERRIDE`
+  (`/dev/uinput` is `root:root` 0600), and `CAP_NET_BIND_SERVICE` (TCP 3389)
+  as file capabilities on the binary - see the systemd unit below.
 
 ### Tested environments
 
@@ -122,8 +122,8 @@ cargo build --release --bin rdp_server
 
 Requires:
 
-- `CAP_SYS_ADMIN` + `CAP_DAC_OVERRIDE` on the binary:
-  `sudo setcap cap_sys_admin,cap_dac_override+ep target/release/rdp_server`
+- `CAP_SYS_ADMIN` + `CAP_DAC_OVERRIDE` + `CAP_NET_BIND_SERVICE` on the binary:
+  `sudo setcap cap_sys_admin,cap_dac_override,cap_net_bind_service+ep target/release/rdp_server`
 - An active graphical session (X11 or Wayland) with a Linear-framebuffer
   display for DRM capture to have something to capture - see "Tested
   environments" above; clipboard sync and CJK text input additionally

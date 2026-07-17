@@ -11,6 +11,9 @@ Type=simple
 ExecStart=/usr/libexec/kmsrdp/kmsrdp-server
 Restart=on-failure
 RestartSec=2
+# Avoid infinite restart spam if startup keeps failing.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 # KMSRDP_USER / KMSRDP_PASSWORD (and anything else the binary reads from the
 # environment) live here rather than in this unit file - see
 # kmsrdp.env.example in the package docs.

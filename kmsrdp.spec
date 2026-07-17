@@ -68,7 +68,7 @@ install -D -m644 dist/%{name}-system.service %{buildroot}%{_unitdir}/%{name}.ser
 install -D -m644 dist/%{name}-system.env.example %{buildroot}%{_docdir}/%{name}/%{name}-system.env.example
 
 %post
-setcap cap_sys_admin,cap_dac_override+ep %{_libexecdir}/%{name}/%{name}-server || :
+setcap cap_sys_admin,cap_dac_override,cap_net_bind_service+ep %{_libexecdir}/%{name}/%{name}-server || :
 cat <<MSG
 kmsrdp installed. Two ways to run it:
 
