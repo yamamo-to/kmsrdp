@@ -2,19 +2,19 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use rdpcore_cliprdr::{CliprdrBackendFactory, CliprdrChannel};
-use rdpcore_connector::{AcceptedConnection, Acceptor, AcceptorEvent};
+use rdpcore_connector::{AcceptedConnection, Acceptor, AcceptorEvent, ConnectorError};
 use rdpcore_dvc::DvcMux;
 use rdpcore_pdu::fastpath::{self, FastPathInputEvent, UPDATE_CODE_BITMAP, keyboard_flags};
 use rdpcore_rdpdr::{DriveConsumerFactory, RdpdrChannel};
 use rdpcore_rdpeai::{AudioInputBackendFactory, AudioInputHandler};
 use rdpcore_rdpsnd::{RdpsndChannel, RdpsndServerMessage, SoundServerFactory};
-use rdpcore_transport::{ChannelKey, ConnectionWriter, Frame, Priority};
+use rdpcore_transport::{ChannelKey, ConnectionWriter, Frame, FrameSender, Priority};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
 use crate::credentials::CredentialValidator;
-use crate::display::{BitmapUpdate, DisplayUpdate, RdpServerDisplay};
+use crate::display::{BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay};
 use crate::input::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use crate::transport::{SteadyStateFrame, read_steady_state_frame, read_tpkt_frame};
 
@@ -485,7 +485,18 @@ impl Session {
         // client confirms the new dimensions, since a frame sized for the
         // old (or new, ahead of confirmation) desktop would desync the
         // client's canvas otherwise.
+        //
+        // mstsc clears its canvas on Deactivate-All and is often slower than
+        // Guacamole to finish Confirm Active + finalization. Capture usually
+        // emits the post-resize full frame during that window; dropping it
+        // leaves mstsc black forever on a static desktop. Retain the best
+        // frame and flush it once the resize is confirmed.
         let mut resizing = false;
+        let mut resize_desktop = DesktopSize {
+            width: accepted.desktop_width,
+            height: accepted.desktop_height,
+        };
+        let mut pending_after_resize: Option<BitmapUpdate> = None;
 
         loop {
             tokio::select! {
@@ -503,6 +514,32 @@ impl Session {
                             }
                         }
                         SteadyStateFrame::SlowPath(bytes) if resizing => {
+                            // Handshake may already be done (batched FontList in a
+                            // prior frame, or a missed Accepted event). Never call
+                            // step() on a finished acceptor — that only spams
+                            // AlreadyFinished and keeps the client black.
+                            if acceptor.is_finished() {
+                                resizing = false;
+                                if flush_pending_resize_bitmap(
+                                    &mut pending_after_resize,
+                                    &frame_sender,
+                                )
+                                .is_err()
+                                {
+                                    return Ok(());
+                                }
+                                if let Err(e) = handle_slow_path_frame(
+                                    &bytes,
+                                    rdpsnd.as_mut(),
+                                    cliprdr.as_mut(),
+                                    dvc.as_mut(),
+                                    rdpdr.as_mut(),
+                                    &frame_sender,
+                                ) {
+                                    eprintln!("dropping malformed slow-path frame after resize: {e}");
+                                }
+                                continue;
+                            }
                             match acceptor.step(&bytes) {
                                 Ok(result) => {
                                     if !result.response.is_empty()
@@ -512,11 +549,49 @@ impl Session {
                                     {
                                         return Ok(()); // writer task gone - connection's over
                                     }
-                                    if matches!(result.event, AcceptorEvent::Accepted(_)) {
+                                    if acceptor.is_finished()
+                                        || matches!(result.event, AcceptorEvent::Accepted(_))
+                                    {
                                         resizing = false;
+                                        if flush_pending_resize_bitmap(
+                                            &mut pending_after_resize,
+                                            &frame_sender,
+                                        )
+                                        .is_err()
+                                        {
+                                            return Ok(());
+                                        }
                                     }
                                 }
-                                Err(e) => eprintln!("dropping malformed frame during resize: {e}"),
+                                Err(e) => {
+                                    if acceptor.is_finished()
+                                        || matches!(e, ConnectorError::AlreadyFinished)
+                                    {
+                                        resizing = false;
+                                        if flush_pending_resize_bitmap(
+                                            &mut pending_after_resize,
+                                            &frame_sender,
+                                        )
+                                        .is_err()
+                                        {
+                                            return Ok(());
+                                        }
+                                        if let Err(err) = handle_slow_path_frame(
+                                            &bytes,
+                                            rdpsnd.as_mut(),
+                                            cliprdr.as_mut(),
+                                            dvc.as_mut(),
+                                            rdpdr.as_mut(),
+                                            &frame_sender,
+                                        ) {
+                                            eprintln!(
+                                                "dropping malformed slow-path frame after resize: {err}"
+                                            );
+                                        }
+                                    } else {
+                                        eprintln!("dropping malformed frame during resize: {e}");
+                                    }
+                                }
                             }
                         }
                         SteadyStateFrame::SlowPath(bytes) => {
@@ -530,7 +605,14 @@ impl Session {
                 }
                 update = updates.next_update() => {
                     match update? {
-                        Some(DisplayUpdate::Bitmap(_)) if resizing => {} // wait for the resize to be confirmed first
+                        Some(DisplayUpdate::Bitmap(bitmap)) if resizing => {
+                            retain_bitmap_during_resize(
+                                &mut pending_after_resize,
+                                bitmap,
+                                resize_desktop.width,
+                                resize_desktop.height,
+                            );
+                        }
                         Some(DisplayUpdate::Bitmap(bitmap)) => {
                             for wire_frame in encode_bitmap_update(&bitmap) {
                                 if frame_sender.send(Frame { channel: ChannelKey::Io, priority: Priority::Bulk, bytes: wire_frame }).is_err() {
@@ -545,6 +627,8 @@ impl Session {
                             match acceptor.begin_resize(size.width, size.height) {
                                 Ok(response) => {
                                     resizing = true;
+                                    resize_desktop = size;
+                                    pending_after_resize = None;
                                     if frame_sender.send(Frame { channel: ChannelKey::Io, priority: Priority::Latency, bytes: response }).is_err() {
                                         return Ok(()); // writer task gone - connection's over
                                     }
@@ -740,6 +824,28 @@ fn translate_mouse(pointer_flags: u16, x: u16, y: u16) -> MouseEvent {
 /// `bitmapLength` field that overflowed before fragmentation even runs).
 const TILE_SIZE: u16 = 64;
 
+fn flush_pending_resize_bitmap(
+    pending: &mut Option<BitmapUpdate>,
+    frame_sender: &FrameSender,
+) -> Result<(), ()> {
+    let Some(bitmap) = pending.take() else {
+        return Ok(());
+    };
+    for wire_frame in encode_bitmap_update(&bitmap) {
+        if frame_sender
+            .send(Frame {
+                channel: ChannelKey::Io,
+                priority: Priority::Bulk,
+                bytes: wire_frame,
+            })
+            .is_err()
+        {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
 /// Splits one `BitmapUpdate` into one-or-more wire-ready `FastPathOutput`
 /// byte buffers (each already TS_FP_UPDATE_PDU-framed, ready for
 /// `write_all`): first tiled into `TILE_SIZE`-square rectangles (so every
@@ -832,4 +938,75 @@ fn encode_bitmap_update(bitmap: &BitmapUpdate) -> Vec<Vec<u8>> {
             .encode()
         })
         .collect()
+}
+
+fn covers_desktop(bitmap: &BitmapUpdate, width: u16, height: u16) -> bool {
+    bitmap.x == 0 && bitmap.y == 0 && bitmap.width.get() == width && bitmap.height.get() == height
+}
+
+/// Keep the best frame seen while a resize handshake is in flight.
+/// Prefer a full-desktop bitmap (mstsc's canvas is blank after Deactivate-All);
+/// only replace an existing full frame with a newer full frame.
+fn retain_bitmap_during_resize(
+    pending: &mut Option<BitmapUpdate>,
+    bitmap: BitmapUpdate,
+    desktop_width: u16,
+    desktop_height: u16,
+) {
+    let incoming_full = covers_desktop(&bitmap, desktop_width, desktop_height);
+    let have_full = pending
+        .as_ref()
+        .is_some_and(|p| covers_desktop(p, desktop_width, desktop_height));
+    if incoming_full || !have_full {
+        *pending = Some(bitmap);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{covers_desktop, retain_bitmap_during_resize};
+    use crate::display::{BitmapUpdate, PixelFormat};
+    use core::num::{NonZeroU16, NonZeroUsize};
+
+    fn bitmap(x: u16, y: u16, width: u16, height: u16, fill: u8) -> BitmapUpdate {
+        let w = NonZeroU16::new(width).unwrap();
+        let h = NonZeroU16::new(height).unwrap();
+        let stride = NonZeroUsize::new(usize::from(width) * 4).unwrap();
+        BitmapUpdate {
+            x,
+            y,
+            width: w,
+            height: h,
+            format: PixelFormat::BgrX32,
+            data: vec![fill; stride.get() * usize::from(height)],
+            stride,
+        }
+    }
+
+    #[test]
+    fn covers_desktop_requires_origin_and_exact_size() {
+        assert!(covers_desktop(&bitmap(0, 0, 100, 50, 1), 100, 50));
+        assert!(!covers_desktop(&bitmap(1, 0, 100, 50, 1), 100, 50));
+        assert!(!covers_desktop(&bitmap(0, 0, 64, 50, 1), 100, 50));
+    }
+
+    #[test]
+    fn resize_pending_prefers_full_frame_over_later_tile() {
+        let mut pending = None;
+        retain_bitmap_during_resize(&mut pending, bitmap(0, 0, 100, 50, 1), 100, 50);
+        retain_bitmap_during_resize(&mut pending, bitmap(0, 0, 64, 64, 2), 100, 50);
+        let kept = pending.unwrap();
+        assert!(covers_desktop(&kept, 100, 50));
+        assert_eq!(kept.data[0], 1);
+    }
+
+    #[test]
+    fn resize_pending_upgrades_tile_to_full_frame() {
+        let mut pending = None;
+        retain_bitmap_during_resize(&mut pending, bitmap(0, 0, 64, 64, 2), 100, 50);
+        retain_bitmap_during_resize(&mut pending, bitmap(0, 0, 100, 50, 3), 100, 50);
+        let kept = pending.unwrap();
+        assert!(covers_desktop(&kept, 100, 50));
+        assert_eq!(kept.data[0], 3);
+    }
 }

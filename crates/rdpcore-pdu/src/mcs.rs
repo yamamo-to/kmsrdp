@@ -435,11 +435,18 @@ impl SendData {
 
     fn decode(input: &[u8], pdu: DomainMcsPdu) -> Result<Self, DecodeError> {
         let mut cursor = ReadCursor::new(input);
-        read_choice_byte(&mut cursor, pdu)?;
-        let initiator = per::read_u16(&mut cursor, BASE_CHANNEL_ID)?;
-        let channel_id = per::read_u16(&mut cursor, 0)?;
+        Self::decode_from_cursor(&mut cursor, pdu)
+    }
+
+    fn decode_from_cursor(
+        cursor: &mut ReadCursor<'_>,
+        pdu: DomainMcsPdu,
+    ) -> Result<Self, DecodeError> {
+        read_choice_byte(cursor, pdu)?;
+        let initiator = per::read_u16(cursor, BASE_CHANNEL_ID)?;
+        let channel_id = per::read_u16(cursor, 0)?;
         let priority_and_segmentation = cursor.read_u8()?;
-        let length = per::read_length(&mut cursor)?;
+        let length = per::read_length(cursor)?;
         let data = cursor.read_slice(length)?.to_vec();
         Ok(Self {
             initiator,
@@ -455,6 +462,12 @@ impl SendData {
 
     pub fn decode_request(input: &[u8]) -> Result<Self, DecodeError> {
         Self::decode(input, DomainMcsPdu::SendDataRequest)
+    }
+
+    /// Decode one Send Data Request and advance `cursor`, leaving any
+    /// subsequent MCS PDUs in the same X.224 payload for the caller.
+    pub fn decode_request_from_cursor(cursor: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
+        Self::decode_from_cursor(cursor, DomainMcsPdu::SendDataRequest)
     }
 
     pub fn encode_indication(&self) -> Vec<u8> {
