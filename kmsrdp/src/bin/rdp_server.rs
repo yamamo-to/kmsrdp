@@ -119,13 +119,14 @@ async fn main() -> Result<()> {
     // component initializations (arboard, pactl) see the right session.
     let session_rx = kmsrdp::session_watcher::start().await?;
 
-    let initial = capture::capture_raw_bgrx()?;
+    let mut capturer = capture::Capturer::new()?;
+    let initial = capturer.capture()?;
     let width = initial.width as u16;
     let height = initial.height as u16;
     println!("desktop size: {width}x{height}");
 
     let mouse_scale: MouseScale = Arc::new(Mutex::new((f64::from(width), f64::from(height))));
-    let hub = DisplayHub::start(width, height, mouse_scale.clone());
+    let hub = DisplayHub::start(width, height, mouse_scale.clone(), capturer);
     let display = Display::new(hub);
 
     let username = std::env::var("KMSRDP_USER").unwrap_or_else(|_| "kmsrdp".to_string());

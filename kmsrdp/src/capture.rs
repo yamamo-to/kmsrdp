@@ -9,7 +9,7 @@
 use std::fs;
 use std::io;
 use std::os::unix::io::{AsFd, AsRawFd};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use drm::Device;
 use drm::control::{Device as ControlDevice, connector, crtc, plane, property};
@@ -82,7 +82,6 @@ impl DisplaySelector {
 }
 
 static DISPLAY_SELECTOR: OnceLock<Result<Option<DisplaySelector>, String>> = OnceLock::new();
-static LAST_SELECTED_DISPLAY: Mutex<Option<String>> = Mutex::new(None);
 
 fn display_selector() -> io::Result<Option<&'static DisplaySelector>> {
     let configured = DISPLAY_SELECTOR.get_or_init(|| {
@@ -94,17 +93,6 @@ fn display_selector() -> io::Result<Option<&'static DisplaySelector>> {
             io::ErrorKind::InvalidInput,
             format!("invalid KMSRDP_DISPLAY: {reason}"),
         )),
-    }
-}
-
-fn log_selected_display(card: &str, connector: &str) {
-    let selected = format!("{card}:{connector}");
-    let mut last = LAST_SELECTED_DISPLAY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if last.as_deref() != Some(&selected) {
-        eprintln!("kmsrdp: capturing DRM display {selected}");
-        *last = Some(selected);
     }
 }
 
@@ -144,10 +132,18 @@ fn connector_crtc_via_atomic_prop(
     Ok(None)
 }
 
+struct OpenedCard {
+    card: Card,
+    path: String,
+    name: String,
+    crtc: crtc::Handle,
+    connector: String,
+}
+
 /// Find the configured connected connector with an active CRTC. When
 /// `KMSRDP_DISPLAY` is unset, this preserves the original "first usable
 /// connector" behavior.
-fn find_usable_card_and_crtc() -> io::Result<(Card, String, crtc::Handle)> {
+fn open_usable_card() -> io::Result<OpenedCard> {
     let selector = display_selector()?;
     let mut discovered = Vec::new();
     let mut entries: Vec<_> = fs::read_dir("/dev/dri")?.filter_map(|e| e.ok()).collect();
@@ -171,47 +167,19 @@ fn find_usable_card_and_crtc() -> io::Result<(Card, String, crtc::Handle)> {
             }
         };
 
-        let resources = match card.resource_handles() {
-            Ok(r) => r,
+        match find_crtc_on_card(&card, card_name) {
+            Ok((crtc, connector)) => {
+                return Ok(OpenedCard {
+                    card,
+                    path: path_str,
+                    name: card_name.to_owned(),
+                    crtc,
+                    connector,
+                });
+            }
             Err(e) => {
-                eprintln!("skip {path_str}: get resources failed: {e}");
-                continue;
+                discovered.push(format!("{card_name}: {e}"));
             }
-        };
-
-        for &conn_handle in resources.connectors() {
-            let Ok(conn) = card.get_connector(conn_handle, false) else {
-                continue;
-            };
-            let connector_name = conn.to_string();
-            let qualified_name = format!("{card_name}:{connector_name}");
-            if conn.state() != connector::State::Connected {
-                discovered.push(format!("{qualified_name} (disconnected)"));
-                continue;
-            }
-            let legacy_crtc = conn
-                .current_encoder()
-                .and_then(|encoder_handle| card.get_encoder(encoder_handle).ok())
-                .and_then(|encoder| encoder.crtc());
-            let crtc_handle = match legacy_crtc {
-                Some(crtc_handle) => crtc_handle,
-                // Legacy encoder->crtc chain is empty (e.g. the proprietary
-                // NVIDIA driver never fills it in) - fall back to the
-                // connector's atomic CRTC_ID property.
-                None => match connector_crtc_via_atomic_prop(&card, conn_handle) {
-                    Ok(Some(crtc_handle)) => crtc_handle,
-                    _ => {
-                        discovered.push(format!("{qualified_name} (connected, inactive)"));
-                        continue;
-                    }
-                },
-            };
-            discovered.push(format!("{qualified_name} (active)"));
-            if selector.is_some_and(|wanted| !wanted.matches(card_name, &connector_name)) {
-                continue;
-            }
-            log_selected_display(card_name, &connector_name);
-            return Ok((card, path_str, crtc_handle));
         }
     }
 
@@ -221,6 +189,64 @@ fn find_usable_card_and_crtc() -> io::Result<(Card, String, crtc::Handle)> {
             selector.configured_name()
         ),
         None => "no usable card/connector/CRTC found (is a display actually active?)".to_string(),
+    };
+    let discovered = if discovered.is_empty() {
+        "none".to_string()
+    } else {
+        discovered.join(", ")
+    };
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("{reason}; discovered DRM connectors: {discovered}"),
+    ))
+}
+
+/// Resolve the currently active CRTC on an already-open card without
+/// reopening the DRM device. Keeping the same fd is important: repeatedly
+/// opening the card while Xorg is dropping DRM master can prevent fbcon
+/// from restoring the text console after logout.
+fn find_crtc_on_card(card: &Card, card_name: &str) -> io::Result<(crtc::Handle, String)> {
+    let selector = display_selector()?;
+    let resources = card.resource_handles()?;
+    let mut discovered = Vec::new();
+
+    for &conn_handle in resources.connectors() {
+        let Ok(conn) = card.get_connector(conn_handle, false) else {
+            continue;
+        };
+        let connector_name = conn.to_string();
+        let qualified_name = format!("{card_name}:{connector_name}");
+        if conn.state() != connector::State::Connected {
+            discovered.push(format!("{qualified_name} (disconnected)"));
+            continue;
+        }
+        let legacy_crtc = conn
+            .current_encoder()
+            .and_then(|encoder_handle| card.get_encoder(encoder_handle).ok())
+            .and_then(|encoder| encoder.crtc());
+        let crtc_handle = match legacy_crtc {
+            Some(crtc_handle) => crtc_handle,
+            None => match connector_crtc_via_atomic_prop(card, conn_handle) {
+                Ok(Some(crtc_handle)) => crtc_handle,
+                _ => {
+                    discovered.push(format!("{qualified_name} (connected, inactive)"));
+                    continue;
+                }
+            },
+        };
+        discovered.push(format!("{qualified_name} (active)"));
+        if selector.is_some_and(|wanted| !wanted.matches(card_name, &connector_name)) {
+            continue;
+        }
+        return Ok((crtc_handle, connector_name));
+    }
+
+    let reason = match selector {
+        Some(selector) => format!(
+            "requested display {} is not active on {card_name}",
+            selector.configured_name()
+        ),
+        None => format!("no active connector found on {card_name}"),
     };
     let discovered = if discovered.is_empty() {
         "none".to_string()
@@ -243,170 +269,234 @@ pub struct RawFrame {
     pub data: Vec<u8>,
 }
 
-/// Grabs the current primary-plane framebuffer of the configured
-/// card/connector/CRTC as raw BGRX8888 bytes (this is
-/// `ironrdp_server::PixelFormat::BgrX32`'s exact memory layout, so the RDP
-/// path can hand it to the encoder with no per-pixel conversion).
-///
-/// Requires `CAP_SYS_ADMIN` (see reframe-streamer's systemd unit for why).
-///
-/// Falls back to NvFBC ([`crate::nvfbc`]) when the DRM/KMS path fails to
-/// find a bound CRTC at all, which happens on the proprietary NVIDIA
-/// driver under a classic Xorg session (see README). NvFBC only ever runs
-/// as this fallback since it's NVIDIA-only; DRM/KMS is the general path
-/// for everything else.
-pub fn capture_raw_bgrx() -> io::Result<RawFrame> {
-    match capture_raw_bgrx_drm() {
-        Ok(frame) => Ok(frame),
-        Err(drm_err) if display_selector()?.is_some() => {
-            // NvFBC captures the X screen as a whole and cannot honor a
-            // connector selection. Falling back here would silently show
-            // a different display than the administrator requested.
-            Err(drm_err)
+/// Stateful screen capturer. The DRM card fd stays open for this object's
+/// lifetime so the capture loop never repeatedly becomes DRM master while
+/// Xorg is exiting and fbcon is trying to restore the text console.
+pub struct Capturer {
+    drm: Option<DrmCapturer>,
+    drm_open_error: Option<String>,
+}
+
+impl Capturer {
+    pub fn new() -> io::Result<Self> {
+        match DrmCapturer::open() {
+            Ok(drm) => Ok(Self {
+                drm: Some(drm),
+                drm_open_error: None,
+            }),
+            Err(drm_err) if display_selector()?.is_some() => {
+                // NvFBC captures the X screen as a whole and cannot honor a
+                // connector selection. Falling back here would silently show
+                // a different display than the administrator requested.
+                Err(drm_err)
+            }
+            Err(drm_err) => Ok(Self {
+                drm: None,
+                drm_open_error: Some(drm_err.to_string()),
+            }),
         }
-        Err(drm_err) => match crate::nvfbc::capture_bgrx() {
+    }
+
+    pub fn capture(&mut self) -> io::Result<RawFrame> {
+        let drm_error = match &mut self.drm {
+            Some(drm) => match drm.capture() {
+                Ok(frame) => return Ok(frame),
+                Err(drm_err) if display_selector()?.is_some() => return Err(drm_err),
+                Err(drm_err) => drm_err.to_string(),
+            },
+            None => self
+                .drm_open_error
+                .clone()
+                .unwrap_or_else(|| "DRM/KMS capturer unavailable".to_string()),
+        };
+
+        match crate::nvfbc::capture_bgrx() {
             Ok((width, height, data)) => Ok(RawFrame {
                 width,
                 height,
                 stride: width as usize * 4,
                 data,
             }),
-            Err(nvfbc_err) => {
-                eprintln!(
-                    "DRM/KMS capture failed ({drm_err}), NvFBC fallback also failed ({nvfbc_err})"
-                );
-                Err(drm_err)
-            }
-        },
+            Err(nvfbc_err) => Err(io::Error::other(format!(
+                "DRM/KMS capture failed ({drm_error}), \
+                 NvFBC fallback also failed ({nvfbc_err})"
+            ))),
+        }
     }
 }
 
-fn capture_raw_bgrx_drm() -> io::Result<RawFrame> {
-    let (card, card_path, crtc_handle) = find_usable_card_and_crtc()?;
+struct DrmCapturer {
+    card: Card,
+    card_path: String,
+    card_name: String,
+    crtc: crtc::Handle,
+    connector: String,
+}
 
-    // Needed to see primary/cursor planes via plane_handles(), and to read
-    // CRTC_X/Y-style properties later on.
-    card.set_client_capability(drm::ClientCapability::UniversalPlanes, true)?;
-    card.set_client_capability(drm::ClientCapability::Atomic, true)?;
+impl DrmCapturer {
+    fn open() -> io::Result<Self> {
+        let opened = open_usable_card()?;
 
-    // We may have become DRM master by being the first opener; drop it so a
-    // compositor can still start normally, same as upstream's drmDropMaster().
-    let _ = card.release_master_lock();
+        // Needed to see primary/cursor planes via plane_handles(), and to read
+        // CRTC_X/Y-style properties later on.
+        opened
+            .card
+            .set_client_capability(drm::ClientCapability::UniversalPlanes, true)?;
+        opened
+            .card
+            .set_client_capability(drm::ClientCapability::Atomic, true)?;
 
-    let (plane_handle, plane_info) = card
-        .plane_handles()?
-        .into_iter()
-        .find_map(|handle| {
-            let info = card.get_plane(handle).ok()?;
-            if info.crtc() != Some(crtc_handle) {
-                return None;
-            }
-            let ty = plane_type(&card, handle).ok()?;
-            (ty == "Primary").then_some((handle, info))
+        // We may have become DRM master by being the first opener. Drop it
+        // once, then retain this non-master fd for all subsequent captures.
+        let _ = opened.card.release_master_lock();
+        eprintln!(
+            "kmsrdp: capturing DRM display {}:{}",
+            opened.name, opened.connector
+        );
+
+        Ok(Self {
+            card: opened.card,
+            card_path: opened.path,
+            card_name: opened.name,
+            crtc: opened.crtc,
+            connector: opened.connector,
         })
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no primary plane for CRTC"))?;
-    let _ = plane_handle;
+    }
 
-    let fb_handle = plane_info.framebuffer().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "primary plane has no framebuffer attached (screen off / locked?)",
-        )
-    })?;
+    fn capture(&mut self) -> io::Result<RawFrame> {
+        let (crtc, connector) = find_crtc_on_card(&self.card, &self.card_name)?;
+        self.crtc = crtc;
+        if connector != self.connector {
+            eprintln!(
+                "kmsrdp: capturing DRM display {}:{connector}",
+                self.card_name
+            );
+            self.connector = connector;
+        }
 
-    // Prefer GetFB2 (fourcc + modifier + per-plane offsets/pitches), fall
-    // back to legacy GetFB, exactly like export_fb2()/export_fb() upstream.
-    let (size, fourcc, modifier, buffers, pitches, offsets) =
-        match card.get_planar_framebuffer(fb_handle) {
-            Ok(fb) => (
-                fb.size(),
-                fb.pixel_format(),
-                fb.modifier(),
-                fb.buffers(),
-                fb.pitches(),
-                fb.offsets(),
-            ),
-            Err(e) => {
-                eprintln!("GetFB2 failed ({e}), falling back to legacy GetFB");
-                let fb = card.get_framebuffer(fb_handle)?;
-                let mut buffers = [None; 4];
-                buffers[0] = fb.buffer();
-                let mut pitches = [0u32; 4];
-                pitches[0] = fb.pitch();
-                (
+        let (plane_handle, plane_info) = self
+            .card
+            .plane_handles()?
+            .into_iter()
+            .find_map(|handle| {
+                let info = self.card.get_plane(handle).ok()?;
+                if info.crtc() != Some(self.crtc) {
+                    return None;
+                }
+                let ty = plane_type(&self.card, handle).ok()?;
+                (ty == "Primary").then_some((handle, info))
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no primary plane for CRTC"))?;
+        let _ = plane_handle;
+
+        let fb_handle = plane_info.framebuffer().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "primary plane has no framebuffer attached (screen off / locked?)",
+            )
+        })?;
+
+        // Prefer GetFB2 (fourcc + modifier + per-plane offsets/pitches), fall
+        // back to legacy GetFB, exactly like export_fb2()/export_fb() upstream.
+        let (size, fourcc, modifier, buffers, pitches, offsets) =
+            match self.card.get_planar_framebuffer(fb_handle) {
+                Ok(fb) => (
                     fb.size(),
-                    // Legacy GetFB has no fourcc; DRM only ever used XRGB8888 here.
-                    DrmFourcc::Xrgb8888,
-                    Some(DrmModifier::Linear),
-                    buffers,
-                    pitches,
-                    [0u32; 4],
-                )
-            }
-        };
+                    fb.pixel_format(),
+                    fb.modifier(),
+                    fb.buffers(),
+                    fb.pitches(),
+                    fb.offsets(),
+                ),
+                Err(e) => {
+                    eprintln!("GetFB2 failed ({e}), falling back to legacy GetFB");
+                    let fb = self.card.get_framebuffer(fb_handle)?;
+                    let mut buffers = [None; 4];
+                    buffers[0] = fb.buffer();
+                    let mut pitches = [0u32; 4];
+                    pitches[0] = fb.pitch();
+                    (
+                        fb.size(),
+                        // Legacy GetFB has no fourcc; DRM only ever used XRGB8888 here.
+                        DrmFourcc::Xrgb8888,
+                        Some(DrmModifier::Linear),
+                        buffers,
+                        pitches,
+                        [0u32; 4],
+                    )
+                }
+            };
 
-    let buf_handle = buffers[0].ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "framebuffer has no plane-0 buffer")
-    })?;
-    let fd = card.buffer_to_prime_fd(buf_handle, drm::CLOEXEC)?;
-    let (width, height) = size;
+        let buf_handle = buffers[0].ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "framebuffer has no plane-0 buffer")
+        })?;
+        let fd = self.card.buffer_to_prime_fd(buf_handle, drm::CLOEXEC)?;
+        let (width, height) = size;
 
-    // Plain Linear XRGB8888/ARGB8888 can be read back with a CPU mmap;
-    // tiled (vendor-modifier) framebuffers of the same formats go through a
-    // GBM/EGL detile pass instead. Anything else (e.g. multi-plane YUV)
-    // isn't supported by either path.
-    let is_plain_bgrx = matches!(fourcc, DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888)
-        && matches!(modifier, None | Some(DrmModifier::Linear));
-    let is_detileable_bgrx =
-        matches!(fourcc, DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888) && modifier.is_some();
+        // Plain Linear XRGB8888/ARGB8888 can be read back with a CPU mmap;
+        // tiled (vendor-modifier) framebuffers of the same formats go through a
+        // GBM/EGL detile pass instead. Anything else (e.g. multi-plane YUV)
+        // isn't supported by either path.
+        let is_plain_bgrx = matches!(fourcc, DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888)
+            && matches!(modifier, None | Some(DrmModifier::Linear));
+        let is_detileable_bgrx =
+            matches!(fourcc, DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888) && modifier.is_some();
 
-    if is_plain_bgrx {
-        let pitch = pitches[0] as usize;
-        let map_len = pitch * height as usize;
+        if is_plain_bgrx {
+            let pitch = pitches[0] as usize;
+            let map_len = pitch * height as usize;
 
-        // Safety: `fd` is a dma-buf we just exported ourselves via PRIME,
-        // backing a buffer at least `pitch * height` bytes; nothing else in
-        // this process writes to it concurrently.
-        let mmap = unsafe {
-            MmapOptions::new()
-                .len(map_len)
-                .map(fd.as_raw_fd())
-                .map_err(|e| io::Error::other(format!("mmap failed: {e}")))?
-        };
+            // Safety: `fd` is a dma-buf we just exported ourselves via PRIME,
+            // backing a buffer at least `pitch * height` bytes; nothing else in
+            // this process writes to it concurrently.
+            let mmap = unsafe {
+                MmapOptions::new()
+                    .len(map_len)
+                    .map(fd.as_raw_fd())
+                    .map_err(|e| io::Error::other(format!("mmap failed: {e}")))?
+            };
 
-        return Ok(RawFrame {
-            width,
-            height,
-            stride: pitch,
-            data: mmap.to_vec(),
-        });
+            return Ok(RawFrame {
+                width,
+                height,
+                stride: pitch,
+                data: mmap.to_vec(),
+            });
+        }
+
+        if is_detileable_bgrx {
+            let data = gpu_detile::detile_to_bgrx(
+                &self.card_path,
+                fd.as_raw_fd(),
+                fourcc,
+                modifier.expect("checked by is_detileable_bgrx"),
+                width,
+                height,
+                offsets[0],
+                pitches[0],
+            )?;
+            return Ok(RawFrame {
+                width,
+                height,
+                stride: width as usize * 4,
+                data,
+            });
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "format {fourcc:?} / modifier {modifier:?} isn't supported \
+                 (need XRGB8888/ARGB8888)"
+            ),
+        ))
     }
+}
 
-    if is_detileable_bgrx {
-        let data = gpu_detile::detile_to_bgrx(
-            &card_path,
-            fd.as_raw_fd(),
-            fourcc,
-            modifier.expect("checked by is_detileable_bgrx"),
-            width,
-            height,
-            offsets[0],
-            pitches[0],
-        )?;
-        return Ok(RawFrame {
-            width,
-            height,
-            stride: width as usize * 4,
-            data,
-        });
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "format {fourcc:?} / modifier {modifier:?} isn't supported (need XRGB8888/ARGB8888)"
-        ),
-    ))
+/// One-shot compatibility helper for demos and diagnostics. The production
+/// display loop owns one [`Capturer`] and reuses it instead.
+pub fn capture_raw_bgrx() -> io::Result<RawFrame> {
+    Capturer::new()?.capture()
 }
 
 /// Same capture, decoded into an RGB image (for the PNG demo binaries).
