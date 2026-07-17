@@ -15,7 +15,7 @@ drm-fourcc = "2.2.0"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 khronos-egl = { version = "6.0.0", features = ["dynamic"] }
 libc = "0.2.186"
-libloading = "0.8.9"
+libloading = "0.9.0"
 memmap2 = { version = "0.9.11", default-features = false }
 rand = "0.10.2"
 rdpcore-cliprdr = { path = "../crates/rdpcore-cliprdr" }
@@ -28,5 +28,5 @@ rustls = "0.23.42"
 futures-util = "0.3"
 tokio = { version = "1.52.3", features = ["full"] }
 uinput-sys = "0.1.7"
-x11rb = { version = "0.13.2", features = ["xtest"] }
-zbus = { version = "4", default-features = false, features = ["tokio"] }
+x11rb = { version = "0.14.0", features = ["xtest"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
