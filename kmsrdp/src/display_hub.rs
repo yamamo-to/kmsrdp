@@ -20,7 +20,7 @@ use crate::capture;
 /// with input so a resize updates both sides together.
 pub type MouseScale = Arc<Mutex<(f64, f64)>>;
 
-const BROADCAST_CAPACITY: usize = 64;
+const BROADCAST_CAPACITY: usize = 256;
 
 /// When more than this fraction of the frame is dirty, send one full-frame
 /// update instead of many tile updates. Large scene changes (logout, VT
@@ -172,6 +172,16 @@ impl DisplayHub {
                         _ => vec![Rect::new(0, 0, raw.width as usize, raw.height as usize)],
                     };
 
+                    // Publish `latest_full` *before* broadcasting. A slow
+                    // subscriber that lags mid-scene-change recovers from
+                    // `latest_full`; if we updated it after the sends, that
+                    // recovery would repaint the previous (e.g. X wallpaper)
+                    // frame while the console update itself was among the
+                    // dropped messages — then a static console produces no
+                    // further dirty rects and the client stays stuck forever.
+                    *self.latest_full.lock().unwrap() = Some(full.clone());
+                    previous = Some(raw);
+
                     for rect in &dirty_rects {
                         let (Some(w), Some(h)) = (
                             NonZeroU16::new(rect.width as u16),
@@ -184,8 +194,6 @@ impl DisplayHub {
                         };
                         let _ = self.tx.send(DisplayUpdate::Bitmap(sub));
                     }
-                    *self.latest_full.lock().unwrap() = Some(full);
-                    previous = Some(raw);
                 }
                 Err(e) => eprintln!("capture failed: {e}"),
             }
@@ -248,9 +256,10 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
         loop {
             match self.rx.recv().await {
                 Ok(update) => return Ok(Some(update)),
-                // Dropped frames leave the client canvas inconsistent with
-                // the server's previous-frame baseline; resync from the
-                // latest complete frame instead of keeping stale tiles.
+                // Missed updates leave the client canvas inconsistent.
+                // Resync from `latest_full`, which the capture loop publishes
+                // before broadcasting so a mid-send lag still recovers the
+                // frame that was being sent (not the prior one).
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     if let Some(full) = self.latest_full.lock().unwrap().clone() {
                         return Ok(Some(DisplayUpdate::Bitmap(full)));

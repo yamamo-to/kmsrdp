@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.3
+Version:        0.1.4
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -96,6 +96,11 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Fri Jul 17 2026 kmsrdp contributors <noreply@example.com> - 0.1.4-1
+- Publish the latest full frame before broadcasting dirty updates so
+  lagged clients recover the current scene instead of stale X tiles
+- Increase the display broadcast buffer for slow RDP clients
+
 * Fri Jul 17 2026 kmsrdp contributors <noreply@example.com> - 0.1.3-1
 - Force a full-frame refresh when the DRM framebuffer changes
 - Lower the dirty-area threshold to prevent stale tiles after X logout
