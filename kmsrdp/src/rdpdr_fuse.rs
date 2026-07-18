@@ -1,10 +1,11 @@
 //! FUSE mount for RDPDR filesystem devices: client-redirected drives appear
 //! under `{xdg_runtime_dir}/kmsrdp/drives/<DosName>` for the active session.
 //!
-//! Each RDP connection mounts at a unique path
-//! `drives/c<id>/<DosName>` so concurrent Guacamole/mstsc sessions cannot
-//! steal or tear down each other's FUSE mounts. A symlink at the stable
-//! `drives/<DosName>` path tracks the most recently announced connection.
+//! Concurrent RDP connections share one mount per DosName (same idea as the
+//! shared display). The mount is created by the first connection that
+//! announces the device and released only when the last connection leaves.
+//! While multiple connections are present, one owner supplies the RDPDR
+//! bridge; ownership is handed off if that connection disconnects first.
 //!
 //! Wire IRPs are limited to CREATE/CLOSE/READ/WRITE/QueryDirectory (same as
 //! FreeRDP's server). unlink/rmdir/rename/setattr therefore return ENOSYS.
@@ -853,26 +854,65 @@ impl Filesystem for FuseFs {
     }
 }
 
-struct MountedDrive {
-    dos_name: String,
-    conn_id: u64,
-    mount_point: PathBuf,
-    session: BackgroundSession,
+struct MountMember {
+    bridge: Arc<Bridge>,
+    device_id: u32,
+    uid: u32,
+    gid: u32,
 }
 
-/// Tracks per-connection FUSE mounts so a disconnect only tears down that
-/// connection's mount, and the stable `<DosName>` symlink can be retargeted.
+struct SharedMount {
+    mount_point: PathBuf,
+    owner_conn: u64,
+    session: BackgroundSession,
+    members: HashMap<u64, MountMember>,
+}
+
+/// One shared FUSE mount per DosName: refcounted across RDP connections,
+/// released only when the last member leaves.
 struct MountRegistry {
     next_conn: AtomicU64,
-    /// `dos_name` → live mounts (oldest → newest). Symlink points at newest.
-    live: Mutex<HashMap<String, Vec<(u64, PathBuf)>>>,
+    slots: Mutex<HashMap<String, SharedMount>>,
+    /// Members that called `leave` while a handoff had the slot temporarily
+    /// removed — filtered out before the remount is published.
+    departed: Mutex<std::collections::HashSet<(String, u64)>>,
+}
+
+enum LeaveAction {
+    /// Non-owner left; mount stays.
+    None,
+    /// Last member left; tear down completely.
+    Release {
+        mount_point: PathBuf,
+        session: BackgroundSession,
+    },
+    /// Owner left but others remain; remount with a new owner.
+    Handoff {
+        dos_name: String,
+        mount_point: PathBuf,
+        session: BackgroundSession,
+        new_owner: u64,
+        /// Remaining members (already excluding the departing owner).
+        members: HashMap<u64, MountMember>,
+    },
+}
+
+struct JoinRequest {
+    dos_name: String,
+    conn_id: u64,
+    bridge: Arc<Bridge>,
+    device_id: u32,
+    mount_point: PathBuf,
+    uid: u32,
+    gid: u32,
 }
 
 impl MountRegistry {
     fn new() -> Self {
         Self {
             next_conn: AtomicU64::new(1),
-            live: Mutex::new(HashMap::new()),
+            slots: Mutex::new(HashMap::new()),
+            departed: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -880,24 +920,289 @@ impl MountRegistry {
         self.next_conn.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn register(&self, dos_name: &str, conn_id: u64, mount_point: PathBuf) {
-        self.live
-            .lock()
-            .unwrap()
-            .entry(dos_name.to_owned())
-            .or_default()
-            .push((conn_id, mount_point));
+    /// Join an existing shared mount, or create it if this is the first member.
+    fn join(&self, req: JoinRequest) -> bool {
+        let JoinRequest {
+            dos_name,
+            conn_id,
+            bridge,
+            device_id,
+            mount_point,
+            uid,
+            gid,
+        } = req;
+        bridge.ensure_root_ino(device_id);
+        let member = MountMember {
+            bridge: Arc::clone(&bridge),
+            device_id,
+            uid,
+            gid,
+        };
+
+        {
+            let mut slots = self.slots.lock().unwrap();
+            if let Some(slot) = slots.get_mut(&dos_name) {
+                slot.members.insert(conn_id, member);
+                println!(
+                    "kmsrdp: rdpdr FUSE joined {} at {} ({} member(s), owner={})",
+                    dos_name,
+                    slot.mount_point.display(),
+                    slot.members.len(),
+                    slot.owner_conn
+                );
+                return true;
+            }
+        }
+
+        // First member: prepare and mount outside the "already shared" path.
+        if let Err(e) = prepare_mount_point(&mount_point) {
+            eprintln!(
+                "kmsrdp: rdpdr FUSE: failed to prepare {}: {e}",
+                mount_point.display()
+            );
+            return false;
+        }
+        chown_path(&mount_point, uid, gid);
+        if let Some(parent) = mount_point.parent() {
+            chown_path(parent, uid, gid);
+        }
+
+        let session = match spawn_shared_mount(&dos_name, &mount_point, &bridge, device_id) {
+            Ok(session) => session,
+            Err(e) => {
+                eprintln!(
+                    "kmsrdp: rdpdr FUSE: mount failed at {}: {e} \
+                     (need fuse3, and usually `user_allow_other` in /etc/fuse.conf)",
+                    mount_point.display()
+                );
+                return false;
+            }
+        };
+
+        let mut slots = self.slots.lock().unwrap();
+        // Another connection may have won the race and mounted first.
+        if let Some(slot) = slots.get_mut(&dos_name) {
+            // Drop our redundant mount; keep the winner's.
+            finish_umount(session, &mount_point);
+            slot.members.insert(conn_id, member);
+            println!(
+                "kmsrdp: rdpdr FUSE joined {} at {} ({} member(s), owner={})",
+                dos_name,
+                slot.mount_point.display(),
+                slot.members.len(),
+                slot.owner_conn
+            );
+            return true;
+        }
+
+        println!(
+            "kmsrdp: rdpdr FUSE mounted {} at {} (shared)",
+            dos_name,
+            mount_point.display()
+        );
+        let mut members = HashMap::new();
+        members.insert(conn_id, member);
+        slots.insert(
+            dos_name,
+            SharedMount {
+                mount_point,
+                owner_conn: conn_id,
+                session,
+                members,
+            },
+        );
+        true
     }
 
-    fn unregister(&self, dos_name: &str, conn_id: u64) -> Option<PathBuf> {
-        let mut live = self.live.lock().unwrap();
-        let entries = live.get_mut(dos_name)?;
-        entries.retain(|(id, _)| *id != conn_id);
-        let next = entries.last().map(|(_, p)| p.clone());
-        if entries.is_empty() {
-            live.remove(dos_name);
+    fn leave(&self, dos_name: &str, conn_id: u64) {
+        let action = {
+            let mut slots = self.slots.lock().unwrap();
+            let Some(slot) = slots.get_mut(dos_name) else {
+                drop(slots);
+                self.departed
+                    .lock()
+                    .unwrap()
+                    .insert((dos_name.to_owned(), conn_id));
+                return;
+            };
+            slot.members.remove(&conn_id);
+            if slot.members.is_empty() {
+                let SharedMount {
+                    mount_point,
+                    session,
+                    ..
+                } = slots.remove(dos_name).expect("slot just checked");
+                LeaveAction::Release {
+                    mount_point,
+                    session,
+                }
+            } else if slot.owner_conn == conn_id {
+                let new_owner = *slot.members.keys().next().expect("members non-empty");
+                let SharedMount {
+                    mount_point,
+                    session,
+                    members,
+                    ..
+                } = slots.remove(dos_name).expect("slot present");
+                LeaveAction::Handoff {
+                    dos_name: dos_name.to_owned(),
+                    mount_point,
+                    session,
+                    new_owner,
+                    members,
+                }
+            } else {
+                println!(
+                    "kmsrdp: rdpdr FUSE member {conn_id} left {} ({} remaining, owner={})",
+                    dos_name,
+                    slot.members.len(),
+                    slot.owner_conn
+                );
+                LeaveAction::None
+            }
+        };
+
+        match action {
+            LeaveAction::None => {}
+            LeaveAction::Release {
+                mount_point,
+                session,
+            } => {
+                println!(
+                    "kmsrdp: rdpdr FUSE releasing {} at {} (last connection)",
+                    dos_name,
+                    mount_point.display()
+                );
+                finish_umount(session, &mount_point);
+            }
+            LeaveAction::Handoff {
+                dos_name,
+                mount_point,
+                session,
+                mut new_owner,
+                mut members,
+            } => {
+                println!(
+                    "kmsrdp: rdpdr FUSE handing off {} at {} → owner={new_owner}",
+                    dos_name,
+                    mount_point.display()
+                );
+                finish_umount(session, &mount_point);
+
+                {
+                    let mut departed = self.departed.lock().unwrap();
+                    members.retain(|id, _| !departed.remove(&(dos_name.clone(), *id)));
+                }
+                if members.is_empty() {
+                    return;
+                }
+                if !members.contains_key(&new_owner) {
+                    new_owner = *members.keys().next().expect("members non-empty");
+                }
+                let owner_member = MountMember {
+                    bridge: Arc::clone(&members[&new_owner].bridge),
+                    device_id: members[&new_owner].device_id,
+                    uid: members[&new_owner].uid,
+                    gid: members[&new_owner].gid,
+                };
+
+                owner_member.bridge.ensure_root_ino(owner_member.device_id);
+                if let Err(e) = prepare_mount_point(&mount_point) {
+                    eprintln!(
+                        "kmsrdp: rdpdr FUSE: handoff prepare failed for {}: {e}",
+                        mount_point.display()
+                    );
+                    return;
+                }
+                chown_path(&mount_point, owner_member.uid, owner_member.gid);
+                let new_session = match spawn_shared_mount(
+                    &dos_name,
+                    &mount_point,
+                    &owner_member.bridge,
+                    owner_member.device_id,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!(
+                            "kmsrdp: rdpdr FUSE: handoff remount failed for {}: {e}",
+                            mount_point.display()
+                        );
+                        return;
+                    }
+                };
+
+                let mut slots = self.slots.lock().unwrap();
+                {
+                    let mut departed = self.departed.lock().unwrap();
+                    members.retain(|id, _| !departed.remove(&(dos_name.clone(), *id)));
+                }
+                if members.is_empty() {
+                    finish_umount(new_session, &mount_point);
+                    return;
+                }
+                if !members.contains_key(&new_owner) {
+                    new_owner = *members.keys().next().expect("members non-empty");
+                }
+
+                if let Some(existing) = slots.remove(&dos_name) {
+                    finish_umount(new_session, &mount_point);
+                    let mut merged = existing;
+                    for (id, m) in members.drain() {
+                        merged.members.entry(id).or_insert(m);
+                    }
+                    println!(
+                        "kmsrdp: rdpdr FUSE handoff raced; keeping mount at {} (owner={})",
+                        merged.mount_point.display(),
+                        merged.owner_conn
+                    );
+                    slots.insert(dos_name, merged);
+                } else {
+                    slots.insert(
+                        dos_name,
+                        SharedMount {
+                            mount_point,
+                            owner_conn: new_owner,
+                            session: new_session,
+                            members,
+                        },
+                    );
+                }
+            }
         }
-        next
+    }
+}
+
+fn spawn_shared_mount(
+    dos_name: &str,
+    mount_point: &Path,
+    bridge: &Arc<Bridge>,
+    device_id: u32,
+) -> std::io::Result<BackgroundSession> {
+    let mut config = Config::default();
+    // SessionACL::All → allow_other so the session user can use a
+    // root-owned mount. File ownership comes from FileAttr uid/gid,
+    // not fusermount uid=/gid= (fusermount3 rejects those options).
+    config.acl = SessionACL::All;
+    config.mount_options = vec![
+        MountOption::FSName(format!("kmsrdp-{dos_name}")),
+        MountOption::DefaultPermissions,
+        MountOption::AutoUnmount,
+    ];
+    config.n_threads = Some(1);
+    let fs = FuseFs {
+        bridge: Arc::clone(bridge),
+        device_id,
+    };
+    fuser::spawn_mount2(fs, mount_point, &config)
+}
+
+fn finish_umount(session: BackgroundSession, mount_point: &Path) {
+    if let Err(e) = session.umount_and_join() {
+        eprintln!(
+            "kmsrdp: rdpdr FUSE umount/join failed for {} ({e}); trying lazy unmount",
+            mount_point.display()
+        );
+        try_unmount(mount_point);
     }
 }
 
@@ -937,7 +1242,7 @@ impl DriveConsumerFactory for FuseDriveFactory {
             uid,
             conn_id: self.registry.alloc_conn_id(),
             registry: Arc::clone(&self.registry),
-            mounts: HashMap::new(),
+            joined: HashMap::new(),
             have_session,
         })
     }
@@ -949,7 +1254,8 @@ struct FuseDriveConsumer {
     uid: u32,
     conn_id: u64,
     registry: Arc<MountRegistry>,
-    mounts: HashMap<u32, MountedDrive>,
+    /// device_id → dos_name for shared mounts this connection joined.
+    joined: HashMap<u32, String>,
     have_session: bool,
 }
 
@@ -972,79 +1278,19 @@ impl DriveConsumer for FuseDriveConsumer {
             return Vec::new();
         }
         let drives_root = self.runtime_dir.join("kmsrdp").join("drives");
-        let mount_point = drives_root.join(format!("c{}", self.conn_id)).join(&name);
-        if let Err(e) = prepare_mount_point(&mount_point) {
-            eprintln!(
-                "kmsrdp: rdpdr FUSE: failed to prepare {}: {e}",
-                mount_point.display()
-            );
-            return Vec::new();
-        }
-        chown_path(&mount_point, self.uid, self.bridge.gid);
-        // Parent dirs must also be reachable by the session user.
-        if let Some(parent) = mount_point.parent() {
-            chown_path(parent, self.uid, self.bridge.gid);
-        }
+        let mount_point = drives_root.join(&name);
         chown_path(&drives_root, self.uid, self.bridge.gid);
 
-        self.bridge.ensure_root_ino(device_id);
-
-        let mut config = Config::default();
-        // SessionACL::All → allow_other so the session user can use a
-        // root-owned mount. File ownership comes from FileAttr uid/gid,
-        // not fusermount uid=/gid= (fusermount3 rejects those options).
-        config.acl = SessionACL::All;
-        config.mount_options = vec![
-            MountOption::FSName(format!("kmsrdp-{}-c{}", name, self.conn_id)),
-            MountOption::DefaultPermissions,
-            MountOption::AutoUnmount,
-        ];
-        config.n_threads = Some(1);
-
-        let fs = FuseFs {
+        if self.registry.join(JoinRequest {
+            dos_name: name.clone(),
+            conn_id: self.conn_id,
             bridge: Arc::clone(&self.bridge),
             device_id,
-        };
-        match fuser::spawn_mount2(fs, &mount_point, &config) {
-            Ok(session) => {
-                self.registry
-                    .register(&name, self.conn_id, mount_point.clone());
-                if let Err(e) = publish_dos_symlink(
-                    &drives_root,
-                    &name,
-                    &PathBuf::from(format!("c{}", self.conn_id)).join(&name),
-                    self.uid,
-                    self.bridge.gid,
-                ) {
-                    eprintln!(
-                        "kmsrdp: rdpdr FUSE: failed to update symlink {} → {}: {e}",
-                        drives_root.join(&name).display(),
-                        mount_point.display()
-                    );
-                }
-                println!(
-                    "kmsrdp: rdpdr FUSE mounted {} at {} (symlink {})",
-                    name,
-                    mount_point.display(),
-                    drives_root.join(&name).display()
-                );
-                self.mounts.insert(
-                    device_id,
-                    MountedDrive {
-                        dos_name: name,
-                        conn_id: self.conn_id,
-                        mount_point,
-                        session,
-                    },
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "kmsrdp: rdpdr FUSE: mount failed at {}: {e} \
-                     (need fuse3, and usually `user_allow_other` in /etc/fuse.conf)",
-                    mount_point.display()
-                );
-            }
+            mount_point,
+            uid: self.uid,
+            gid: self.bridge.gid,
+        }) {
+            self.joined.insert(device_id, name);
         }
         Vec::new()
     }
@@ -1106,59 +1352,25 @@ impl DriveConsumer for FuseDriveConsumer {
 
 impl Drop for FuseDriveConsumer {
     fn drop(&mut self) {
-        // Unblock any FUSE ops waiting on IoCompletion before umount joins.
+        // Unblock FUSE ops waiting on this connection's bridge before leave
+        // may umount (owner) or hand off.
         self.bridge.abort_pending();
-        let drives_root = self.runtime_dir.join("kmsrdp").join("drives");
-        for (device_id, mounted) in self.mounts.drain() {
-            println!(
-                "kmsrdp: rdpdr FUSE unmounting device {device_id} at {}",
-                mounted.mount_point.display()
-            );
-            let MountedDrive {
-                dos_name,
-                conn_id,
-                mount_point,
-                session,
-            } = mounted;
-            if let Err(e) = session.umount_and_join() {
-                eprintln!(
-                    "kmsrdp: rdpdr FUSE umount/join failed for {} ({e}); trying lazy unmount",
-                    mount_point.display()
-                );
-                try_unmount(&mount_point);
-            }
-            match self.registry.unregister(&dos_name, conn_id) {
-                Some(remaining) => {
-                    // Point the stable name at another live connection.
-                    if let Ok(rel) = remaining.strip_prefix(&drives_root)
-                        && let Err(e) = publish_dos_symlink(
-                            &drives_root,
-                            &dos_name,
-                            rel,
-                            self.uid,
-                            self.bridge.gid,
-                        )
-                    {
-                        eprintln!("kmsrdp: rdpdr FUSE: failed to retarget symlink {dos_name}: {e}");
-                    }
-                }
-                None => {
-                    let link = drives_root.join(&dos_name);
-                    let _ = std::fs::remove_file(&link);
-                }
-            }
-            // Best-effort cleanup of the per-connection directory.
-            if let Some(parent) = mount_point.parent() {
-                let _ = std::fs::remove_dir(parent);
-            }
+        for (_device_id, dos_name) in self.joined.drain() {
+            self.registry.leave(&dos_name, self.conn_id);
         }
     }
 }
 
 fn prepare_mount_point(path: &Path) -> std::io::Result<()> {
-    // A previous RDP session may have left a stale FUSE mount. create_dir_all
-    // then hits EEXIST and is_dir() on the broken mount returns EIO, which
-    // surfaces as "File exists". Lazy-unmount first, then ensure the dir.
+    // A previous RDP session may have left a stale FUSE mount, or a v0.1.9
+    // per-connection symlink at this path. Clear those before mounting.
+    if path
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_file(path);
+    }
     if path.exists() {
         try_unmount(path);
     }
@@ -1174,30 +1386,6 @@ fn prepare_mount_point(path: &Path) -> std::io::Result<()> {
         }
         Err(e) => Err(e),
     }
-}
-
-/// Keep `drives/<DosName>` as a symlink to the per-connection mount so apps
-/// retain a stable path while concurrent sessions each keep their own FUSE.
-fn publish_dos_symlink(
-    drives_root: &Path,
-    dos_name: &str,
-    target_rel: &Path,
-    uid: u32,
-    gid: u32,
-) -> std::io::Result<()> {
-    std::fs::create_dir_all(drives_root)?;
-    chown_path(drives_root, uid, gid);
-    let link = drives_root.join(dos_name);
-    // Pre-v0.1.9 installs mounted directly at drives/<DosName>. Clear that
-    // before replacing with a symlink.
-    if link.exists() || link.symlink_metadata().is_ok() {
-        try_unmount(&link);
-        let _ = std::fs::remove_file(&link);
-        let _ = std::fs::remove_dir(&link);
-    }
-    std::os::unix::fs::symlink(target_rel, &link)?;
-    chown_path(&link, uid, gid);
-    Ok(())
 }
 
 fn try_unmount(path: &Path) {
