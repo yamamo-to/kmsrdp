@@ -91,6 +91,8 @@ kmsrdp's own DRM/uinput glue.
 - MS-RDPDR filesystem (drive) redirection is wired through a FUSE mount
   at `$XDG_RUNTIME_DIR/kmsrdp/drives/<DosName>` for the active session
   (e.g. `xfreerdp ... /drive:share,/path` or mstsc drive redirection).
+  Concurrent RDP connections each mount under `drives/c<id>/<DosName>`;
+  the stable `<DosName>` path is a symlink to the newest connection.
   Supported ops: list/read/write/create/mkdir. Delete, rename, and
   setattr are not implemented yet (no matching IRPs). Printer
   redirection (CUPS) is still a planned follow-up. Set
