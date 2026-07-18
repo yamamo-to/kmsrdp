@@ -15,6 +15,7 @@
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use rdpcore_rdpsnd::pdu::{AudioFormat, NegotiatedFormat};
 use rdpcore_rdpsnd::{RdpsndError, RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
@@ -30,6 +31,12 @@ const CHUNK_BYTES: usize = (SAMPLE_RATE * BLOCK_ALIGN as u32 / 1000 * CHUNK_MS) 
 
 fn pcm_format() -> AudioFormat {
     AudioFormat::pcm(CHANNELS, SAMPLE_RATE, BITS_PER_SAMPLE)
+}
+
+/// Kill (if still running) and `wait()` so the child cannot linger as a zombie.
+fn reap_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Stateless factory: each connection gets its own backend and sender.
@@ -51,6 +58,7 @@ impl SoundServerFactory for LocalAudioFactory {
             sender,
             formats: vec![pcm_format()],
             child: Arc::new(Mutex::new(None)),
+            capture: None,
         })
     }
 }
@@ -59,11 +67,20 @@ struct LocalAudioHandler {
     sender: UnboundedSender<RdpsndServerMessage>,
     formats: Vec<AudioFormat>,
     child: Arc<Mutex<Option<Child>>>,
+    /// Joined in [`Self::stop`] so renegotiation / disconnect cannot leave
+    /// orphaned capture threads (visible as growing `Threads:` in `/proc`).
+    capture: Option<JoinHandle<()>>,
 }
 
 impl core::fmt::Debug for LocalAudioHandler {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LocalAudioHandler").finish_non_exhaustive()
+    }
+}
+
+impl Drop for LocalAudioHandler {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -89,6 +106,7 @@ fn run_capture(sender: UnboundedSender<RdpsndServerMessage>, child: Arc<Mutex<Op
         }
     };
     let Some(mut stdout) = child_proc.stdout.take() else {
+        reap_child(&mut child_proc);
         return;
     };
     *child.lock().unwrap() = Some(child_proc);
@@ -107,6 +125,12 @@ fn run_capture(sender: UnboundedSender<RdpsndServerMessage>, child: Arc<Mutex<Op
         }
         timestamp_ms = timestamp_ms.wrapping_add(CHUNK_MS);
     }
+
+    // If `stop()` already took the Child, this is a no-op. Otherwise parec
+    // exited on its own and we still must wait() to avoid a zombie.
+    if let Some(mut child_proc) = child.lock().unwrap().take() {
+        reap_child(&mut child_proc);
+    }
 }
 
 impl RdpsndServerHandler for LocalAudioHandler {
@@ -119,15 +143,21 @@ impl RdpsndServerHandler for LocalAudioHandler {
     }
 
     fn start(&mut self, _format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+        // Guacamole (and some clients) can renegotiate / restart the wave
+        // stream; never leave a previous parec or capture thread running.
+        self.stop();
         let sender = self.sender.clone();
         let child = Arc::clone(&self.child);
-        std::thread::spawn(move || run_capture(sender, child));
+        self.capture = Some(std::thread::spawn(move || run_capture(sender, child)));
         Ok(())
     }
 
     fn stop(&mut self) {
         if let Some(mut child) = self.child.lock().unwrap().take() {
-            let _ = child.kill();
+            reap_child(&mut child);
+        }
+        if let Some(handle) = self.capture.take() {
+            let _ = handle.join();
         }
     }
 }

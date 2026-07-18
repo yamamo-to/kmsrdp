@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.7
+Version:        0.1.8
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -97,6 +97,10 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Sat Jul 18 2026 kmsrdp contributors <noreply@example.com> - 0.1.8-1
+- Reap parec/paplay children with wait() to stop Guacamole session zombies
+- Join audio capture and FUSE threads; stop clipboard watcher on disconnect
+
 * Sat Jul 18 2026 kmsrdp contributors <noreply@example.com> - 0.1.7-1
 - Mount redirected client drives via FUSE under the session runtime dir
 - Prefer HYBRID CredSSP wake path for RDPDR I/O; clear stale FUSE mounts

@@ -148,6 +148,7 @@ fn spawn_writer(format: &AudioFormat) -> Option<Sender<Vec<u8>>> {
             }
         }
         let _ = child.kill();
+        let _ = child.wait();
     });
     Some(tx)
 }
@@ -162,5 +163,12 @@ impl AudioInputBackend for VirtualMicBackend {
         {
             self.tx = None; // writer thread/child died - respawn on next chunk
         }
+    }
+}
+
+impl Drop for VirtualMicBackend {
+    fn drop(&mut self) {
+        // Closing the channel lets the writer thread exit, kill paplay, and wait.
+        self.tx = None;
     }
 }

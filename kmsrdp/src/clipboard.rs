@@ -54,8 +54,17 @@ fn spawn_local_clipboard_watcher(
     tokio::spawn(async move {
         let mut last = local_text();
         loop {
+            // Exit as soon as the connection drops its receiver. Previously we
+            // only noticed on a failed send (clipboard text change), so after
+            // Guacamole disconnect the watcher kept spawning blocking polls.
+            if sender.is_closed() {
+                break;
+            }
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(750)) => {
+                    if sender.is_closed() {
+                        break;
+                    }
                     let current = tokio::task::spawn_blocking(local_text).await.unwrap_or(None);
                     if current != last && matches!(&current, Some(t) if !t.is_empty())
                         && !advertise_local_text(&sender) {
