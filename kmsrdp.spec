@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.9
+Version:        0.1.10
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -97,6 +97,10 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Sat Jul 18 2026 kmsrdp contributors <noreply@example.com> - 0.1.10-1
+- Share one FUSE mount per DosName across RDP connections; release on last disconnect
+- Hand off the RDPDR owner when the mounting connection leaves first
+
 * Sat Jul 18 2026 kmsrdp contributors <noreply@example.com> - 0.1.9-1
 - Per-connection FUSE mounts so concurrent sessions no longer share/unmount one path
 - Abort pending RDPDR waiters on disconnect so umount does not block for 60s

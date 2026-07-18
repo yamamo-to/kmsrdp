@@ -91,14 +91,13 @@ kmsrdp's own DRM/uinput glue.
 - MS-RDPDR filesystem (drive) redirection is wired through a FUSE mount
   at `$XDG_RUNTIME_DIR/kmsrdp/drives/<DosName>` for the active session
   (e.g. `xfreerdp ... /drive:share,/path` or mstsc drive redirection).
-  Concurrent RDP connections each mount under `drives/c<id>/<DosName>`;
-  the stable `<DosName>` path is a symlink to the newest connection.
-  Supported ops: list/read/write/create/mkdir. Delete, rename, and
-  setattr are not implemented yet (no matching IRPs). Printer
-  redirection (CUPS) is still a planned follow-up. Set
-  `KMSRDP_RDPDR_DIAGNOSTIC=1` to run the protocol self-test consumer
-  instead of FUSE. Mounting requires `user_allow_other` in
-  `/etc/fuse.conf` when kmsrdp runs as root.
+  Concurrent RDP connections share that path (one mount per DosName);
+  it is released only when the last connection leaves. Supported ops:
+  list/read/write/create/mkdir. Delete, rename, and setattr are not
+  implemented yet (no matching IRPs). Printer redirection (CUPS) is
+  still a planned follow-up. Set `KMSRDP_RDPDR_DIAGNOSTIC=1` to run the
+  protocol self-test consumer instead of FUSE. Mounting requires
+  `user_allow_other` in `/etc/fuse.conf` when kmsrdp runs as root.
 - Extended-key (arrow keys, etc.) scancode mapping covers only the common
   cases, not the full table.
 - Single-process design requires `CAP_SYS_ADMIN` (DRM), `CAP_DAC_OVERRIDE`
