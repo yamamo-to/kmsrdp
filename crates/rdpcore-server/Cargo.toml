@@ -16,5 +16,6 @@ rdpcore-rdpdr = { path = "../rdpcore-rdpdr" }
 rdpcore-pdu = { path = "../rdpcore-pdu" }
 rdpcore-rdpsnd = { path = "../rdpcore-rdpsnd" }
 rdpcore-transport = { path = "../rdpcore-transport" }
+sspi = { version = "0.21.3", default-features = false, features = ["aws-lc-rs"] }
 tokio = { version = "1.52.3", features = ["rt", "net", "io-util", "macros", "sync"] }
 tokio-rustls = "0.26"

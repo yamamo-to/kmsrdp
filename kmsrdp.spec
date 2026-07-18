@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.5
+Version:        0.1.6
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -96,6 +96,10 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Sat Jul 18 2026 kmsrdp contributors <noreply@example.com> - 0.1.6-1
+- Add optional NLA (CredSSP/NTLMv2) with HYBRID preferred and TLS fallback
+- Pass TLS subjectPublicKey bytes so FreeRDP/Guacamole pubKeyAuth verifies
+
 * Sat Jul 18 2026 kmsrdp contributors <noreply@example.com> - 0.1.5-1
 - Complete mstsc reactivation after a server-side desktop resize
 - Preserve and send the post-resize full frame after capability negotiation

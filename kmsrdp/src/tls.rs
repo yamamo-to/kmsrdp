@@ -12,7 +12,16 @@ use std::sync::Arc;
 use rdpcore_server::tokio_rustls::TlsAcceptor;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-pub fn build_acceptor() -> io::Result<TlsAcceptor> {
+/// TLS acceptor plus the subjectPublicKey bytes CredSSP needs for `pubKeyAuth`.
+pub struct TlsIdentity {
+    pub acceptor: TlsAcceptor,
+    /// X.509 SubjectPublicKeyInfo *subjectPublicKey* BIT STRING contents
+    /// (not the full SPKI wrapper). FreeRDP/Guacamole and Windows CredSSP
+    /// hash this blob in `pubKeyAuth` (via `i2d_PublicKey` / equivalent).
+    pub public_key: Vec<u8>,
+}
+
+pub fn build_acceptor() -> io::Result<TlsIdentity> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let hostnames = tls_hostnames();
@@ -25,6 +34,7 @@ pub fn build_acceptor() -> io::Result<TlsAcceptor> {
         rcgen::generate_simple_self_signed(hostnames)
             .map_err(|e| io::Error::other(format!("certificate generation failed: {e}")))?;
 
+    let public_key = signing_key.public_key_raw().to_vec();
     let cert_der: CertificateDer<'static> = cert.der().clone();
     let key_der: PrivateKeyDer<'static> =
         PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into();
@@ -34,7 +44,10 @@ pub fn build_acceptor() -> io::Result<TlsAcceptor> {
         .with_single_cert(vec![cert_der], key_der)
         .map_err(|e| io::Error::other(format!("TLS config failed: {e}")))?;
 
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    Ok(TlsIdentity {
+        acceptor: TlsAcceptor::from(Arc::new(config)),
+        public_key,
+    })
 }
 
 /// Subject Alternative Names placed in the per-run self-signed certificate.

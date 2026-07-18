@@ -13,7 +13,8 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
-use crate::credentials::CredentialValidator;
+use crate::credentials::{CredentialValidator, Credentials};
+use crate::credssp;
 use crate::display::{BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay};
 use crate::input::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use crate::transport::{SteadyStateFrame, read_steady_state_frame, read_tpkt_frame};
@@ -22,9 +23,12 @@ pub struct RdpServerBuilder {
     addr: Option<SocketAddr>,
     listener: Option<TcpListener>,
     tls: Option<TlsAcceptor>,
+    tls_public_key: Option<Vec<u8>>,
     display: Option<Arc<dyn RdpServerDisplay>>,
     input: Option<Arc<Mutex<dyn RdpServerInputHandler>>>,
     credential_validator: Option<Arc<dyn CredentialValidator>>,
+    /// Account used for CredSSP/NTLMv2 when the client negotiates NLA.
+    nla_credentials: Option<Credentials>,
     sound_factory: Option<Arc<dyn SoundServerFactory>>,
     cliprdr_factory: Option<Arc<dyn CliprdrBackendFactory>>,
     audio_input_factory: Option<Arc<dyn AudioInputBackendFactory>>,
@@ -38,9 +42,11 @@ impl RdpServerBuilder {
             addr: None,
             listener: None,
             tls: None,
+            tls_public_key: None,
             display: None,
             input: None,
             credential_validator: None,
+            nla_credentials: None,
             sound_factory: None,
             cliprdr_factory: None,
             audio_input_factory: None,
@@ -66,6 +72,13 @@ impl RdpServerBuilder {
         self
     }
 
+    /// SubjectPublicKeyInfo DER of the certificate presented during TLS.
+    /// Required for CredSSP `pubKeyAuth` when a client negotiates NLA.
+    pub fn with_tls_public_key(mut self, public_key: Vec<u8>) -> Self {
+        self.tls_public_key = Some(public_key);
+        self
+    }
+
     pub fn with_display_handler(mut self, display: impl RdpServerDisplay + 'static) -> Self {
         self.display = Some(Arc::new(display));
         self
@@ -81,6 +94,13 @@ impl RdpServerBuilder {
         validator: Option<Arc<dyn CredentialValidator>>,
     ) -> Self {
         self.credential_validator = validator;
+        self
+    }
+
+    /// Credentials CredSSP/NTLMv2 uses to verify the client's challenge
+    /// response. Typically the same account as `with_credential_validator`.
+    pub fn with_nla_credentials(mut self, credentials: Option<Credentials>) -> Self {
+        self.nla_credentials = credentials;
         self
     }
 
@@ -125,9 +145,11 @@ impl RdpServerBuilder {
             addr: self.addr,
             listener: self.listener,
             tls: self.tls.expect("with_tls is required"),
+            tls_public_key: self.tls_public_key.unwrap_or_default(),
             display: self.display.expect("with_display_handler is required"),
             input: self.input.expect("with_input_handler is required"),
             credential_validator: self.credential_validator,
+            nla_credentials: self.nla_credentials,
             sound_factory: self.sound_factory,
             cliprdr_factory: self.cliprdr_factory,
             audio_input_factory: self.audio_input_factory,
@@ -141,9 +163,11 @@ pub struct RdpServer {
     addr: Option<SocketAddr>,
     listener: Option<TcpListener>,
     tls: TlsAcceptor,
+    tls_public_key: Vec<u8>,
     display: Arc<dyn RdpServerDisplay>,
     input: Arc<Mutex<dyn RdpServerInputHandler>>,
     credential_validator: Option<Arc<dyn CredentialValidator>>,
+    nla_credentials: Option<Credentials>,
     sound_factory: Option<Arc<dyn SoundServerFactory>>,
     cliprdr_factory: Option<Arc<dyn CliprdrBackendFactory>>,
     audio_input_factory: Option<Arc<dyn AudioInputBackendFactory>>,
@@ -156,9 +180,11 @@ pub struct RdpServer {
 /// concurrently.
 struct Session {
     tls: TlsAcceptor,
+    tls_public_key: Vec<u8>,
     display: Arc<dyn RdpServerDisplay>,
     input: Arc<Mutex<dyn RdpServerInputHandler>>,
     credential_validator: Option<Arc<dyn CredentialValidator>>,
+    nla_credentials: Option<Credentials>,
     sound_factory: Option<Arc<dyn SoundServerFactory>>,
     cliprdr_factory: Option<Arc<dyn CliprdrBackendFactory>>,
     audio_input_factory: Option<Arc<dyn AudioInputBackendFactory>>,
@@ -174,9 +200,11 @@ impl RdpServer {
     fn session(&self) -> Session {
         Session {
             tls: self.tls.clone(),
+            tls_public_key: self.tls_public_key.clone(),
             display: Arc::clone(&self.display),
             input: Arc::clone(&self.input),
             credential_validator: self.credential_validator.clone(),
+            nla_credentials: self.nla_credentials.clone(),
             sound_factory: self.sound_factory.clone(),
             cliprdr_factory: self.cliprdr_factory.clone(),
             audio_input_factory: self.audio_input_factory.clone(),
@@ -217,7 +245,8 @@ impl Session {
         let mut acceptor = Acceptor::new(desktop.width, desktop.height);
 
         // Connection Request/Confirm is always cleartext, even under
-        // PROTOCOL_SSL - the TLS handshake only starts after this.
+        // PROTOCOL_SSL / PROTOCOL_HYBRID - the TLS handshake only starts
+        // after this.
         let frame = read_tpkt_frame(&mut tcp).await?;
         let result = acceptor.step(&frame).map_err(|e| {
             eprintln!("rdp[{peer}]: cleartext negotiation PDU error: {e}");
@@ -226,12 +255,17 @@ impl Session {
         tcp.write_all(&result.response).await?;
         tcp.flush().await?;
         match result.event {
-            AcceptorEvent::TlsUpgrade => eprintln!("rdp[{peer}]: negotiation ok, starting TLS"),
+            AcceptorEvent::TlsUpgrade => {
+                if acceptor.requires_credssp() {
+                    eprintln!("rdp[{peer}]: negotiation ok (NLA/HYBRID), starting TLS");
+                } else {
+                    eprintln!("rdp[{peer}]: negotiation ok (TLS), starting TLS");
+                }
+            }
             AcceptorEvent::Rejected => {
                 eprintln!(
-                    "rdp[{peer}]: rejected at negotiation - client did not offer PROTOCOL_SSL \
-                     (if using mstsc with enablecredsspsupport:i:0, some Windows versions also \
-                     disable TLS; remove that setting or use xfreerdp /sec:tls)"
+                    "rdp[{peer}]: rejected at negotiation - client offered neither \
+                     PROTOCOL_HYBRID nor PROTOCOL_SSL"
                 );
                 return Ok(());
             }
@@ -249,6 +283,39 @@ impl Session {
             }
         };
 
+        // NLA: CredSSP runs on the TLS stream before MCS Connect Initial.
+        let mut nla_authenticated = false;
+        if acceptor.requires_credssp() {
+            let Some(credentials) = self.nla_credentials.clone() else {
+                eprintln!(
+                    "rdp[{peer}]: client requested NLA but server has no NLA credentials configured"
+                );
+                return Ok(());
+            };
+            if self.tls_public_key.is_empty() {
+                eprintln!("rdp[{peer}]: client requested NLA but server TLS public key is missing");
+                return Ok(());
+            }
+            eprintln!("rdp[{peer}]: starting CredSSP (NTLMv2)");
+            match credssp::run_credssp_nla(
+                &mut tls,
+                self.tls_public_key.clone(),
+                credentials,
+                "kmsrdp",
+            )
+            .await
+            {
+                Ok(user) => {
+                    eprintln!("rdp[{peer}]: CredSSP succeeded for user {user:?}");
+                    nla_authenticated = true;
+                }
+                Err(e) => {
+                    eprintln!("rdp[{peer}]: CredSSP failed: {e}");
+                    return Ok(());
+                }
+            }
+        }
+
         let accepted = loop {
             let frame = read_tpkt_frame(&mut tls).await.map_err(|e| {
                 eprintln!(
@@ -259,8 +326,7 @@ impl Session {
             })?;
             if frame.first() != Some(&0x03) {
                 eprintln!(
-                    "rdp[{peer}]: first byte after TLS is 0x{:02x}, not TPKT 0x03 - \
-                     client may be attempting CredSSP/NLA instead of MCS",
+                    "rdp[{peer}]: first byte during RDP handshake is 0x{:02x}, not TPKT 0x03",
                     frame.first().copied().unwrap_or(0)
                 );
             }
@@ -280,20 +346,26 @@ impl Session {
                 }
                 AcceptorEvent::ClientInfoReceived(credentials) => {
                     eprintln!(
-                        "rdp[{peer}]: client info user={:?} domain={:?}",
+                        "rdp[{peer}]: client info user={:?} domain={:?} (nla={nla_authenticated})",
                         credentials.username, credentials.domain
                     );
-                    let valid = match &self.credential_validator {
-                        Some(validator) => validator.validate(
-                            &credentials.username,
-                            &credentials.password,
-                            &credentials.domain,
-                        ),
-                        None => true,
+                    let valid = if nla_authenticated {
+                        // mstsc often sends an empty password after NLA; the
+                        // CredSSP exchange already proved the account.
+                        true
+                    } else {
+                        match &self.credential_validator {
+                            Some(validator) => validator.validate(
+                                &credentials.username,
+                                &credentials.password,
+                                &credentials.domain,
+                            ),
+                            None => true,
+                        }
                     };
                     if !valid {
                         let password_hint = if credentials.password.is_empty() {
-                            "password empty (mstsc did not send one - enter the KMSRDP_PASSWORD in the client)"
+                            "password empty (mstsc did not send one - enter the KMSRDP_PASSWORD in the client, or enable NLA)"
                         } else {
                             "password non-empty but does not match KMSRDP_PASSWORD"
                         };

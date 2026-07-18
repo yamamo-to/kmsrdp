@@ -146,13 +146,14 @@ async fn main() -> Result<()> {
             generated
         }
     };
-    let validator = ExactMatchCredentialValidator::new(Credentials {
-        username,
-        password,
+    let credentials = Credentials {
+        username: username.clone(),
+        password: password.clone(),
         domain: None,
-    });
+    };
+    let validator = ExactMatchCredentialValidator::new(credentials.clone());
 
-    let acceptor = tls::build_acceptor()?;
+    let tls_identity = tls::build_acceptor()?;
 
     // Bind before creating the uinput device so a missing CAP_NET_BIND_SERVICE
     // (or a busy port) fails without spamming `input: kmsrdp as ...` on every
@@ -173,7 +174,8 @@ async fn main() -> Result<()> {
 
     let server: RdpServer = RdpServer::builder()
         .with_listener(listener)
-        .with_tls(acceptor)
+        .with_tls(tls_identity.acceptor)
+        .with_tls_public_key(tls_identity.public_key)
         .with_input_handler(input)
         .with_display_handler(display)
         .with_cliprdr_factory(Some(Box::new(LocalClipboardFactory::new(
@@ -182,11 +184,12 @@ async fn main() -> Result<()> {
         .with_sound_factory(Some(Box::new(LocalAudioFactory::new())))
         .with_audio_input_factory(Some(Box::new(VirtualMicFactory::new())))
         .with_credential_validator(Some(Arc::new(validator)))
+        .with_nla_credentials(Some(credentials))
         .build();
 
     println!(
-        "RDP server listening on {addr} (TLS, self-signed - use e.g. \
-         `xfreerdp /sec:tls /cert:ignore /u:<user> /p:<password>`)"
+        "RDP server listening on {addr} (TLS + optional NLA - use e.g. \
+         `xfreerdp /cert:ignore /u:<user> /p:<password>` or mstsc)"
     );
     server.run().await
 }
