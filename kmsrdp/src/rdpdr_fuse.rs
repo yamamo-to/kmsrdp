@@ -5,7 +5,8 @@
 //! shared display). The mount is created by the first connection that
 //! announces the device and released only when the last connection leaves.
 //! While multiple connections are present, one owner supplies the RDPDR
-//! bridge; ownership is handed off if that connection disconnects first.
+//! bridge; if that connection disconnects first, ownership is handed off by
+//! swapping the backend in place (no umount) so other sessions keep responding.
 //!
 //! Wire IRPs are limited to CREATE/CLOSE/READ/WRITE/QueryDirectory (same as
 //! FreeRDP's server). unlink/rmdir/rename/setattr therefore return ENOSYS.
@@ -36,7 +37,7 @@ use tokio::sync::watch;
 use crate::session::Session;
 
 const TTL: Duration = Duration::from_secs(1);
-const OP_TIMEOUT: Duration = Duration::from_secs(60);
+const OP_TIMEOUT: Duration = Duration::from_secs(5);
 const ROOT_INO: u64 = 1;
 
 #[derive(Clone)]
@@ -399,14 +400,28 @@ impl Bridge {
     }
 }
 
-struct FuseFs {
+/// Swappable RDPDR backend for a shared FUSE mount. Owner handoff updates
+/// this without umounting, so disconnect cannot block other RDP sessions.
+struct ActiveBackend {
     bridge: Arc<Bridge>,
     device_id: u32,
 }
 
+struct FuseFs {
+    active: Arc<Mutex<ActiveBackend>>,
+}
+
+impl FuseFs {
+    fn active(&self) -> (Arc<Bridge>, u32) {
+        let g = self.active.lock().unwrap();
+        (Arc::clone(&g.bridge), g.device_id)
+    }
+}
+
 impl Filesystem for FuseFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let Some(parent_path) = self.bridge.path_for(self.device_id, parent.0) else {
+        let (bridge, device_id) = self.active();
+        let Some(parent_path) = bridge.path_for(device_id, parent.0) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -414,55 +429,57 @@ impl Filesystem for FuseFs {
             reply.error(Errno::EINVAL);
             return;
         };
-        match self.bridge.lookup_child(self.device_id, &parent_path, name) {
+        match bridge.lookup_child(device_id, &parent_path, name) {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
             Err(e) => reply.error(e),
         }
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        let Some(path) = self.bridge.path_for(self.device_id, ino.0) else {
+        let (bridge, device_id) = self.active();
+        let Some(path) = bridge.path_for(device_id, ino.0) else {
             reply.error(Errno::ENOENT);
             return;
         };
-        if let Some(attr) = self.bridge.attr_for(self.device_id, &path) {
+        if let Some(attr) = bridge.attr_for(device_id, &path) {
             reply.attr(&TTL, &attr);
             return;
         }
         if path == "\\" {
-            self.bridge.ensure_root_ino(self.device_id);
-            if let Some(attr) = self.bridge.attr_for(self.device_id, "\\") {
+            bridge.ensure_root_ino(device_id);
+            if let Some(attr) = bridge.attr_for(device_id, "\\") {
                 reply.attr(&TTL, &attr);
                 return;
             }
         }
         // Refresh parent listing to populate cache.
         let parent = parent_of(&path);
-        let _ = self.bridge.refresh_dir(self.device_id, &parent);
-        match self.bridge.attr_for(self.device_id, &path) {
+        let _ = bridge.refresh_dir(device_id, &parent);
+        match bridge.attr_for(device_id, &path) {
             Some(attr) => reply.attr(&TTL, &attr),
             None => reply.error(Errno::ENOENT),
         }
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        let Some(path) = self.bridge.path_for(self.device_id, ino.0) else {
+        let (bridge, device_id) = self.active();
+        let Some(path) = bridge.path_for(device_id, ino.0) else {
             reply.error(Errno::ENOENT);
             return;
         };
-        match self.bridge.submit_create(
-            self.device_id,
+        match bridge.submit_create(
+            device_id,
             path,
             GENERIC_READ,
             FILE_OPEN,
             FILE_DIRECTORY_FILE,
         ) {
             Ok(create) => {
-                let fh = self.bridge.next_fh.fetch_add(1, Ordering::Relaxed);
-                self.bridge.opens.lock().unwrap().insert(
+                let fh = bridge.next_fh.fetch_add(1, Ordering::Relaxed);
+                bridge.opens.lock().unwrap().insert(
                     fh,
                     OpenHandle {
-                        device_id: self.device_id,
+                        device_id,
                         file_id: create.file_id,
                     },
                 );
@@ -480,11 +497,12 @@ impl Filesystem for FuseFs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let Some(path) = self.bridge.path_for(self.device_id, ino.0) else {
+        let (bridge, device_id) = self.active();
+        let Some(path) = bridge.path_for(device_id, ino.0) else {
             reply.error(Errno::ENOENT);
             return;
         };
-        let opens = self.bridge.opens.lock().unwrap();
+        let opens = bridge.opens.lock().unwrap();
         let Some(handle) = opens.get(&fh.0) else {
             reply.error(Errno::EBADF);
             return;
@@ -502,18 +520,15 @@ impl Filesystem for FuseFs {
         };
         let mut first = Some(pattern);
         loop {
-            match self
-                .bridge
-                .submit_query_dir(self.device_id, file_id, first.take())
-            {
+            match bridge.submit_query_dir(device_id, file_id, first.take()) {
                 Ok(Some(entry)) => {
-                    self.bridge.cache_entry(self.device_id, &path, &entry);
+                    bridge.cache_entry(device_id, &path, &entry);
                     let name = entry.file_name.trim_end_matches('\0').to_owned();
                     if name.is_empty() || name == "." || name == ".." {
                         continue;
                     }
                     let child = join_win(&path, &name);
-                    let ino = self.bridge.inode_for(self.device_id, &child);
+                    let ino = bridge.inode_for(device_id, &child);
                     let kind = if entry.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
                         FileType::Directory
                     } else {
@@ -541,7 +556,7 @@ impl Filesystem for FuseFs {
             let parent_ino = if path == "\\" {
                 ino.0
             } else {
-                self.bridge.inode_for(self.device_id, &parent_of(&path))
+                bridge.inode_for(device_id, &parent_of(&path))
             };
             if reply.add(INodeNo(parent_ino), 2, FileType::Directory, "..") {
                 reply.ok();
@@ -567,14 +582,16 @@ impl Filesystem for FuseFs {
         _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
-        if let Some(handle) = self.bridge.opens.lock().unwrap().remove(&fh.0) {
-            let _ = self.bridge.submit_close(handle.device_id, handle.file_id);
+        let (bridge, _device_id) = self.active();
+        if let Some(handle) = bridge.opens.lock().unwrap().remove(&fh.0) {
+            let _ = bridge.submit_close(handle.device_id, handle.file_id);
         }
         reply.ok();
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let Some(path) = self.bridge.path_for(self.device_id, ino.0) else {
+        let (bridge, device_id) = self.active();
+        let Some(path) = bridge.path_for(device_id, ino.0) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -592,19 +609,19 @@ impl Filesystem for FuseFs {
         } else {
             FILE_OPEN
         };
-        match self.bridge.submit_create(
-            self.device_id,
+        match bridge.submit_create(
+            device_id,
             path,
             access,
             disposition,
             FILE_SYNCHRONOUS_IO_NONALERT,
         ) {
             Ok(create) => {
-                let fh = self.bridge.next_fh.fetch_add(1, Ordering::Relaxed);
-                self.bridge.opens.lock().unwrap().insert(
+                let fh = bridge.next_fh.fetch_add(1, Ordering::Relaxed);
+                bridge.opens.lock().unwrap().insert(
                     fh,
                     OpenHandle {
-                        device_id: self.device_id,
+                        device_id,
                         file_id: create.file_id,
                     },
                 );
@@ -625,7 +642,8 @@ impl Filesystem for FuseFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let opens = self.bridge.opens.lock().unwrap();
+        let (bridge, _device_id) = self.active();
+        let opens = bridge.opens.lock().unwrap();
         let Some(handle) = opens.get(&fh.0) else {
             reply.error(Errno::EBADF);
             return;
@@ -633,7 +651,7 @@ impl Filesystem for FuseFs {
         let device_id = handle.device_id;
         let file_id = handle.file_id;
         drop(opens);
-        match self.bridge.submit_read(device_id, file_id, size, offset) {
+        match bridge.submit_read(device_id, file_id, size, offset) {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(e),
         }
@@ -651,7 +669,8 @@ impl Filesystem for FuseFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
-        let opens = self.bridge.opens.lock().unwrap();
+        let (bridge, _device_id) = self.active();
+        let opens = bridge.opens.lock().unwrap();
         let Some(handle) = opens.get(&fh.0) else {
             reply.error(Errno::EBADF);
             return;
@@ -659,13 +678,10 @@ impl Filesystem for FuseFs {
         let device_id = handle.device_id;
         let file_id = handle.file_id;
         drop(opens);
-        match self
-            .bridge
-            .submit_write(device_id, file_id, offset, data.to_vec())
-        {
+        match bridge.submit_write(device_id, file_id, offset, data.to_vec()) {
             Ok(n) => {
-                if let Some(path) = self.bridge.path_for(device_id, ino.0) {
-                    let mut meta = self.bridge.meta.lock().unwrap();
+                if let Some(path) = bridge.path_for(device_id, ino.0) {
+                    let mut meta = bridge.meta.lock().unwrap();
                     if let Some(m) = meta.get_mut(&(device_id, path)) {
                         let end = offset.saturating_add(n as u64);
                         if end > m.size {
@@ -690,8 +706,9 @@ impl Filesystem for FuseFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        if let Some(handle) = self.bridge.opens.lock().unwrap().remove(&fh.0) {
-            let _ = self.bridge.submit_close(handle.device_id, handle.file_id);
+        let (bridge, _device_id) = self.active();
+        if let Some(handle) = bridge.opens.lock().unwrap().remove(&fh.0) {
+            let _ = bridge.submit_close(handle.device_id, handle.file_id);
         }
         reply.ok();
     }
@@ -706,7 +723,8 @@ impl Filesystem for FuseFs {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        let Some(parent_path) = self.bridge.path_for(self.device_id, parent.0) else {
+        let (bridge, device_id) = self.active();
+        let Some(parent_path) = bridge.path_for(device_id, parent.0) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -721,16 +739,16 @@ impl Filesystem for FuseFs {
         } else {
             GENERIC_READ | SYNCHRONIZE
         };
-        match self.bridge.submit_create(
-            self.device_id,
+        match bridge.submit_create(
+            device_id,
             path.clone(),
             access,
             FILE_OPEN_IF,
             FILE_SYNCHRONOUS_IO_NONALERT,
         ) {
             Ok(create) => {
-                self.bridge.meta.lock().unwrap().insert(
-                    (self.device_id, path.clone()),
+                bridge.meta.lock().unwrap().insert(
+                    (device_id, path.clone()),
                     CachedMeta {
                         size: 0,
                         is_dir: false,
@@ -740,15 +758,14 @@ impl Filesystem for FuseFs {
                         crtime: SystemTime::now(),
                     },
                 );
-                let attr = self
-                    .bridge
-                    .attr_for(self.device_id, &path)
+                let attr = bridge
+                    .attr_for(device_id, &path)
                     .expect("meta just inserted");
-                let fh = self.bridge.next_fh.fetch_add(1, Ordering::Relaxed);
-                self.bridge.opens.lock().unwrap().insert(
+                let fh = bridge.next_fh.fetch_add(1, Ordering::Relaxed);
+                bridge.opens.lock().unwrap().insert(
                     fh,
                     OpenHandle {
-                        device_id: self.device_id,
+                        device_id,
                         file_id: create.file_id,
                     },
                 );
@@ -773,7 +790,8 @@ impl Filesystem for FuseFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let Some(parent_path) = self.bridge.path_for(self.device_id, parent.0) else {
+        let (bridge, device_id) = self.active();
+        let Some(parent_path) = bridge.path_for(device_id, parent.0) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -782,17 +800,17 @@ impl Filesystem for FuseFs {
             return;
         };
         let path = join_win(&parent_path, name);
-        match self.bridge.submit_create(
-            self.device_id,
+        match bridge.submit_create(
+            device_id,
             path.clone(),
             GENERIC_READ | SYNCHRONIZE,
             FILE_CREATE,
             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
         ) {
             Ok(create) => {
-                let _ = self.bridge.submit_close(self.device_id, create.file_id);
-                self.bridge.meta.lock().unwrap().insert(
-                    (self.device_id, path.clone()),
+                let _ = bridge.submit_close(device_id, create.file_id);
+                bridge.meta.lock().unwrap().insert(
+                    (device_id, path.clone()),
                     CachedMeta {
                         size: 0,
                         is_dir: true,
@@ -802,7 +820,7 @@ impl Filesystem for FuseFs {
                         crtime: SystemTime::now(),
                     },
                 );
-                match self.bridge.attr_for(self.device_id, &path) {
+                match bridge.attr_for(device_id, &path) {
                     Some(attr) => reply.entry(&TTL, &attr, Generation(0)),
                     None => reply.error(Errno::EIO),
                 }
@@ -857,44 +875,23 @@ impl Filesystem for FuseFs {
 struct MountMember {
     bridge: Arc<Bridge>,
     device_id: u32,
-    uid: u32,
-    gid: u32,
 }
 
 struct SharedMount {
     mount_point: PathBuf,
     owner_conn: u64,
     session: BackgroundSession,
+    /// Shared with [`FuseFs`]; owner handoff swaps the backend in place.
+    active: Arc<Mutex<ActiveBackend>>,
     members: HashMap<u64, MountMember>,
 }
 
 /// One shared FUSE mount per DosName: refcounted across RDP connections,
-/// released only when the last member leaves.
+/// released only when the last member leaves. Owner changes swap the
+/// RDPDR backend without umounting.
 struct MountRegistry {
     next_conn: AtomicU64,
     slots: Mutex<HashMap<String, SharedMount>>,
-    /// Members that called `leave` while a handoff had the slot temporarily
-    /// removed — filtered out before the remount is published.
-    departed: Mutex<std::collections::HashSet<(String, u64)>>,
-}
-
-enum LeaveAction {
-    /// Non-owner left; mount stays.
-    None,
-    /// Last member left; tear down completely.
-    Release {
-        mount_point: PathBuf,
-        session: BackgroundSession,
-    },
-    /// Owner left but others remain; remount with a new owner.
-    Handoff {
-        dos_name: String,
-        mount_point: PathBuf,
-        session: BackgroundSession,
-        new_owner: u64,
-        /// Remaining members (already excluding the departing owner).
-        members: HashMap<u64, MountMember>,
-    },
 }
 
 struct JoinRequest {
@@ -912,7 +909,6 @@ impl MountRegistry {
         Self {
             next_conn: AtomicU64::new(1),
             slots: Mutex::new(HashMap::new()),
-            departed: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -935,8 +931,6 @@ impl MountRegistry {
         let member = MountMember {
             bridge: Arc::clone(&bridge),
             device_id,
-            uid,
-            gid,
         };
 
         {
@@ -954,7 +948,6 @@ impl MountRegistry {
             }
         }
 
-        // First member: prepare and mount outside the "already shared" path.
         if let Err(e) = prepare_mount_point(&mount_point) {
             eprintln!(
                 "kmsrdp: rdpdr FUSE: failed to prepare {}: {e}",
@@ -967,23 +960,24 @@ impl MountRegistry {
             chown_path(parent, uid, gid);
         }
 
-        let session = match spawn_shared_mount(&dos_name, &mount_point, &bridge, device_id) {
-            Ok(session) => session,
-            Err(e) => {
-                eprintln!(
-                    "kmsrdp: rdpdr FUSE: mount failed at {}: {e} \
+        let (session, active) =
+            match spawn_shared_mount(&dos_name, &mount_point, &bridge, device_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "kmsrdp: rdpdr FUSE: mount failed at {}: {e} \
                      (need fuse3, and usually `user_allow_other` in /etc/fuse.conf)",
-                    mount_point.display()
-                );
-                return false;
-            }
-        };
+                        mount_point.display()
+                    );
+                    return false;
+                }
+            };
 
         let mut slots = self.slots.lock().unwrap();
-        // Another connection may have won the race and mounted first.
         if let Some(slot) = slots.get_mut(&dos_name) {
-            // Drop our redundant mount; keep the winner's.
-            finish_umount(session, &mount_point);
+            // Another connection won the race; discard our mount asynchronously
+            // so we do not block this connection's RDP loop.
+            detach_umount(session, mount_point.clone());
             slot.members.insert(conn_id, member);
             println!(
                 "kmsrdp: rdpdr FUSE joined {} at {} ({} member(s), owner={})",
@@ -1008,6 +1002,7 @@ impl MountRegistry {
                 mount_point,
                 owner_conn: conn_id,
                 session,
+                active,
                 members,
             },
         );
@@ -1015,159 +1010,56 @@ impl MountRegistry {
     }
 
     fn leave(&self, dos_name: &str, conn_id: u64) {
-        let action = {
-            let mut slots = self.slots.lock().unwrap();
-            let Some(slot) = slots.get_mut(dos_name) else {
-                drop(slots);
-                self.departed
-                    .lock()
-                    .unwrap()
-                    .insert((dos_name.to_owned(), conn_id));
-                return;
-            };
-            slot.members.remove(&conn_id);
-            if slot.members.is_empty() {
-                let SharedMount {
-                    mount_point,
-                    session,
-                    ..
-                } = slots.remove(dos_name).expect("slot just checked");
-                LeaveAction::Release {
-                    mount_point,
-                    session,
-                }
-            } else if slot.owner_conn == conn_id {
-                let new_owner = *slot.members.keys().next().expect("members non-empty");
-                let SharedMount {
-                    mount_point,
-                    session,
-                    members,
-                    ..
-                } = slots.remove(dos_name).expect("slot present");
-                LeaveAction::Handoff {
-                    dos_name: dos_name.to_owned(),
-                    mount_point,
-                    session,
-                    new_owner,
-                    members,
-                }
-            } else {
-                println!(
-                    "kmsrdp: rdpdr FUSE member {conn_id} left {} ({} remaining, owner={})",
-                    dos_name,
-                    slot.members.len(),
-                    slot.owner_conn
-                );
-                LeaveAction::None
-            }
+        let mut slots = self.slots.lock().unwrap();
+        let Some(slot) = slots.get_mut(dos_name) else {
+            return;
         };
-
-        match action {
-            LeaveAction::None => {}
-            LeaveAction::Release {
+        slot.members.remove(&conn_id);
+        if slot.members.is_empty() {
+            let SharedMount {
                 mount_point,
                 session,
-            } => {
-                println!(
-                    "kmsrdp: rdpdr FUSE releasing {} at {} (last connection)",
-                    dos_name,
-                    mount_point.display()
-                );
-                finish_umount(session, &mount_point);
-            }
-            LeaveAction::Handoff {
+                ..
+            } = slots.remove(dos_name).expect("slot just checked");
+            drop(slots);
+            println!(
+                "kmsrdp: rdpdr FUSE releasing {} at {} (last connection)",
                 dos_name,
-                mount_point,
-                session,
-                mut new_owner,
-                mut members,
-            } => {
-                println!(
-                    "kmsrdp: rdpdr FUSE handing off {} at {} → owner={new_owner}",
-                    dos_name,
-                    mount_point.display()
-                );
-                finish_umount(session, &mount_point);
+                mount_point.display()
+            );
+            // Never block the RDP connection task / tokio worker on umount.
+            detach_umount(session, mount_point);
+            return;
+        }
 
-                {
-                    let mut departed = self.departed.lock().unwrap();
-                    members.retain(|id, _| !departed.remove(&(dos_name.clone(), *id)));
-                }
-                if members.is_empty() {
-                    return;
-                }
-                if !members.contains_key(&new_owner) {
-                    new_owner = *members.keys().next().expect("members non-empty");
-                }
-                let owner_member = MountMember {
-                    bridge: Arc::clone(&members[&new_owner].bridge),
-                    device_id: members[&new_owner].device_id,
-                    uid: members[&new_owner].uid,
-                    gid: members[&new_owner].gid,
+        if slot.owner_conn == conn_id {
+            let new_owner = *slot.members.keys().next().expect("members non-empty");
+            let member = &slot.members[&new_owner];
+            member.bridge.ensure_root_ino(member.device_id);
+            // Clear stale opens from the departing owner's bridge; swap the
+            // live backend so FUSE keeps serving without umount/remount.
+            {
+                let mut active = slot.active.lock().unwrap();
+                active.bridge.opens.lock().unwrap().clear();
+                active.bridge.abort_pending();
+                *active = ActiveBackend {
+                    bridge: Arc::clone(&member.bridge),
+                    device_id: member.device_id,
                 };
-
-                owner_member.bridge.ensure_root_ino(owner_member.device_id);
-                if let Err(e) = prepare_mount_point(&mount_point) {
-                    eprintln!(
-                        "kmsrdp: rdpdr FUSE: handoff prepare failed for {}: {e}",
-                        mount_point.display()
-                    );
-                    return;
-                }
-                chown_path(&mount_point, owner_member.uid, owner_member.gid);
-                let new_session = match spawn_shared_mount(
-                    &dos_name,
-                    &mount_point,
-                    &owner_member.bridge,
-                    owner_member.device_id,
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!(
-                            "kmsrdp: rdpdr FUSE: handoff remount failed for {}: {e}",
-                            mount_point.display()
-                        );
-                        return;
-                    }
-                };
-
-                let mut slots = self.slots.lock().unwrap();
-                {
-                    let mut departed = self.departed.lock().unwrap();
-                    members.retain(|id, _| !departed.remove(&(dos_name.clone(), *id)));
-                }
-                if members.is_empty() {
-                    finish_umount(new_session, &mount_point);
-                    return;
-                }
-                if !members.contains_key(&new_owner) {
-                    new_owner = *members.keys().next().expect("members non-empty");
-                }
-
-                if let Some(existing) = slots.remove(&dos_name) {
-                    finish_umount(new_session, &mount_point);
-                    let mut merged = existing;
-                    for (id, m) in members.drain() {
-                        merged.members.entry(id).or_insert(m);
-                    }
-                    println!(
-                        "kmsrdp: rdpdr FUSE handoff raced; keeping mount at {} (owner={})",
-                        merged.mount_point.display(),
-                        merged.owner_conn
-                    );
-                    slots.insert(dos_name, merged);
-                } else {
-                    slots.insert(
-                        dos_name,
-                        SharedMount {
-                            mount_point,
-                            owner_conn: new_owner,
-                            session: new_session,
-                            members,
-                        },
-                    );
-                }
             }
+            slot.owner_conn = new_owner;
+            println!(
+                "kmsrdp: rdpdr FUSE owner handoff {} → {new_owner} (no umount, {} member(s))",
+                dos_name,
+                slot.members.len()
+            );
+        } else {
+            println!(
+                "kmsrdp: rdpdr FUSE member {conn_id} left {} ({} remaining, owner={})",
+                dos_name,
+                slot.members.len(),
+                slot.owner_conn
+            );
         }
     }
 }
@@ -1177,7 +1069,11 @@ fn spawn_shared_mount(
     mount_point: &Path,
     bridge: &Arc<Bridge>,
     device_id: u32,
-) -> std::io::Result<BackgroundSession> {
+) -> std::io::Result<(BackgroundSession, Arc<Mutex<ActiveBackend>>)> {
+    let active = Arc::new(Mutex::new(ActiveBackend {
+        bridge: Arc::clone(bridge),
+        device_id,
+    }));
     let mut config = Config::default();
     // SessionACL::All → allow_other so the session user can use a
     // root-owned mount. File ownership comes from FileAttr uid/gid,
@@ -1190,20 +1086,25 @@ fn spawn_shared_mount(
     ];
     config.n_threads = Some(1);
     let fs = FuseFs {
-        bridge: Arc::clone(bridge),
-        device_id,
+        active: Arc::clone(&active),
     };
-    fuser::spawn_mount2(fs, mount_point, &config)
+    let session = fuser::spawn_mount2(fs, mount_point, &config)?;
+    Ok((session, active))
 }
 
-fn finish_umount(session: BackgroundSession, mount_point: &Path) {
-    if let Err(e) = session.umount_and_join() {
-        eprintln!(
-            "kmsrdp: rdpdr FUSE umount/join failed for {} ({e}); trying lazy unmount",
-            mount_point.display()
-        );
-        try_unmount(mount_point);
-    }
+fn detach_umount(session: BackgroundSession, mount_point: PathBuf) {
+    std::thread::Builder::new()
+        .name("kmsrdp-fuse-umount".into())
+        .spawn(move || {
+            if let Err(e) = session.umount_and_join() {
+                eprintln!(
+                    "kmsrdp: rdpdr FUSE umount/join failed for {} ({e}); trying lazy unmount",
+                    mount_point.display()
+                );
+                try_unmount(&mount_point);
+            }
+        })
+        .expect("spawn fuse umount thread");
 }
 
 pub struct FuseDriveFactory {
