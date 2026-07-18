@@ -1,6 +1,11 @@
 //! FUSE mount for RDPDR filesystem devices: client-redirected drives appear
 //! under `{xdg_runtime_dir}/kmsrdp/drives/<DosName>` for the active session.
 //!
+//! Each RDP connection mounts at a unique path
+//! `drives/c<id>/<DosName>` so concurrent Guacamole/mstsc sessions cannot
+//! steal or tear down each other's FUSE mounts. A symlink at the stable
+//! `drives/<DosName>` path tracks the most recently announced connection.
+//!
 //! Wire IRPs are limited to CREATE/CLOSE/READ/WRITE/QueryDirectory (same as
 //! FreeRDP's server). unlink/rmdir/rename/setattr therefore return ENOSYS.
 
@@ -103,6 +108,13 @@ impl Bridge {
 
     fn poll_commands(&self) -> Vec<DriveCommand> {
         self.outbound.lock().unwrap().drain(..).collect()
+    }
+
+    /// Drop all in-flight waiters so FUSE threads unblock immediately when
+    /// the RDP connection is gone (umount must not wait out [`OP_TIMEOUT`]).
+    fn abort_pending(&self) {
+        self.outbound.lock().unwrap().clear();
+        self.pending.lock().unwrap().clear();
     }
 
     fn submit_create(
@@ -842,17 +854,64 @@ impl Filesystem for FuseFs {
 }
 
 struct MountedDrive {
+    dos_name: String,
+    conn_id: u64,
     mount_point: PathBuf,
     session: BackgroundSession,
 }
 
+/// Tracks per-connection FUSE mounts so a disconnect only tears down that
+/// connection's mount, and the stable `<DosName>` symlink can be retargeted.
+struct MountRegistry {
+    next_conn: AtomicU64,
+    /// `dos_name` → live mounts (oldest → newest). Symlink points at newest.
+    live: Mutex<HashMap<String, Vec<(u64, PathBuf)>>>,
+}
+
+impl MountRegistry {
+    fn new() -> Self {
+        Self {
+            next_conn: AtomicU64::new(1),
+            live: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn alloc_conn_id(&self) -> u64 {
+        self.next_conn.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn register(&self, dos_name: &str, conn_id: u64, mount_point: PathBuf) {
+        self.live
+            .lock()
+            .unwrap()
+            .entry(dos_name.to_owned())
+            .or_default()
+            .push((conn_id, mount_point));
+    }
+
+    fn unregister(&self, dos_name: &str, conn_id: u64) -> Option<PathBuf> {
+        let mut live = self.live.lock().unwrap();
+        let entries = live.get_mut(dos_name)?;
+        entries.retain(|(id, _)| *id != conn_id);
+        let next = entries.last().map(|(_, p)| p.clone());
+        if entries.is_empty() {
+            live.remove(dos_name);
+        }
+        next
+    }
+}
+
 pub struct FuseDriveFactory {
     session_rx: watch::Receiver<Option<Session>>,
+    registry: Arc<MountRegistry>,
 }
 
 impl FuseDriveFactory {
     pub fn new(session_rx: watch::Receiver<Option<Session>>) -> Self {
-        Self { session_rx }
+        Self {
+            session_rx,
+            registry: Arc::new(MountRegistry::new()),
+        }
     }
 }
 
@@ -876,6 +935,8 @@ impl DriveConsumerFactory for FuseDriveFactory {
             bridge: Bridge::new(wake, uid, gid),
             runtime_dir: runtime,
             uid,
+            conn_id: self.registry.alloc_conn_id(),
+            registry: Arc::clone(&self.registry),
             mounts: HashMap::new(),
             have_session,
         })
@@ -886,6 +947,8 @@ struct FuseDriveConsumer {
     bridge: Arc<Bridge>,
     runtime_dir: PathBuf,
     uid: u32,
+    conn_id: u64,
+    registry: Arc<MountRegistry>,
     mounts: HashMap<u32, MountedDrive>,
     have_session: bool,
 }
@@ -908,7 +971,8 @@ impl DriveConsumer for FuseDriveConsumer {
             eprintln!("kmsrdp: rdpdr FUSE: ignoring device {device_id} with empty DosName");
             return Vec::new();
         }
-        let mount_point = self.runtime_dir.join("kmsrdp").join("drives").join(&name);
+        let drives_root = self.runtime_dir.join("kmsrdp").join("drives");
+        let mount_point = drives_root.join(format!("c{}", self.conn_id)).join(&name);
         if let Err(e) = prepare_mount_point(&mount_point) {
             eprintln!(
                 "kmsrdp: rdpdr FUSE: failed to prepare {}: {e}",
@@ -917,6 +981,11 @@ impl DriveConsumer for FuseDriveConsumer {
             return Vec::new();
         }
         chown_path(&mount_point, self.uid, self.bridge.gid);
+        // Parent dirs must also be reachable by the session user.
+        if let Some(parent) = mount_point.parent() {
+            chown_path(parent, self.uid, self.bridge.gid);
+        }
+        chown_path(&drives_root, self.uid, self.bridge.gid);
 
         self.bridge.ensure_root_ino(device_id);
 
@@ -926,7 +995,7 @@ impl DriveConsumer for FuseDriveConsumer {
         // not fusermount uid=/gid= (fusermount3 rejects those options).
         config.acl = SessionACL::All;
         config.mount_options = vec![
-            MountOption::FSName(format!("kmsrdp-{name}")),
+            MountOption::FSName(format!("kmsrdp-{}-c{}", name, self.conn_id)),
             MountOption::DefaultPermissions,
             MountOption::AutoUnmount,
         ];
@@ -938,14 +1007,32 @@ impl DriveConsumer for FuseDriveConsumer {
         };
         match fuser::spawn_mount2(fs, &mount_point, &config) {
             Ok(session) => {
+                self.registry
+                    .register(&name, self.conn_id, mount_point.clone());
+                if let Err(e) = publish_dos_symlink(
+                    &drives_root,
+                    &name,
+                    &PathBuf::from(format!("c{}", self.conn_id)).join(&name),
+                    self.uid,
+                    self.bridge.gid,
+                ) {
+                    eprintln!(
+                        "kmsrdp: rdpdr FUSE: failed to update symlink {} → {}: {e}",
+                        drives_root.join(&name).display(),
+                        mount_point.display()
+                    );
+                }
                 println!(
-                    "kmsrdp: rdpdr FUSE mounted {} at {}",
+                    "kmsrdp: rdpdr FUSE mounted {} at {} (symlink {})",
                     name,
-                    mount_point.display()
+                    mount_point.display(),
+                    drives_root.join(&name).display()
                 );
                 self.mounts.insert(
                     device_id,
                     MountedDrive {
+                        dos_name: name,
+                        conn_id: self.conn_id,
                         mount_point,
                         session,
                     },
@@ -1019,16 +1106,17 @@ impl DriveConsumer for FuseDriveConsumer {
 
 impl Drop for FuseDriveConsumer {
     fn drop(&mut self) {
+        // Unblock any FUSE ops waiting on IoCompletion before umount joins.
+        self.bridge.abort_pending();
+        let drives_root = self.runtime_dir.join("kmsrdp").join("drives");
         for (device_id, mounted) in self.mounts.drain() {
             println!(
                 "kmsrdp: rdpdr FUSE unmounting device {device_id} at {}",
                 mounted.mount_point.display()
             );
-            // Explicit umount+join: dropping BackgroundSession alone detaches
-            // the fuser thread(s) without joining, which left OS threads
-            // behind after Guacamole disconnect until the kernel tore the
-            // mount down asynchronously.
             let MountedDrive {
+                dos_name,
+                conn_id,
                 mount_point,
                 session,
             } = mounted;
@@ -1038,6 +1126,30 @@ impl Drop for FuseDriveConsumer {
                     mount_point.display()
                 );
                 try_unmount(&mount_point);
+            }
+            match self.registry.unregister(&dos_name, conn_id) {
+                Some(remaining) => {
+                    // Point the stable name at another live connection.
+                    if let Ok(rel) = remaining.strip_prefix(&drives_root)
+                        && let Err(e) = publish_dos_symlink(
+                            &drives_root,
+                            &dos_name,
+                            rel,
+                            self.uid,
+                            self.bridge.gid,
+                        )
+                    {
+                        eprintln!("kmsrdp: rdpdr FUSE: failed to retarget symlink {dos_name}: {e}");
+                    }
+                }
+                None => {
+                    let link = drives_root.join(&dos_name);
+                    let _ = std::fs::remove_file(&link);
+                }
+            }
+            // Best-effort cleanup of the per-connection directory.
+            if let Some(parent) = mount_point.parent() {
+                let _ = std::fs::remove_dir(parent);
             }
         }
     }
@@ -1062,6 +1174,30 @@ fn prepare_mount_point(path: &Path) -> std::io::Result<()> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// Keep `drives/<DosName>` as a symlink to the per-connection mount so apps
+/// retain a stable path while concurrent sessions each keep their own FUSE.
+fn publish_dos_symlink(
+    drives_root: &Path,
+    dos_name: &str,
+    target_rel: &Path,
+    uid: u32,
+    gid: u32,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(drives_root)?;
+    chown_path(drives_root, uid, gid);
+    let link = drives_root.join(dos_name);
+    // Pre-v0.1.9 installs mounted directly at drives/<DosName>. Clear that
+    // before replacing with a symlink.
+    if link.exists() || link.symlink_metadata().is_ok() {
+        try_unmount(&link);
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir(&link);
+    }
+    std::os::unix::fs::symlink(target_rel, &link)?;
+    chown_path(&link, uid, gid);
+    Ok(())
 }
 
 fn try_unmount(path: &Path) {
