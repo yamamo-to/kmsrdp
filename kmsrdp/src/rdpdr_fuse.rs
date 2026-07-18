@@ -843,7 +843,7 @@ impl Filesystem for FuseFs {
 
 struct MountedDrive {
     mount_point: PathBuf,
-    _session: BackgroundSession,
+    session: BackgroundSession,
 }
 
 pub struct FuseDriveFactory {
@@ -947,7 +947,7 @@ impl DriveConsumer for FuseDriveConsumer {
                     device_id,
                     MountedDrive {
                         mount_point,
-                        _session: session,
+                        session,
                     },
                 );
             }
@@ -1024,8 +1024,21 @@ impl Drop for FuseDriveConsumer {
                 "kmsrdp: rdpdr FUSE unmounting device {device_id} at {}",
                 mounted.mount_point.display()
             );
-            // BackgroundSession drop unmounts.
-            drop(mounted);
+            // Explicit umount+join: dropping BackgroundSession alone detaches
+            // the fuser thread(s) without joining, which left OS threads
+            // behind after Guacamole disconnect until the kernel tore the
+            // mount down asynchronously.
+            let MountedDrive {
+                mount_point,
+                session,
+            } = mounted;
+            if let Err(e) = session.umount_and_join() {
+                eprintln!(
+                    "kmsrdp: rdpdr FUSE umount/join failed for {} ({e}); trying lazy unmount",
+                    mount_point.display()
+                );
+                try_unmount(&mount_point);
+            }
         }
     }
 }
