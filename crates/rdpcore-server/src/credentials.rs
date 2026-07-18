@@ -41,7 +41,7 @@ impl CredentialValidator for ExactMatchCredentialValidator {
 
 /// mstsc may send `DOMAIN\user` or `user@domain` entirely in the username
 /// field (with an empty domain), or prefix local accounts as `.\user`.
-fn normalize_client_identity(username: &str, domain: &str) -> (String, String) {
+pub fn normalize_client_identity(username: &str, domain: &str) -> (String, String) {
     let username = username.trim();
     let domain = domain.trim();
 

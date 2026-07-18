@@ -10,10 +10,11 @@ NVIDIA) and injecting input via `uinput` - but speaking RDP instead of VNC.
 > [!WARNING]
 > kmsrdp is experimental software. It can capture the complete desktop,
 > inject keyboard and mouse input, and access the clipboard while running
-> with powerful Linux capabilities. It does not implement NLA/CredSSP and
-> currently generates a new self-signed TLS certificate on every start.
-> Do not expose TCP port 3389 directly to the public Internet. Restrict it
-> with a firewall and use it only on a trusted LAN or through a VPN or SSH
+> with powerful Linux capabilities. Authentication supports TLS with
+> optional NLA (CredSSP/NTLMv2); Kerberos is not implemented. A new
+> self-signed TLS certificate is generated on every start. Do not expose
+> TCP port 3389 directly to the public Internet. Restrict it with a
+> firewall and use it only on a trusted LAN or through a VPN or SSH
 > tunnel.
 
 The RDP protocol stack itself (`crates/rdpcore-*`) is a from-scratch
@@ -57,8 +58,9 @@ kmsrdp's own DRM/uinput glue.
 
 ## Known limitations
 
-- NLA/CredSSP is not implemented. Authentication uses the RDP Client Info
-  credentials inside TLS instead.
+- NLA uses CredSSP with NTLMv2 only (no Kerberos). When the client offers
+  `PROTOCOL_HYBRID`, kmsrdp selects it; otherwise it falls back to TLS plus
+  RDP Client Info credentials.
 - A fresh self-signed TLS certificate is generated at every start; there is
   currently no configuration for a persistent certificate or private key.
 - The server listens on `0.0.0.0:3389` and has no bind-address option yet.
@@ -141,8 +143,8 @@ Requires:
 KMSRDP_USER=myuser KMSRDP_PASSWORD=mypassword ./target/release/rdp_server
 ```
 
-Connect with any RDP client, e.g. `xfreerdp /v:<host> /sec:tls /cert:ignore
-/u:myuser /p:mypassword`.
+Connect with any RDP client, e.g. `xfreerdp /v:<host> /cert:ignore
+/u:myuser /p:mypassword` (NLA by default; use `/sec:tls` to force TLS-only).
 
 `KMSRDP_TLS_HOSTS` optionally adds comma-separated hostnames or IP addresses
 to the generated certificate's Subject Alternative Name list:
@@ -184,20 +186,15 @@ connector, so the NvFBC fallback is intentionally disabled when
 
 ### Windows Remote Desktop (mstsc)
 
-kmsrdp does not support NLA/CredSSP. Windows Remote Desktop may also skip
-its password prompt when NLA is unavailable and consequently send an empty
-password. Store the credentials first, then connect:
+mstsc connects with NLA (CredSSP/NTLMv2) by default. Use the same
+`KMSRDP_USER` / `KMSRDP_PASSWORD` values configured on the server:
 
 ```bat
-cmdkey /generic:TERMSRV/<host> /user:myuser /pass:mypassword
 mstsc /v:<host>
 ```
 
-Remove the stored credential when it is no longer needed:
-
-```bat
-cmdkey /delete:TERMSRV/<host>
-```
+For clients that disable NLA, kmsrdp falls back to TLS + Client Info
+authentication (`xfreerdp /sec:tls` still works).
 
 Accept the self-signed certificate warning only after confirming that you
 are connecting through a trusted network path.

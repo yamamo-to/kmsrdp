@@ -12,6 +12,7 @@
 //! one (audio).
 
 mod credentials;
+mod credssp;
 pub mod diff;
 mod display;
 mod input;

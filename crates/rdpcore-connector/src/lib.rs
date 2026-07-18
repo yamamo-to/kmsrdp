@@ -12,6 +12,7 @@
 mod error;
 
 pub use error::ConnectorError;
+pub use rdpcore_pdu::x224::SecurityProtocol;
 
 use rdpcore_pdu::capability_sets::{
     BitmapCapability, BitmapCodecsCapability, ConfirmActive, DeactivateAllPdu, DemandActive,
@@ -33,9 +34,7 @@ use rdpcore_pdu::mcs::{
     AttachUserConfirm, AttachUserRequest, BASE_CHANNEL_ID, ChannelJoinConfirm, ChannelJoinRequest,
     ConnectInitial, ConnectResponse, DomainMcsPdu, DomainParameters, ErectDomainRequest, SendData,
 };
-use rdpcore_pdu::x224::{
-    self, ConnectionConfirm, ConnectionRequest, FailureCode, ResponseFlags, SecurityProtocol,
-};
+use rdpcore_pdu::x224::{self, ConnectionConfirm, ConnectionRequest, FailureCode, ResponseFlags};
 
 /// MCS user (initiator) channel id - fixed since this server design is one
 /// connection (one `Acceptor`) per TCP/TLS stream, so there's no risk of
@@ -140,6 +139,10 @@ pub struct Acceptor {
     /// Echo of the client's RDP Negotiation Request `requestedProtocols`
     /// (MS-RDPBCGR: SC_CORE.clientRequestedProtocols MUST match this).
     client_requested_protocols: u32,
+    /// Protocol selected in the Connection Confirm (`PROTOCOL_HYBRID` or
+    /// `PROTOCOL_SSL`). Callers use this after TLS to decide whether CredSSP
+    /// (NLA) must run before MCS Connect Initial.
+    selected_protocol: SecurityProtocol,
     /// MCS user-data reassembly for Confirm Active when mstsc fragments it.
     confirm_active_buf: Vec<u8>,
 }
@@ -153,8 +156,21 @@ impl Acceptor {
             static_channel_names: Vec::new(),
             message_channel_id: None,
             client_requested_protocols: SecurityProtocol::SSL.0,
+            selected_protocol: SecurityProtocol::SSL,
             confirm_active_buf: Vec::new(),
         }
+    }
+
+    /// Protocol chosen during X.224 negotiation (`PROTOCOL_HYBRID` when the
+    /// client offered NLA, otherwise `PROTOCOL_SSL`).
+    pub fn selected_protocol(&self) -> SecurityProtocol {
+        self.selected_protocol
+    }
+
+    /// Whether the selected protocol requires a CredSSP exchange after TLS
+    /// and before MCS Connect Initial.
+    pub fn requires_credssp(&self) -> bool {
+        self.selected_protocol.contains(SecurityProtocol::HYBRID)
     }
 
     /// Whether the connection has reached (or been rejected before
@@ -405,19 +421,27 @@ impl Acceptor {
 
     fn on_connection_request(&mut self, input: &[u8]) -> Result<StepResult, ConnectorError> {
         let request = ConnectionRequest::decode(input)?;
-        if !request.protocol.contains(SecurityProtocol::SSL) {
+        // Prefer NLA (CredSSP / PROTOCOL_HYBRID) when the client offers it;
+        // otherwise fall back to TLS-only (PROTOCOL_SSL) + Client Info auth.
+        // Either path still needs SSL as the transport underneath CredSSP.
+        let selected = if request.protocol.contains(SecurityProtocol::HYBRID) {
+            SecurityProtocol::HYBRID
+        } else if request.protocol.contains(SecurityProtocol::SSL) {
+            SecurityProtocol::SSL
+        } else {
             self.state = State::Rejected;
             let response = ConnectionConfirm::Failure {
                 code: FailureCode::SSL_REQUIRED_BY_SERVER,
             }
             .encode();
             return Ok(StepResult::with_event(response, AcceptorEvent::Rejected));
-        }
+        };
 
         self.client_requested_protocols = request.protocol.0;
+        self.selected_protocol = selected;
         let response = ConnectionConfirm::Response {
             flags: ResponseFlags(0),
-            protocol: SecurityProtocol::SSL,
+            protocol: selected,
         }
         .encode();
         self.state = State::WaitConnectInitial;
@@ -1131,6 +1155,46 @@ mod tests {
                 code: FailureCode::SSL_REQUIRED_BY_SERVER
             }
         ));
+    }
+
+    #[test]
+    fn prefers_hybrid_when_client_offers_nla() {
+        let mut acceptor = Acceptor::new(1024, 768);
+        let request = ConnectionRequest {
+            cookie: None,
+            flags: x224::RequestFlags(0),
+            protocol: SecurityProtocol::SSL | SecurityProtocol::HYBRID,
+        };
+        let result = acceptor.step(&request.encode()).unwrap();
+        assert_eq!(result.event, AcceptorEvent::TlsUpgrade);
+        assert!(acceptor.requires_credssp());
+        assert_eq!(acceptor.selected_protocol(), SecurityProtocol::HYBRID);
+        match ConnectionConfirm::decode(&result.response).unwrap() {
+            ConnectionConfirm::Response { protocol, .. } => {
+                assert_eq!(protocol, SecurityProtocol::HYBRID);
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn falls_back_to_ssl_when_client_omits_hybrid() {
+        let mut acceptor = Acceptor::new(1024, 768);
+        let request = ConnectionRequest {
+            cookie: None,
+            flags: x224::RequestFlags(0),
+            protocol: SecurityProtocol::SSL,
+        };
+        let result = acceptor.step(&request.encode()).unwrap();
+        assert_eq!(result.event, AcceptorEvent::TlsUpgrade);
+        assert!(!acceptor.requires_credssp());
+        assert_eq!(acceptor.selected_protocol(), SecurityProtocol::SSL);
+        match ConnectionConfirm::decode(&result.response).unwrap() {
+            ConnectionConfirm::Response { protocol, .. } => {
+                assert_eq!(protocol, SecurityProtocol::SSL);
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
     }
 
     #[test]
