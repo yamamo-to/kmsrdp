@@ -10,6 +10,7 @@
 use rdpcore_rdpdr::diagnostic::DirectoryListingSelfTest;
 use rdpcore_rdpdr::pdu::{RDPDR_DTYP_FILESYSTEM, RDPDR_DTYP_PRINT};
 use rdpcore_rdpdr::{DriveConsumer, DriveConsumerFactory};
+use tokio::sync::mpsc::UnboundedSender;
 
 pub struct DiagnosticDriveFactory;
 
@@ -18,7 +19,7 @@ impl DriveConsumerFactory for DiagnosticDriveFactory {
         RDPDR_DTYP_FILESYSTEM | RDPDR_DTYP_PRINT
     }
 
-    fn build_drive_consumer(&self) -> Box<dyn DriveConsumer> {
+    fn build_drive_consumer(&self, _wake: UnboundedSender<()>) -> Box<dyn DriveConsumer> {
         Box::new(DirectoryListingSelfTest::new(|event| {
             println!("rdpdr self-test: {event}")
         }))

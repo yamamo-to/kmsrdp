@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.6
+Version:        0.1.7
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -25,9 +25,11 @@ Source1:        %{name}-%{version}-vendor.tar.xz
 BuildRequires:  cargo
 BuildRequires:  rust
 BuildRequires:  gcc
+BuildRequires:  fuse3-devel
 BuildRequires:  systemd-rpm-macros
 
 Requires:       libcap
+Requires:       fuse3
 Requires(post): libcap
 
 %description
@@ -37,13 +39,12 @@ injection) but speaking RDP instead of VNC via its own from-scratch RDP
 protocol implementation (no ironrdp or other RDP library dependency). It
 supports screen capture, mouse/keyboard input, Japanese/CJK IME text
 injection (X11 sessions), bidirectional clipboard sync, audio output and
-microphone redirection, TLS + username/password authentication, and
-priority-aware scheduling so video traffic can't starve audio.
+microphone redirection, FUSE mounts for redirected client drives, TLS +
+username/password authentication (optional NLA), and priority-aware
+scheduling so video traffic can't starve audio.
 
 Known limitations: Linear (non-tiled) framebuffers only, single monitor,
-and no printer/drive redirection consumer yet (the MS-RDPDR protocol
-itself is implemented and validated, just not wired to a real local
-filesystem/printing backend). See the upstream README for details.
+and no printer redirection (CUPS) yet. See the upstream README for details.
 
 %prep
 %autosetup -p1 -n %{name}-%{version}
@@ -96,6 +97,10 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Sat Jul 18 2026 kmsrdp contributors <noreply@example.com> - 0.1.7-1
+- Mount redirected client drives via FUSE under the session runtime dir
+- Prefer HYBRID CredSSP wake path for RDPDR I/O; clear stale FUSE mounts
+
 * Sat Jul 18 2026 kmsrdp contributors <noreply@example.com> - 0.1.6-1
 - Add optional NLA (CredSSP/NTLMv2) with HYBRID preferred and TLS fallback
 - Pass TLS subjectPublicKey bytes so FreeRDP/Guacamole pubKeyAuth verifies

@@ -25,9 +25,11 @@ for a fix and coordinated release before publishing details.
 ## Deployment warning
 
 kmsrdp provides authenticated clients with complete screen visibility,
-keyboard and mouse control, and optional clipboard and audio access. It
-supports optional NLA (CredSSP/NTLMv2; no Kerberos) and uses a newly
-generated self-signed TLS certificate on every start.
+keyboard and mouse control, and optional clipboard, audio, and redirected
+drive access (client drives appear under the session user's
+`$XDG_RUNTIME_DIR/kmsrdp/drives/`). It supports optional NLA
+(CredSSP/NTLMv2; no Kerberos) and uses a newly generated self-signed TLS
+certificate on every start.
 
 Do not expose it directly to the public Internet. Restrict TCP port 3389 to
 trusted clients and use a trusted LAN, VPN, or SSH tunnel.

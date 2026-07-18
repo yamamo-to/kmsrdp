@@ -530,21 +530,24 @@ impl Session {
             .iter()
             .find(|(name, _)| name == rdpcore_rdpdr::pdu::CHANNEL_NAME)
             .map(|(_, id)| *id);
+        let mut rdpdr_wake_rx = None;
         let mut rdpdr = match (rdpdr_channel_id, &self.drive_factory) {
             (Some(channel_id), Some(factory)) => {
+                let (wake_tx, wake_rx) = tokio::sync::mpsc::unbounded_channel();
                 let (channel, initial) = RdpdrChannel::new(
                     channel_id,
                     accepted.user_channel_id,
                     factory.supported_device_types(),
-                    factory.build_drive_consumer(),
+                    factory.build_drive_consumer(wake_tx),
                 );
                 for bytes in initial {
                     let _ = frame_sender.send(Frame {
                         channel: ChannelKey::Static(channel_id),
-                        priority: Priority::Bulk,
+                        priority: Priority::Latency,
                         bytes,
                     });
                 }
+                rdpdr_wake_rx = Some(wake_rx);
                 Some(channel)
             }
             _ => None,
@@ -729,6 +732,23 @@ impl Session {
                         }
                     }
                 }
+                _ = recv_optional(&mut rdpdr_wake_rx) => {
+                    if let Some(channel) = rdpdr.as_mut() {
+                        let channel_id = channel.channel_id();
+                        for bytes in channel.flush_pending_commands() {
+                            if frame_sender
+                                .send(Frame {
+                                    channel: ChannelKey::Static(channel_id),
+                                    priority: Priority::Latency,
+                                    bytes,
+                                })
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -808,7 +828,7 @@ fn handle_slow_path_frame(
         for response in channel.on_channel_data(&send_data.data)? {
             let _ = frame_sender.send(Frame {
                 channel: ChannelKey::Static(channel_id),
-                priority: Priority::Bulk,
+                priority: Priority::Latency,
                 bytes: response,
             });
         }
