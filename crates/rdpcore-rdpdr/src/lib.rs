@@ -13,9 +13,11 @@
 //! opposite of rdpsnd/cliprdr, where the server mostly reacts to what the
 //! client sends. [`DriveConsumer`] is therefore command-driven rather than
 //! event-driven: every callback returns the next [`DriveCommand`]s to
-//! issue, letting a consumer (e.g. a directory-listing walk, or eventually
-//! a FUSE filesystem / CUPS backend) drive a whole operation one reply at
-//! a time without re-entrant calls back into [`RdpdrChannel`].
+//! issue, letting a consumer (e.g. a directory-listing walk, or a FUSE
+//! filesystem) drive a whole operation one reply at a time without
+//! re-entrant calls back into [`RdpdrChannel`]. Externally driven
+//! consumers (FUSE) also expose commands via [`DriveConsumer::poll_commands`]
+//! and wake the connection loop through the factory-supplied sender.
 
 pub mod diagnostic;
 pub mod irp;
@@ -25,6 +27,7 @@ use std::collections::HashMap;
 
 use rdpcore_pdu::mcs::SendData;
 use rdpcore_pdu::{DecodeError, svc, x224};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Arbitrary, fixed - the client only ever echoes this back
 /// (`Client Announce Reply`/`Client ID Confirm`), it carries no other
@@ -104,6 +107,13 @@ pub trait DriveConsumer: Send {
         request_tag: u64,
         result: Result<Option<irp::DirectoryEntry>, u32>,
     ) -> Vec<DriveCommand>;
+    /// Drain any commands queued by an external driver (e.g. FUSE) since
+    /// the last poll. Reply callbacks may still return follow-up commands
+    /// directly; this is the path for ops that originate outside the RDP
+    /// completion cycle.
+    fn poll_commands(&mut self) -> Vec<DriveCommand> {
+        Vec::new()
+    }
 }
 
 /// One [`DriveConsumer`] per connection, mirroring `SoundServerFactory`/
@@ -113,7 +123,11 @@ pub trait DriveConsumerFactory: Send + Sync {
     /// OR of `pdu::RDPDR_DTYP_*` - which device types to accept and
     /// advertise capability for on every connection this factory serves.
     fn supported_device_types(&self) -> u32;
-    fn build_drive_consumer(&self) -> Box<dyn DriveConsumer>;
+    /// `wake` is fired whenever the consumer may have new
+    /// [`DriveConsumer::poll_commands`] ready (typically from a FUSE
+    /// thread). The connection loop should call
+    /// [`RdpdrChannel::flush_pending_commands`] on each wake.
+    fn build_drive_consumer(&self, wake: UnboundedSender<()>) -> Box<dyn DriveConsumer>;
 }
 
 struct PendingOp {
@@ -176,6 +190,15 @@ impl RdpdrChannel {
 
     pub fn devices(&self) -> &HashMap<u32, (u32, String)> {
         &self.devices
+    }
+
+    /// Encode any commands waiting in [`DriveConsumer::poll_commands`].
+    /// Call after the factory `wake` sender fires.
+    pub fn flush_pending_commands(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let commands = self.consumer.poll_commands();
+        self.encode_commands(commands, &mut out);
+        out
     }
 
     /// `payload` is one SVC chunk (Channel PDU Header included) of
@@ -253,16 +276,36 @@ impl RdpdrChannel {
         Ok(match pending.major_function {
             irp::IRP_MJ_CREATE => {
                 let result = if ok {
-                    Ok(irp::decode_create_reply(body)?)
+                    match irp::decode_create_reply(body) {
+                        Ok(reply) => Ok(reply),
+                        Err(e) => {
+                            eprintln!(
+                                "rdpdr: CREATE completion decode failed ({e}); treating as I/O error"
+                            );
+                            Err(io_status.max(1))
+                        }
+                    }
                 } else {
                     Err(io_status)
                 };
+                if let Err(status) = result {
+                    eprintln!(
+                        "rdpdr: CREATE failed NTSTATUS={status:#010x} (tag={})",
+                        pending.request_tag
+                    );
+                }
                 self.consumer.on_create_reply(pending.request_tag, result)
             }
             irp::IRP_MJ_CLOSE => self.consumer.on_close_reply(pending.request_tag, io_status),
             irp::IRP_MJ_READ => {
                 let result = if ok {
-                    Ok(irp::decode_read_reply(body)?)
+                    match irp::decode_read_reply(body) {
+                        Ok(data) => Ok(data),
+                        Err(e) => {
+                            eprintln!("rdpdr: READ completion decode failed ({e})");
+                            Err(io_status.max(1))
+                        }
+                    }
                 } else {
                     Err(io_status)
                 };
@@ -270,7 +313,13 @@ impl RdpdrChannel {
             }
             irp::IRP_MJ_WRITE => {
                 let result = if ok {
-                    Ok(irp::decode_write_reply(body)?)
+                    match irp::decode_write_reply(body) {
+                        Ok(n) => Ok(n),
+                        Err(e) => {
+                            eprintln!("rdpdr: WRITE completion decode failed ({e})");
+                            Err(io_status.max(1))
+                        }
+                    }
                 } else {
                     Err(io_status)
                 };
@@ -278,10 +327,20 @@ impl RdpdrChannel {
             }
             irp::IRP_MJ_DIRECTORY_CONTROL => {
                 let result = if ok {
-                    Ok(irp::decode_query_directory_reply(body)?)
+                    match irp::decode_query_directory_reply(body) {
+                        Ok(entry) => Ok(entry),
+                        Err(e) => {
+                            eprintln!("rdpdr: QueryDirectory completion decode failed ({e})");
+                            Err(io_status.max(1))
+                        }
+                    }
                 } else if io_status == irp::STATUS_NO_MORE_FILES {
                     Ok(None)
                 } else {
+                    eprintln!(
+                        "rdpdr: QueryDirectory failed NTSTATUS={io_status:#010x} (tag={})",
+                        pending.request_tag
+                    );
                     Err(io_status)
                 };
                 self.consumer
@@ -617,5 +676,75 @@ mod tests {
 
         let out = send_message(&mut channel, completion);
         assert!(out.is_empty()); // RecordingConsumer::on_create_reply issues no further commands
+    }
+
+    #[test]
+    fn flush_pending_commands_encodes_polled_queue() {
+        struct QueuedConsumer {
+            queued: Vec<DriveCommand>,
+        }
+        impl DriveConsumer for QueuedConsumer {
+            fn on_device_ready(
+                &mut self,
+                _device_id: u32,
+                _device_type: u32,
+                _dos_name: &str,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_create_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<irp::CreateReply, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_close_reply(&mut self, _request_tag: u64, _status: u32) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_read_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<Vec<u8>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_write_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<u32, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_query_directory_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<Option<irp::DirectoryEntry>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn poll_commands(&mut self) -> Vec<DriveCommand> {
+                std::mem::take(&mut self.queued)
+            }
+        }
+
+        let (mut channel, _initial) = RdpdrChannel::new(
+            1004,
+            1002,
+            pdu::RDPDR_DTYP_FILESYSTEM,
+            Box::new(QueuedConsumer {
+                queued: vec![DriveCommand::Create {
+                    device_id: 1,
+                    path: "\\".to_owned(),
+                    desired_access: irp::GENERIC_READ,
+                    create_disposition: irp::FILE_OPEN,
+                    create_options: irp::FILE_DIRECTORY_FILE,
+                    request_tag: 42,
+                }],
+            }),
+        );
+        let out = channel.flush_pending_commands();
+        assert_eq!(out.len(), 1);
+        assert!(channel.flush_pending_commands().is_empty());
     }
 }

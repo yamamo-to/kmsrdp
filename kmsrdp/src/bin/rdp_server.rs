@@ -26,6 +26,8 @@ use kmsrdp::audio_input::VirtualMicFactory;
 use kmsrdp::capture;
 use kmsrdp::clipboard::LocalClipboardFactory;
 use kmsrdp::display_hub::{Display, DisplayHub, MouseScale};
+use kmsrdp::rdpdr_diagnostic::DiagnosticDriveFactory;
+use kmsrdp::rdpdr_fuse::FuseDriveFactory;
 use kmsrdp::tls;
 use kmsrdp::uinput::{self, VirtualInput};
 use kmsrdp::x11_unicode::X11UnicodeTyper;
@@ -172,6 +174,14 @@ async fn main() -> Result<()> {
         x11_typer: X11UnicodeTyper::new(session_rx.clone()),
     });
 
+    let drive_factory: Box<dyn rdpcore_rdpdr::DriveConsumerFactory> =
+        if std::env::var_os("KMSRDP_RDPDR_DIAGNOSTIC").is_some() {
+            println!("kmsrdp: RDPDR diagnostic self-test enabled (KMSRDP_RDPDR_DIAGNOSTIC)");
+            Box::new(DiagnosticDriveFactory)
+        } else {
+            Box::new(FuseDriveFactory::new(session_rx.clone()))
+        };
+
     let server: RdpServer = RdpServer::builder()
         .with_listener(listener)
         .with_tls(tls_identity.acceptor)
@@ -183,6 +193,7 @@ async fn main() -> Result<()> {
         ))))
         .with_sound_factory(Some(Box::new(LocalAudioFactory::new())))
         .with_audio_input_factory(Some(Box::new(VirtualMicFactory::new())))
+        .with_drive_factory(Some(drive_factory))
         .with_credential_validator(Some(Arc::new(validator)))
         .with_nla_credentials(Some(credentials))
         .build();

@@ -20,7 +20,8 @@ NVIDIA) and injecting input via `uinput` - but speaking RDP instead of VNC.
 The RDP protocol stack itself (`crates/rdpcore-*`) is a from-scratch
 implementation - TPKT/X.224/MCS/GCC framing, capability negotiation,
 fast-path input/output, RDPSND, CLIPRDR, MS-RDPEAI (audio input), MS-RDPDR
-(drive/printer redirection), and an RDP 6.0 "Planar" bitmap codec - with no
+(drive redirection via FUSE; printer/CUPS still planned), and an RDP 6.0
+"Planar" bitmap codec - with no
 dependency on `ironrdp-*` or any other RDP protocol library. It's structured
 as a Cargo workspace so the protocol crates are usable independently of
 kmsrdp's own DRM/uinput glue.
@@ -87,12 +88,15 @@ kmsrdp's own DRM/uinput glue.
 - One selected physical monitor is captured at a time. Combining monitors
   into one desktop or exposing true RDP multimonitor layouts is not yet
   supported.
-- MS-RDPDR (drive/printer redirection) is implemented and live-validated
-  against a real client at the protocol level (`crates/rdpcore-rdpdr`), but
-  isn't wired into the production server yet - there's no consumer on this
-  side to make a redirected drive/printer actually usable from the Linux
-  desktop session (a FUSE mount for drives, a CUPS backend for printers).
-  That's a planned follow-up.
+- MS-RDPDR filesystem (drive) redirection is wired through a FUSE mount
+  at `$XDG_RUNTIME_DIR/kmsrdp/drives/<DosName>` for the active session
+  (e.g. `xfreerdp ... /drive:share,/path` or mstsc drive redirection).
+  Supported ops: list/read/write/create/mkdir. Delete, rename, and
+  setattr are not implemented yet (no matching IRPs). Printer
+  redirection (CUPS) is still a planned follow-up. Set
+  `KMSRDP_RDPDR_DIAGNOSTIC=1` to run the protocol self-test consumer
+  instead of FUSE. Mounting requires `user_allow_other` in
+  `/etc/fuse.conf` when kmsrdp runs as root.
 - Extended-key (arrow keys, etc.) scancode mapping covers only the common
   cases, not the full table.
 - Single-process design requires `CAP_SYS_ADMIN` (DRM), `CAP_DAC_OVERRIDE`

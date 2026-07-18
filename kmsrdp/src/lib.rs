@@ -6,6 +6,7 @@ pub mod display_hub;
 pub mod gpu_detile;
 pub mod nvfbc;
 pub mod rdpdr_diagnostic;
+pub mod rdpdr_fuse;
 pub mod session;
 pub mod session_watcher;
 pub mod tls;
