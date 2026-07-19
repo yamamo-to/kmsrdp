@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.11
+Version:        0.1.12
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -97,6 +97,11 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Sun Jul 19 2026 kmsrdp contributors <noreply@example.com> - 0.1.12-1
+- Narrow tokio features; share one clipboard poller across RDP connections
+- Disable arboard image-data by default; gate RDPDR diagnostic and DVC echo behind features
+- Share full-frame bitmaps via Arc to avoid duplicate framebuffer copies
+
 * Sat Jul 18 2026 kmsrdp contributors <noreply@example.com> - 0.1.11-1
 - Hand off shared FUSE ownership by swapping the RDPDR backend without umount
 - Detach last-connection umount so disconnect cannot block other RDP sessions

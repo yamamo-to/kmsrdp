@@ -5,6 +5,7 @@ pub mod clipboard;
 pub mod display_hub;
 pub mod gpu_detile;
 pub mod nvfbc;
+#[cfg(feature = "rdpdr-diagnostic")]
 pub mod rdpdr_diagnostic;
 pub mod rdpdr_fuse;
 pub mod session;

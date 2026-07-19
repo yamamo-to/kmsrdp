@@ -95,9 +95,10 @@ kmsrdp's own DRM/uinput glue.
   it is released only when the last connection leaves. Supported ops:
   list/read/write/create/mkdir. Delete, rename, and setattr are not
   implemented yet (no matching IRPs). Printer redirection (CUPS) is
-  still a planned follow-up. Set `KMSRDP_RDPDR_DIAGNOSTIC=1` to run the
-  protocol self-test consumer instead of FUSE. Mounting requires
-  `user_allow_other` in `/etc/fuse.conf` when kmsrdp runs as root.
+  still a planned follow-up. Build with `--features rdpdr-diagnostic` and
+  set `KMSRDP_RDPDR_DIAGNOSTIC=1` to run the protocol self-test consumer
+  instead of FUSE. Mounting requires `user_allow_other` in
+  `/etc/fuse.conf` when kmsrdp runs as root.
 - Extended-key (arrow keys, etc.) scancode mapping covers only the common
   cases, not the full table.
 - Single-process design requires `CAP_SYS_ADMIN` (DRM), `CAP_DAC_OVERRIDE`

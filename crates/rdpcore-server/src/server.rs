@@ -33,6 +33,7 @@ pub struct RdpServerBuilder {
     cliprdr_factory: Option<Arc<dyn CliprdrBackendFactory>>,
     audio_input_factory: Option<Arc<dyn AudioInputBackendFactory>>,
     drive_factory: Option<Arc<dyn DriveConsumerFactory>>,
+    #[cfg(feature = "dvc-echo")]
     echo_smoke_test: bool,
 }
 
@@ -51,6 +52,7 @@ impl RdpServerBuilder {
             cliprdr_factory: None,
             audio_input_factory: None,
             drive_factory: None,
+            #[cfg(feature = "dvc-echo")]
             echo_smoke_test: false,
         }
     }
@@ -130,7 +132,8 @@ impl RdpServerBuilder {
     /// Opens a trivial MS-RDPEECO Echo dynamic channel on every connection
     /// and logs whether the client echoed the payload back correctly -
     /// purely a diagnostic to confirm the DVC transport itself is healthy.
-    /// No real feature depends on this.
+    /// Requires the `dvc-echo` cargo feature.
+    #[cfg(feature = "dvc-echo")]
     pub fn with_echo_smoke_test(mut self, enabled: bool) -> Self {
         self.echo_smoke_test = enabled;
         self
@@ -154,6 +157,7 @@ impl RdpServerBuilder {
             cliprdr_factory: self.cliprdr_factory,
             audio_input_factory: self.audio_input_factory,
             drive_factory: self.drive_factory,
+            #[cfg(feature = "dvc-echo")]
             echo_smoke_test: self.echo_smoke_test,
         }
     }
@@ -172,6 +176,7 @@ pub struct RdpServer {
     cliprdr_factory: Option<Arc<dyn CliprdrBackendFactory>>,
     audio_input_factory: Option<Arc<dyn AudioInputBackendFactory>>,
     drive_factory: Option<Arc<dyn DriveConsumerFactory>>,
+    #[cfg(feature = "dvc-echo")]
     echo_smoke_test: bool,
 }
 
@@ -189,6 +194,7 @@ struct Session {
     cliprdr_factory: Option<Arc<dyn CliprdrBackendFactory>>,
     audio_input_factory: Option<Arc<dyn AudioInputBackendFactory>>,
     drive_factory: Option<Arc<dyn DriveConsumerFactory>>,
+    #[cfg(feature = "dvc-echo")]
     echo_smoke_test: bool,
 }
 
@@ -209,14 +215,15 @@ impl RdpServer {
             cliprdr_factory: self.cliprdr_factory.clone(),
             audio_input_factory: self.audio_input_factory.clone(),
             drive_factory: self.drive_factory.clone(),
+            #[cfg(feature = "dvc-echo")]
             echo_smoke_test: self.echo_smoke_test,
         }
     }
 
     /// Accepts connections and runs each on its own task. Display capture
     /// and input injection are shared across sessions (see kmsrdp's
-    /// `DisplayHub` / `SharedInput`); audio and clipboard backends are
-    /// built per connection.
+    /// `DisplayHub` / `SharedInput`); audio backends are per-connection,
+    /// clipboard backends share one process-wide local poller.
     pub async fn run(mut self) -> anyhow::Result<()> {
         let listener = match self.listener.take() {
             Some(listener) => listener,
@@ -487,6 +494,7 @@ impl Session {
                     bytes,
                 });
             }
+            #[cfg(feature = "dvc-echo")]
             if self.echo_smoke_test {
                 let echo_frames =
                     mux.register_channel(Box::new(rdpcore_dvc::echo::EchoHandler::new(
@@ -1070,7 +1078,7 @@ mod tests {
             width: w,
             height: h,
             format: PixelFormat::BgrX32,
-            data: vec![fill; stride.get() * usize::from(height)],
+            data: std::sync::Arc::from(vec![fill; stride.get() * usize::from(height)]),
             stride,
         }
     }

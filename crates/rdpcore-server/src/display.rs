@@ -3,6 +3,7 @@
 //! kmsrdp) only need to change import paths, not logic.
 
 use core::num::{NonZeroU16, NonZeroUsize};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -28,11 +29,15 @@ pub struct BitmapUpdate {
     pub width: NonZeroU16,
     pub height: NonZeroU16,
     pub format: PixelFormat,
-    /// Row-major, top-down, tightly packed (`stride == width * 4`) once
-    /// this came out of [`BitmapUpdate::sub`] - the wire encoder relies on
-    /// that (it only reverses rows for the bottom-up wire convention, it
-    /// doesn't re-pack arbitrary strides).
-    pub data: Vec<u8>,
+    /// Row-major, top-down pixel bytes. Shared via [`Arc`] so the capture
+    /// loop can publish one full frame to `latest_full` and to subscribers
+    /// without cloning megabytes of framebuffer data.
+    ///
+    /// After [`BitmapUpdate::sub`] the buffer is tightly packed
+    /// (`stride == width * 4`) - the wire encoder relies on that (it only
+    /// reverses rows for the bottom-up wire convention, it doesn't re-pack
+    /// arbitrary strides).
+    pub data: Arc<[u8]>,
     pub stride: NonZeroUsize,
 }
 
@@ -66,7 +71,7 @@ impl BitmapUpdate {
             width,
             height,
             format: self.format,
-            data,
+            data: Arc::from(data),
             stride: NonZeroUsize::new(bw * BYTES_PER_PIXEL)?,
         })
     }

@@ -9,4 +9,4 @@ description = "Priority-aware per-connection write scheduler: bulk graphics can'
 tokio = { version = "1.52.3", features = ["io-util", "sync"] }
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["full"] }
+tokio = { version = "1.52.3", features = ["macros", "rt", "io-util", "sync"] }
