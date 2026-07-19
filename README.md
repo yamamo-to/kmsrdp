@@ -205,7 +205,12 @@ authentication (`xfreerdp /sec:tls` still works).
 Accept the self-signed certificate warning only after confirming that you
 are connecting through a trusted network path.
 
-## Packaging (AlmaLinux / RHEL 9 RPM)
+## Packaging
+
+Tagged releases (`v*.*.*`) build both an AlmaLinux 9 RPM and an Ubuntu
+`.deb` in GitHub Actions and attach them to the GitHub release. Locally:
+
+### AlmaLinux / RHEL 9 RPM
 
 ```
 make install-build-deps   # one-time, needs sudo
@@ -215,12 +220,26 @@ sudo dnf install .rpmbuild/RPMS/x86_64/kmsrdp-*.rpm
 
 `make rpm`/`make srpm` generate both the source archive and a vendored Rust
 dependency archive from the current checkout. The subsequent `rpmbuild`
-step therefore needs no network access. Tagged releases (`v*.*.*`) also
-trigger the GitHub Actions RPM build and attach the resulting RPM to the
-GitHub release.
+step therefore needs no network access.
 
 Other targets: `make srpm` (source RPM only), `make lint` (rpmlint the
 spec), `make clean`.
+
+### Debian / Ubuntu (.deb)
+
+Needs a recent Rust toolchain (edition 2024; use [rustup](https://rustup.rs/)
+if the distro `cargo`/`rustc` is older):
+
+```
+make install-deb-build-deps   # one-time, needs sudo
+make deb                      # -> .debbuild/kmsrdp_*.deb
+sudo apt install ./.debbuild/kmsrdp_*.deb
+```
+
+`make deb` vendors crates into `.debbuild/`, then runs `dpkg-buildpackage`
+offline (`-d` so a rustup toolchain can satisfy Build-Depends). The package
+layout matches the RPM (binary under `/usr/libexec/kmsrdp/`, user and system
+systemd units, env examples, `setcap` in `postinst`).
 
 ## Installing as a service
 
@@ -230,10 +249,10 @@ Two install options, pick one: a `--user` unit tied to a single login
 
 ### systemd --user service
 
-Installing the RPM places `dist/kmsrdp.service` and
+Installing the RPM or `.deb` places `dist/kmsrdp.service` and
 `dist/kmsrdp.env.example` under `/usr/lib/systemd/user/` and
 `/usr/share/doc/kmsrdp/`, and runs `setcap` on the binary automatically
-(spec's `%post`). Building from source instead, copy those two files into
+(package post-install). Building from source instead, copy those two files into
 place yourself and run the `setcap` command from "Running" above. Either
 way, then:
 

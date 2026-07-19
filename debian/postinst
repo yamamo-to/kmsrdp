@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+configure)
+	setcap cap_sys_admin,cap_dac_override,cap_net_bind_service+ep \
+		/usr/libexec/kmsrdp/kmsrdp-server || true
+	cat <<'MSG'
+kmsrdp installed. Two ways to run it:
+
+Per user (single session, no root):
+  mkdir -p ~/.config/kmsrdp
+  cp /usr/share/doc/kmsrdp/kmsrdp.env.example ~/.config/kmsrdp/kmsrdp.env
+  chmod 600 ~/.config/kmsrdp/kmsrdp.env
+  $EDITOR ~/.config/kmsrdp/kmsrdp.env   # set KMSRDP_USER / KMSRDP_PASSWORD
+  systemctl --user enable --now kmsrdp.service
+
+As root (follows whichever login session is active):
+  mkdir -p /etc/kmsrdp
+  install -m600 /usr/share/doc/kmsrdp/kmsrdp-system.env.example /etc/kmsrdp/kmsrdp.env
+  $EDITOR /etc/kmsrdp/kmsrdp.env   # set KMSRDP_USER / KMSRDP_PASSWORD
+  systemctl enable --now kmsrdp.service
+MSG
+	;;
+esac
+
+#DEBHELPER#
+
+exit 0

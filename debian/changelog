@@ -1,0 +1,5 @@
+kmsrdp (0.1.14) unstable; urgency=medium
+
+  * Add Debian/Ubuntu packaging (.deb) alongside the AlmaLinux RPM.
+
+ -- kmsrdp contributors <noreply@example.com>  Sun, 19 Jul 2026 14:14:00 +0900
