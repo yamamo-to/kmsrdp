@@ -1,0 +1,34 @@
+Source: kmsrdp
+Section: net
+Priority: optional
+Maintainer: kmsrdp contributors <noreply@example.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc,
+ pkg-config,
+ libfuse3-dev,
+Standards-Version: 4.7.0
+Homepage: https://github.com/yamamo-to/kmsrdp
+Rules-Requires-Root: no
+
+Package: kmsrdp
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ fuse3,
+ libcap2-bin,
+Description: DRM/KMS-based RDP remote desktop server (pure Rust)
+ kmsrdp is a from-scratch remote desktop server for Linux, inspired by
+ ReFrame's compositor-bypass architecture (DRM/KMS capture + uinput input
+ injection) but speaking RDP instead of VNC via its own from-scratch RDP
+ protocol implementation (no ironrdp or other RDP library dependency). It
+ supports screen capture, mouse/keyboard input, Japanese/CJK IME text
+ injection (X11 sessions), bidirectional clipboard sync, audio output and
+ microphone redirection, FUSE mounts for redirected client drives, TLS +
+ username/password authentication (optional NLA), and priority-aware
+ scheduling so video traffic cannot starve audio.
+ .
+ Known limitations: Linear (non-tiled) framebuffers only, single monitor,
+ and no printer redirection (CUPS) yet. See the upstream README for details.

@@ -1,0 +1,45 @@
+#!/usr/bin/make -f
+
+# Vendored crates + offline cargo (prepared by `make deb` / CI). Distro
+# cargo/rustc packages are often too old for edition 2024; CI and `make
+# deb` therefore supply a rustup toolchain and pass -d to
+# dpkg-buildpackage.
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+# Upstream Makefile's `clean` only removes packaging dirs; skip it so dh
+# does not treat this tree as an autotools/make project mid-build.
+override_dh_auto_clean:
+
+# cargo-vendor writes `Cargo.toml.orig` next to each crate; default
+# dh_clean deletes `*.orig` and breaks `cargo build --offline` checksums.
+override_dh_clean:
+	dh_clean -X.orig
+
+override_dh_auto_configure:
+
+override_dh_auto_build:
+	cargo build --release --offline --bin rdp_server
+
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -D -m755 target/release/rdp_server \
+		debian/kmsrdp/usr/libexec/kmsrdp/kmsrdp-server
+	install -D -m644 dist/kmsrdp.service \
+		debian/kmsrdp/usr/lib/systemd/user/kmsrdp.service
+	install -D -m644 dist/kmsrdp-system.service \
+		debian/kmsrdp/lib/systemd/system/kmsrdp.service
+	install -D -m644 dist/kmsrdp.env.example \
+		debian/kmsrdp/usr/share/doc/kmsrdp/kmsrdp.env.example
+	install -D -m644 dist/kmsrdp-system.env.example \
+		debian/kmsrdp/usr/share/doc/kmsrdp/kmsrdp-system.env.example
+
+# Do not enable or start on install (same as the RPM).
+override_dh_installsystemd:
+
+# Rust release binaries often trip dwz; skip like the RPM empty debugsource.
+override_dh_dwz:
