@@ -1,317 +1,104 @@
 # kmsrdp
 
-A DRM/KMS-based RDP remote desktop server for Linux, written in pure Rust.
+DRM/KMS-based RDP remote desktop server for Linux, in pure Rust.
 
-Inspired by [ReFrame](https://github.com/AlynxZhou/reframe)'s architecture -
-capturing the screen directly from the kernel's DRM/KMS subsystem (no
-compositor cooperation needed, works on the login screen, headless, over
-NVIDIA) and injecting input via `uinput` - but speaking RDP instead of VNC.
+Captures the screen via the kernel DRM/KMS path (no compositor hook) and
+injects input through `uinput`, similar to
+[ReFrame](https://github.com/AlynxZhou/reframe), but speaks RDP instead of
+VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
 
 > [!WARNING]
-> kmsrdp is experimental software. It can capture the complete desktop,
-> inject keyboard and mouse input, and access the clipboard while running
-> with powerful Linux capabilities. Authentication supports TLS with
-> optional NLA (CredSSP/NTLMv2); Kerberos is not implemented. A new
-> self-signed TLS certificate is generated on every start. Do not expose
-> TCP port 3389 directly to the public Internet. Restrict it with a
-> firewall and use it only on a trusted LAN or through a VPN or SSH
-> tunnel.
-
-The RDP protocol stack itself (`crates/rdpcore-*`) is a from-scratch
-implementation - TPKT/X.224/MCS/GCC framing, capability negotiation,
-fast-path input/output, RDPSND, CLIPRDR, MS-RDPEAI (audio input), MS-RDPDR
-(drive redirection via FUSE; printer/CUPS still planned), and an RDP 6.0
-"Planar" bitmap codec - with no
-dependency on `ironrdp-*` or any other RDP protocol library. It's structured
-as a Cargo workspace so the protocol crates are usable independently of
-kmsrdp's own DRM/uinput glue.
+> Experimental. Authenticated clients get full screen, keyboard/mouse,
+> clipboard, audio, and optional drive access. TLS uses a **new self-signed
+> certificate every start**; NLA is CredSSP/NTLMv2 only (no Kerberos).
+> **Do not expose TCP 3389 to the public Internet** — use a firewall, VPN,
+> or SSH tunnel on a trusted network.
 
 ## Features
 
-- Screen capture: DRM/KMS dma-buf export. A Linear XRGB8888/ARGB8888
-  framebuffer is decoded with a plain CPU mmap; a tiled (vendor-modifier)
-  one of the same formats goes through a GBM/EGL detile pass instead
-  (`kmsrdp::gpu_detile`) - both EGL/GLES and GBM are dlopen'd at runtime, so
-  a build without a GPU driver stack installed still works for the mmap
-  path, it just can't use the GBM/EGL one.
-- NVIDIA NvFBC fallback (`kmsrdp::nvfbc`): when DRM/KMS can't find a bound
-  CRTC at all (the proprietary NVIDIA + classic Xorg case below), this
-  captures straight from the X driver's internal state instead, bypassing
-  DRM/KMS entirely. `libnvidia-fbc.so.1` is also dlopen'd at runtime, so
-  this is a no-op fallback (not a hard dependency) on non-NVIDIA boxes.
-- Mouse/keyboard input via a virtual `uinput` device
-- Selectable DRM connector through `KMSRDP_DISPLAY` when more than one
-  physical monitor is active
-- Japanese/CJK (IME-composed Unicode) text input, via an X11-specific
-  keymap-remap + XTest trick (X11 sessions only)
-- Bidirectional clipboard sync (CLIPRDR <-> local clipboard, text only)
-- TLS (self-signed, regenerated per run) + username/password authentication
-- Dirty-rect diffing for the display path (64x64 tiles), with lossless
-  RDP 6.0 Planar compression on top of each tile
-- Audio output redirection (RDPSND <-> PipeWire monitor source via `parec`)
-- Microphone/audio input redirection (MS-RDPEAI <-> a virtual PipeWire
-  microphone source other local apps can select as their input device)
-- Concurrent RDP sessions sharing one capture stream and one serialized
-  keyboard/mouse input device; audio and clipboard channels remain
-  connection-local
-- Priority-aware write scheduling: a bulk graphics fragment can never
-  starve a latency-sensitive audio frame, even mid-burst
+- **Display:** DRM/KMS capture (Linear mmap or GBM/EGL detile); NVIDIA NvFBC
+  fallback when no CRTC is bound; dirty 64×64 tiles + RDP 6.0 Planar codec;
+  optional `KMSRDP_DISPLAY` for connector selection
+- **Input:** `uinput` mouse/keyboard; CJK IME text on X11 (XTest)
+- **Clipboard:** text-only CLIPRDR; one process-wide local poller shared by
+  all sessions
+- **Audio:** output (RDPSND / `parec`) and mic input (MS-RDPEAI); per connection
+- **Drives:** RDPDR → FUSE at `$XDG_RUNTIME_DIR/kmsrdp/drives/<DosName>`
+  (list/read/write/create/mkdir; shared until the last session leaves)
+- **Auth / transport:** TLS + password; optional NLA; priority-aware writes
+  so audio is not starved by graphics
 
-## Known limitations
+## Limitations
 
-- NLA uses CredSSP with NTLMv2 only (no Kerberos). When the client offers
-  `PROTOCOL_HYBRID`, kmsrdp selects it; otherwise it falls back to TLS plus
-  RDP Client Info credentials.
-- A fresh self-signed TLS certificate is generated at every start; there is
-  currently no configuration for a persistent certificate or private key.
-- The server listens on `0.0.0.0:3389` and has no bind-address option yet.
-  Apply host/network firewall rules before starting it.
-- Concurrent clients see and control the same desktop. Input from every
-  authenticated client is accepted and serialized into the same virtual
-  input device; sessions are not isolated from each other.
-- Only single-plane XRGB8888/ARGB8888 framebuffers are handled (Linear via
-  CPU mmap, tiled via GBM/EGL) - multi-plane formats (e.g. YUV) aren't
-  supported by either path.
-- The proprietary NVIDIA driver has been seen to not bind a CRTC to the
-  connector at all (neither the legacy encoder->crtc chain nor the atomic
-  `CRTC_ID` property) while running a classic Xorg session - the display is
-  on, but the standard DRM/KMS layer has no record of an active CRTC, so
-  DRM/KMS capture fails with `no usable card/connector/CRTC found`
-  regardless of the GBM/EGL path (there's no framebuffer to hand it in the
-  first place). The NvFBC fallback above covers exactly this case. Not yet
-  confirmed whether a Wayland session with the same driver needs it too.
-- NvFBC's officially supported hardware is GRID/Tesla/Quadro; GeForce needs
-  the unofficial "magic private data" unlock every open source NvFBC
-  client uses (see `kmsrdp::nvfbc`'s doc comment) - unofficial, but this is
-  exactly the mechanism tools like Sunshine rely on, and it's what's
-  actually validated below.
-- One selected physical monitor is captured at a time. Combining monitors
-  into one desktop or exposing true RDP multimonitor layouts is not yet
-  supported.
-- MS-RDPDR filesystem (drive) redirection is wired through a FUSE mount
-  at `$XDG_RUNTIME_DIR/kmsrdp/drives/<DosName>` for the active session
-  (e.g. `xfreerdp ... /drive:share,/path` or mstsc drive redirection).
-  Concurrent RDP connections share that path (one mount per DosName);
-  it is released only when the last connection leaves. Supported ops:
-  list/read/write/create/mkdir. Delete, rename, and setattr are not
-  implemented yet (no matching IRPs). Printer redirection (CUPS) is
-  still a planned follow-up. Build with `--features rdpdr-diagnostic` and
-  set `KMSRDP_RDPDR_DIAGNOSTIC=1` to run the protocol self-test consumer
-  instead of FUSE. Mounting requires `user_allow_other` in
-  `/etc/fuse.conf` when kmsrdp runs as root.
-- Extended-key (arrow keys, etc.) scancode mapping covers only the common
-  cases, not the full table.
-- Single-process design requires `CAP_SYS_ADMIN` (DRM), `CAP_DAC_OVERRIDE`
-  (`/dev/uinput` is `root:root` 0600), and `CAP_NET_BIND_SERVICE` (TCP 3389)
-  as file capabilities on the binary - see the systemd unit below.
+- Single monitor; concurrent clients share one desktop and one input device
+- Listens on `0.0.0.0:3389` only (no bind-address option)
+- Framebuffers: single-plane XRGB8888/ARGB8888 only
+- Drive FUSE: no delete/rename/setattr; no printer/CUPS yet
+- CJK IME and clipboard need X11 (`DISPLAY` / `XAUTHORITY`)
+- Needs `CAP_SYS_ADMIN`, `CAP_DAC_OVERRIDE`, `CAP_NET_BIND_SERVICE` on the binary
 
-### Tested environments
+**Tested:** Proxmox VM (VirtIO-GPU/QXL) via Guacamole; NVIDIA/Xorg via NvFBC
+fallback. See module docs for NvFBC / GBM details.
 
-- **Works:** a Proxmox VM with its default virtual display (std VGA /
-  VirtIO-GPU / QXL - plain Linear framebuffers, no vendor tiling),
-  connected to over RDP through Apache Guacamole.
-- **Works (NvFBC fallback):** a physical NVIDIA/Xorg desktop where DRM/KMS
-  finds no bound CRTC at all (see the limitation above) - `capture_raw_bgrx`
-  falls back to NvFBC, and a real `xfreerdp` client correctly renders the
-  live desktop end to end. This is the scenario a GPU-passthrough Proxmox
-  VM running the proprietary NVIDIA driver hits, so it's the one that
-  actually matters for that deployment target, not just this dev box.
-- **GBM/EGL detile path exercised, but not against a live desktop:** on
-  that same NVIDIA/Xorg box, `kmsrdp::gpu_detile`'s import/shader/readback
-  pipeline round-trips a known color correctly against a real GBM buffer
-  allocated directly on the GPU (see `detile_selftest`) - the CRTC-binding
-  issue means no live tiled framebuffer has reached this path yet, but a
-  driver/session where DRM/KMS does find a CRTC (e.g. Wayland) should hand
-  it one.
+## Quick start
 
-## Building
-
-```
+```bash
 cargo build --release --bin rdp_server
-```
+sudo setcap cap_sys_admin,cap_dac_override,cap_net_bind_service+ep \
+  target/release/rdp_server
 
-## Running
-
-Requires:
-
-- `CAP_SYS_ADMIN` + `CAP_DAC_OVERRIDE` + `CAP_NET_BIND_SERVICE` on the binary:
-  `sudo setcap cap_sys_admin,cap_dac_override,cap_net_bind_service+ep target/release/rdp_server`
-- An active graphical session (X11 or Wayland) with a Linear-framebuffer
-  display for DRM capture to have something to capture - see "Tested
-  environments" above; clipboard sync and CJK text input additionally
-  require an X11 session (`DISPLAY`/`XAUTHORITY` in the environment).
-- `parec`/`paplay`/`pactl` (`pulseaudio-utils`) on `$PATH` for audio
-  output/input redirection.
-- TCP port 3389 restricted to trusted clients with a firewall, VPN, or SSH
-  tunnel.
-
-```
 KMSRDP_USER=myuser KMSRDP_PASSWORD=mypassword ./target/release/rdp_server
 ```
 
-Connect with any RDP client, e.g. `xfreerdp /v:<host> /cert:ignore
-/u:myuser /p:mypassword` (NLA by default; use `/sec:tls` to force TLS-only).
+Connect with `xfreerdp /v:<host> /cert:ignore /u:myuser /p:mypassword`, or
+mstsc (NLA). Optional: `KMSRDP_TLS_HOSTS=host,1.2.3.4` for certificate SANs;
+`KMSRDP_DISPLAY=DP-1` or `card1:DP-1` to pick a connector (disables NvFBC
+fallback).
 
-`KMSRDP_TLS_HOSTS` optionally adds comma-separated hostnames or IP addresses
-to the generated certificate's Subject Alternative Name list:
+Audio needs `parec` / `paplay` / `pactl` on `$PATH`. Root FUSE mounts need
+`user_allow_other` in `/etc/fuse.conf`.
 
-```
-KMSRDP_TLS_HOSTS=server.example.test,192.0.2.10 \
-KMSRDP_USER=myuser KMSRDP_PASSWORD=mypassword \
-./target/release/rdp_server
-```
+## Packages
 
-### Selecting a monitor
-
-When multiple DRM connectors are active, set `KMSRDP_DISPLAY` to the Linux
-connector name:
+GitHub Releases (`v*.*.*`) attach an AlmaLinux 9 RPM and an Ubuntu `.deb`.
 
 ```bash
-KMSRDP_DISPLAY=DP-1 \
-KMSRDP_USER=myuser KMSRDP_PASSWORD=mypassword \
-./target/release/rdp_server
-```
-
-Connector names are the familiar `DP-1`, `HDMI-A-1`, `eDP-1`, and similar
-names shown under `/sys/class/drm`. If two DRM cards expose the same
-connector name, qualify it with the card:
-
-```bash
-KMSRDP_DISPLAY=card1:DP-1
-```
-
-The server logs the selected `card:connector`. If the requested connector
-is missing, disconnected, or has no active CRTC, startup fails and the
-error lists the DRM connectors it discovered. When `KMSRDP_DISPLAY` is
-unset, kmsrdp keeps its original behavior and uses the first active
-connector.
-
-NvFBC captures the X screen as a whole and cannot select an individual DRM
-connector, so the NvFBC fallback is intentionally disabled when
-`KMSRDP_DISPLAY` is set.
-
-### Windows Remote Desktop (mstsc)
-
-mstsc connects with NLA (CredSSP/NTLMv2) by default. Use the same
-`KMSRDP_USER` / `KMSRDP_PASSWORD` values configured on the server:
-
-```bat
-mstsc /v:<host>
-```
-
-For clients that disable NLA, kmsrdp falls back to TLS + Client Info
-authentication (`xfreerdp /sec:tls` still works).
-
-Accept the self-signed certificate warning only after confirming that you
-are connecting through a trusted network path.
-
-## Packaging
-
-Tagged releases (`v*.*.*`) build both an AlmaLinux 9 RPM and an Ubuntu
-`.deb` in GitHub Actions and attach them to the GitHub release. Locally:
-
-### AlmaLinux / RHEL 9 RPM
-
-```
-make install-build-deps   # one-time, needs sudo
-make rpm                  # -> .rpmbuild/RPMS/x86_64/kmsrdp-*.rpm
+# RPM (Alma/RHEL 9)
+make install-build-deps && make rpm
 sudo dnf install .rpmbuild/RPMS/x86_64/kmsrdp-*.rpm
-```
 
-`make rpm`/`make srpm` generate both the source archive and a vendored Rust
-dependency archive from the current checkout. The subsequent `rpmbuild`
-step therefore needs no network access.
-
-Other targets: `make srpm` (source RPM only), `make lint` (rpmlint the
-spec), `make clean`.
-
-### Debian / Ubuntu (.deb)
-
-Needs a recent Rust toolchain (edition 2024; use [rustup](https://rustup.rs/)
-if the distro `cargo`/`rustc` is older):
-
-```
-make install-deb-build-deps   # one-time, needs sudo
-make deb                      # -> .debbuild/kmsrdp_*.deb
+# .deb (Debian/Ubuntu; needs a recent rustup toolchain)
+make install-deb-build-deps && make deb
 sudo apt install ./.debbuild/kmsrdp_*.deb
 ```
 
-`make deb` vendors crates into `.debbuild/`, then runs `dpkg-buildpackage`
-offline (`-d` so a rustup toolchain can satisfy Build-Depends). The package
-layout matches the RPM (binary under `/usr/libexec/kmsrdp/`, user and system
-systemd units, env examples, `setcap` in `postinst`).
+## systemd
 
-## Installing as a service
+**User unit** (one graphical login):
 
-Two install options, pick one: a `--user` unit tied to a single login
-(below), or a root unit that follows whichever session is active
-(further down).
-
-### systemd --user service
-
-Installing the RPM or `.deb` places `dist/kmsrdp.service` and
-`dist/kmsrdp.env.example` under `/usr/lib/systemd/user/` and
-`/usr/share/doc/kmsrdp/`, and runs `setcap` on the binary automatically
-(package post-install). Building from source instead, copy those two files into
-place yourself and run the `setcap` command from "Running" above. Either
-way, then:
-
-```
+```bash
 mkdir -p ~/.config/kmsrdp
 cp /usr/share/doc/kmsrdp/kmsrdp.env.example ~/.config/kmsrdp/kmsrdp.env
-chmod 600 ~/.config/kmsrdp/kmsrdp.env
-$EDITOR ~/.config/kmsrdp/kmsrdp.env  # set KMSRDP_USER / KMSRDP_PASSWORD
+chmod 600 ~/.config/kmsrdp/kmsrdp.env   # set KMSRDP_USER / KMSRDP_PASSWORD
 systemctl --user enable --now kmsrdp.service
 ```
 
-Verified end-to-end on a GDM/GNOME (X11) AlmaLinux 9 session: the
-`--user` manager there already imports `DISPLAY`/`XAUTHORITY` into its
-activation environment, so the unit needs no extra environment-import
-glue. Other session managers may need one (e.g. an XDG autostart entry
-or session-startup script that runs `systemctl --user import-environment
-DISPLAY XAUTHORITY`).
+**System unit** (follows the active login via logind):
 
-### Root system service
-
-Needs no `setcap`/environment-import glue at all: the built-in logind
-D-Bus session watcher finds whichever graphical session is currently
-active and follows it across logout/login and user switches.
-
-Installing the RPM places `dist/kmsrdp-system.service` (as
-`kmsrdp.service`) and `dist/kmsrdp-system.env.example` under
-`/usr/lib/systemd/system/` and `/usr/share/doc/kmsrdp/`. Building from
-source instead, copy those two files into place yourself. Either way,
-then:
-
+```bash
+sudo mkdir -p /etc/kmsrdp
+sudo cp /usr/share/doc/kmsrdp/kmsrdp-system.env.example /etc/kmsrdp/kmsrdp.env
+sudo chmod 600 /etc/kmsrdp/kmsrdp.env   # RDP login credentials only
+sudo systemctl enable --now kmsrdp.service
 ```
-mkdir -p /etc/kmsrdp
-cp /usr/share/doc/kmsrdp/kmsrdp-system.env.example /etc/kmsrdp/kmsrdp.env
-chmod 600 /etc/kmsrdp/kmsrdp.env
-$EDITOR /etc/kmsrdp/kmsrdp.env  # set KMSRDP_USER / KMSRDP_PASSWORD
-systemctl enable --now kmsrdp.service
-```
-
-`KMSRDP_USER`/`KMSRDP_PASSWORD` here are the RDP login credentials
-presented to the RDP client - unrelated to which Linux account's screen
-gets captured, since that's auto-detected via logind.
 
 ## Security
 
-Running kmsrdp grants remote clients access equivalent to someone sitting
-at the machine: they can view the screen, inject input, and exchange
-clipboard and audio data. Use a strong unique password, keep the environment
-file mode at `0600`, restrict network access, and stop the service when it
-is not needed.
-
-If you discover a security vulnerability, please report it privately
-through GitHub's security advisory interface rather than opening a public
-issue. See [SECURITY.md](SECURITY.md) for the reporting policy.
+Treat a connected client like a person at the console. Use a strong password,
+keep env files mode `0600`, and restrict who can reach port 3389. Report
+vulnerabilities via GitHub Security Advisories — see [SECURITY.md](SECURITY.md).
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT License ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
+Apache-2.0 or MIT, at your option ([LICENSE-APACHE](LICENSE-APACHE),
+[LICENSE-MIT](LICENSE-MIT)).

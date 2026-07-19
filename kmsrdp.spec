@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.14
+Version:        0.1.15
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -97,6 +97,9 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Sun Jul 19 2026 kmsrdp contributors <noreply@example.com> - 0.1.15-1
+- Shorten README and correct shared-clipboard description
+
 * Sun Jul 19 2026 kmsrdp contributors <noreply@example.com> - 0.1.14-1
 - Add Debian/Ubuntu .deb packaging and CI release artifact
 
