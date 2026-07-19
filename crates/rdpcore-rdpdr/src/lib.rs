@@ -27,8 +27,8 @@ pub mod diagnostic;
 
 use std::collections::HashMap;
 
-use rdpcore_pdu::mcs::SendData;
-use rdpcore_pdu::{DecodeError, svc, x224};
+use rdpcore_pdu::svc::wrap_indication;
+use rdpcore_pdu::{DecodeError, svc};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Arbitrary, fixed - the client only ever echoes this back
@@ -437,23 +437,6 @@ impl RdpdrChannel {
     fn wrap(&self, data: Vec<u8>) -> Vec<Vec<u8>> {
         wrap_indication(self.user_channel_id, self.channel_id, data)
     }
-}
-
-fn wrap_indication(initiator: u16, channel_id: u16, data: Vec<u8>) -> Vec<Vec<u8>> {
-    svc::chunkify(&data)
-        .into_iter()
-        .map(|chunk| {
-            x224::wrap_data(
-                &SendData {
-                    initiator,
-                    channel_id,
-                    data: chunk,
-                    complete: true,
-                }
-                .encode_indication(),
-            )
-        })
-        .collect()
 }
 
 #[cfg(test)]

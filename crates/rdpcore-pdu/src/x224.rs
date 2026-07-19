@@ -1,10 +1,6 @@
-//! X.224 Connection Request / Connection Confirm, carrying the RDP
-//! Negotiation Request/Response/Failure structures used to pick a security
-//! protocol (MS-RDPBCGR 2.2.1.1 / 2.2.1.2).
-//!
-//! Every other TPDU type (Data, Disconnect, ...) belongs to later phases;
-//! this module only covers what's needed to complete the initial X.224
-//! exchange.
+//! X.224 Connection Request / Connection Confirm (with RDP Negotiation
+//! Request/Response/Failure) plus Data TPDU helpers used once the session
+//! is past the initial cleartext exchange (MS-RDPBCGR 2.2.1.1 / 2.2.1.2).
 
 use crate::DecodeError;
 use crate::cursor::{ReadCursor, WriteBuf};

@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.12
+Version:        0.1.13
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -97,6 +97,10 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Sun Jul 19 2026 kmsrdp contributors <noreply@example.com> - 0.1.13-1
+- Share wrap_indication in rdpcore-pdu; unify FUSE directory enumeration
+- Refresh stale Phase/later-phase comments (FUSE, DVC, scheduler, RDPDR)
+
 * Sun Jul 19 2026 kmsrdp contributors <noreply@example.com> - 0.1.12-1
 - Narrow tokio features; share one clipboard poller across RDP connections
 - Disable arboard image-data by default; gate RDPDR diagnostic and DVC echo behind features

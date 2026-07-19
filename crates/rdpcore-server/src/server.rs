@@ -951,9 +951,8 @@ fn flush_pending_resize_bitmap(
 /// `write_all`): first tiled into `TILE_SIZE`-square rectangles (so every
 /// `TS_BITMAP_DATA.bitmapLength` fits in 16 bits), then the combined
 /// encoded bytes are fragmented at `MAX_FASTPATH_CHUNK_SIZE` - each
-/// fragment is its own PDU/write rather than bundled, matching how the
-/// phase-2 scheduler will treat each fragment as its own schedulable
-/// `Frame`.
+/// fragment is its own PDU/write rather than bundled, matching how
+/// [`rdpcore_transport`] schedules each fragment as its own `Frame`.
 fn encode_bitmap_update(bitmap: &BitmapUpdate) -> Vec<Vec<u8>> {
     let width = bitmap.width.get();
     let height = bitmap.height.get();

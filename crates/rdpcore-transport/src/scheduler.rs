@@ -8,27 +8,27 @@ use std::collections::VecDeque;
 
 /// Identifies a channel purely for the scheduler's bookkeeping -
 /// independent of the wire-level MCS channel ID numbering, so dynamic
-/// virtual channel sub-IDs (a later phase) and static channels can share
-/// one enum here without the scheduler needing to know DVC exists.
+/// virtual channels (multiplexed under `"drdynvc"`) and static channels
+/// can share one enum here without the scheduler needing DVC details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChannelKey {
     /// The main graphics + input channel.
     Io,
     /// A static virtual channel, keyed by its negotiated MCS channel ID
-    /// (e.g. rdpsnd, cliprdr).
+    /// (e.g. rdpsnd, cliprdr, rdpdr).
     Static(u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Priority {
-    /// Small, real-time-sensitive data - audio wave chunks today, future
-    /// audio-input. Always fully drained before any `Bulk` channel gets a
+    /// Small, real-time-sensitive data — audio wave chunks, resize /
+    /// control PDUs. Always fully drained before any `Bulk` channel gets a
     /// turn.
     Latency,
-    /// Large, throughput-oriented data - graphics today; future rdpdr
-    /// file transfers, cliprdr paste of a big clipboard blob. Serviced one
-    /// frame at a time, round-robin across channels, only when no
-    /// `Latency` channel has anything pending.
+    /// Large, throughput-oriented data — graphics tiles, cliprdr paste of
+    /// a big clipboard blob, and (today) RDPDR I/O when marked Latency by
+    /// the server loop. Serviced one frame at a time, round-robin across
+    /// channels, only when no `Latency` channel has anything pending.
     Bulk,
 }
 
