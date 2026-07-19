@@ -45,6 +45,7 @@ jobs:
           restore-keys: ubuntu24-cargo-
 
       - name: Build .deb
+        shell: bash
         run: |
           source "${HOME}/.cargo/env"
           make deb
