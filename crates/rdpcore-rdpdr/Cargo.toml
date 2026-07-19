@@ -8,3 +8,8 @@ description = "From-scratch MS-RDPEFS (RDPDR) device redirection, drive (filesys
 [dependencies]
 rdpcore-pdu = { path = "../rdpcore-pdu" }
 tokio = { version = "1.52.3", features = ["sync"] }
+
+[features]
+default = []
+diagnostic = []
+

@@ -19,9 +19,11 @@
 //! consumers (FUSE) also expose commands via [`DriveConsumer::poll_commands`]
 //! and wake the connection loop through the factory-supplied sender.
 
-pub mod diagnostic;
 pub mod irp;
 pub mod pdu;
+
+#[cfg(feature = "diagnostic")]
+pub mod diagnostic;
 
 use std::collections::HashMap;
 

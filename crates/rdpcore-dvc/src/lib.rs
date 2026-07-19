@@ -3,11 +3,11 @@
 //! channels on demand, and reassembles each channel's Data/DataFirst
 //! fragments before handing complete payloads to a [`DvcHandler`].
 //!
-//! This crate is scaffolding: no real feature (audio input, RDPDR) is
-//! built on it yet - `echo` is a trivial loopback channel used only to
-//! smoke-test that the transport itself works before something real
-//! depends on it.
+//! Production handlers (e.g. AUDIO_INPUT via `rdpcore-rdpeai`) register
+//! through [`DvcMux::register_channel`]. The optional `echo` feature
+//! provides a loopback handler for transport smoke tests only.
 
+#[cfg(feature = "echo")]
 pub mod echo;
 pub mod pdu;
 

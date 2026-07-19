@@ -7,7 +7,11 @@
 //! environment, which [`crate::session_watcher`] keeps up-to-date.  When the
 //! active session changes the polling watcher resets its state so the next
 //! poll creates a fresh arboard connection to the new session.
+//!
+//! Polling is process-wide: one watcher fans out format advertisements to
+//! every live RDP connection, so N sessions do not mean N clipboard polls.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rdpcore_cliprdr::pdu::CF_UNICODETEXT;
@@ -32,44 +36,44 @@ fn set_local_text(text: String) {
 
 fn advertise_local_text(sender: &UnboundedSender<ClipboardMessage>) -> bool {
     if matches!(local_text(), Some(t) if !t.is_empty()) {
-        return sender
-            .send(ClipboardMessage::SendInitiateCopy(vec![
-                ClipboardFormat::unicode_text(),
-            ]))
-            .is_ok();
+        return advertise_unicode_formats(sender);
     }
     true
 }
 
-/// Polls the local clipboard for changes (no notify API in `arboard`) and
-/// advertises new text content to the remote as it appears.
-///
-/// Reacts to session changes by resetting state, forcing a re-advertisement
-/// with the new session's clipboard once it reconnects. Stops when the
-/// connection's sender is dropped.
-fn spawn_local_clipboard_watcher(
-    sender: UnboundedSender<ClipboardMessage>,
+fn advertise_unicode_formats(sender: &UnboundedSender<ClipboardMessage>) -> bool {
+    sender
+        .send(ClipboardMessage::SendInitiateCopy(vec![
+            ClipboardFormat::unicode_text(),
+        ]))
+        .is_ok()
+}
+
+/// Process-wide poll of the local clipboard. Subscribers are per-connection
+/// CLIPRDR senders; closed ones are pruned each tick. Idle (no subscribers)
+/// skips `spawn_blocking` so disconnect leaves almost no clipboard cost.
+fn spawn_shared_clipboard_watcher(
+    subscribers: Arc<Mutex<Vec<UnboundedSender<ClipboardMessage>>>>,
     mut session_rx: watch::Receiver<Option<Session>>,
 ) {
     tokio::spawn(async move {
         let mut last = local_text();
         loop {
-            // Exit as soon as the connection drops its receiver. Previously we
-            // only noticed on a failed send (clipboard text change), so after
-            // Guacamole disconnect the watcher kept spawning blocking polls.
-            if sender.is_closed() {
-                break;
-            }
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(750)) => {
-                    if sender.is_closed() {
-                        break;
+                    let any = {
+                        let mut subs = subscribers.lock().unwrap();
+                        subs.retain(|s| !s.is_closed());
+                        !subs.is_empty()
+                    };
+                    if !any {
+                        continue;
                     }
                     let current = tokio::task::spawn_blocking(local_text).await.unwrap_or(None);
-                    if current != last && matches!(&current, Some(t) if !t.is_empty())
-                        && !advertise_local_text(&sender) {
-                            break;
-                        }
+                    if current != last && matches!(&current, Some(t) if !t.is_empty()) {
+                        let mut subs = subscribers.lock().unwrap();
+                        subs.retain(advertise_unicode_formats);
+                    }
                     last = current;
                 }
                 changed = session_rx.changed() => {
@@ -85,16 +89,17 @@ fn spawn_local_clipboard_watcher(
     });
 }
 
-/// Stateless factory: each connection gets its own backend, sender, and
-/// clipboard watcher.
+/// Builds per-connection backends that share one process-wide clipboard poller.
 #[derive(Clone)]
 pub struct LocalClipboardFactory {
-    session_rx: watch::Receiver<Option<Session>>,
+    subscribers: Arc<Mutex<Vec<UnboundedSender<ClipboardMessage>>>>,
 }
 
 impl LocalClipboardFactory {
     pub fn new(session_rx: watch::Receiver<Option<Session>>) -> Self {
-        Self { session_rx }
+        let subscribers = Arc::new(Mutex::new(Vec::new()));
+        spawn_shared_clipboard_watcher(Arc::clone(&subscribers), session_rx);
+        Self { subscribers }
     }
 }
 
@@ -103,7 +108,7 @@ impl CliprdrBackendFactory for LocalClipboardFactory {
         &self,
         sender: UnboundedSender<ClipboardMessage>,
     ) -> Box<dyn CliprdrBackend> {
-        spawn_local_clipboard_watcher(sender.clone(), self.session_rx.clone());
+        self.subscribers.lock().unwrap().push(sender.clone());
         Box::new(LocalClipboardBackend {
             sender,
             remote_has_text: false,

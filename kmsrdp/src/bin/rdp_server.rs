@@ -15,7 +15,8 @@
 //! session.  Existing RDP connections are not dropped.
 //!
 //! Concurrent clients share one DRM capture loop ([`DisplayHub`]) and one
-//! uinput device ([`SharedInput`]); audio and clipboard are per-connection.
+//! uinput device ([`SharedInput`]); audio is per-connection. Clipboard
+//! backends are per-connection but share one process-wide local poller.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -26,7 +27,6 @@ use kmsrdp::audio_input::VirtualMicFactory;
 use kmsrdp::capture;
 use kmsrdp::clipboard::LocalClipboardFactory;
 use kmsrdp::display_hub::{Display, DisplayHub, MouseScale};
-use kmsrdp::rdpdr_diagnostic::DiagnosticDriveFactory;
 use kmsrdp::rdpdr_fuse::FuseDriveFactory;
 use kmsrdp::tls;
 use kmsrdp::uinput::{self, VirtualInput};
@@ -174,13 +174,27 @@ async fn main() -> Result<()> {
         x11_typer: X11UnicodeTyper::new(session_rx.clone()),
     });
 
-    let drive_factory: Box<dyn rdpcore_rdpdr::DriveConsumerFactory> =
-        if std::env::var_os("KMSRDP_RDPDR_DIAGNOSTIC").is_some() {
-            println!("kmsrdp: RDPDR diagnostic self-test enabled (KMSRDP_RDPDR_DIAGNOSTIC)");
-            Box::new(DiagnosticDriveFactory)
-        } else {
+    let drive_factory: Box<dyn rdpcore_rdpdr::DriveConsumerFactory> = {
+        #[cfg(feature = "rdpdr-diagnostic")]
+        {
+            if std::env::var_os("KMSRDP_RDPDR_DIAGNOSTIC").is_some() {
+                println!("kmsrdp: RDPDR diagnostic self-test enabled (KMSRDP_RDPDR_DIAGNOSTIC)");
+                Box::new(kmsrdp::rdpdr_diagnostic::DiagnosticDriveFactory)
+            } else {
+                Box::new(FuseDriveFactory::new(session_rx.clone()))
+            }
+        }
+        #[cfg(not(feature = "rdpdr-diagnostic"))]
+        {
+            if std::env::var_os("KMSRDP_RDPDR_DIAGNOSTIC").is_some() {
+                eprintln!(
+                    "kmsrdp: KMSRDP_RDPDR_DIAGNOSTIC is set but this binary was built without \
+                     the rdpdr-diagnostic feature; using FUSE drives"
+                );
+            }
             Box::new(FuseDriveFactory::new(session_rx.clone()))
-        };
+        }
+    };
 
     let server: RdpServer = RdpServer::builder()
         .with_listener(listener)

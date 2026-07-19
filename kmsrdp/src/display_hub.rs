@@ -71,7 +71,15 @@ impl DisplayHub {
     }
 
     async fn run_capture_loop(self: Arc<Self>, mut capturer: capture::Capturer) {
-        let mut previous: Option<capture::RawFrame> = None;
+        /// Prior frame pixels shared with `latest_full` via [`Arc`] so the
+        /// dirty-rect pass does not need a second framebuffer copy.
+        struct PrevFrame {
+            width: u32,
+            height: u32,
+            stride: usize,
+            data: Arc<[u8]>,
+        }
+        let mut previous: Option<PrevFrame> = None;
         let mut negotiated_size = *self.size.lock().unwrap();
         loop {
             let task = tokio::task::spawn_blocking(move || {
@@ -139,13 +147,14 @@ impl DisplayHub {
                         continue;
                     };
 
+                    let data: Arc<[u8]> = Arc::from(raw.data);
                     let full = BitmapUpdate {
                         x: 0,
                         y: 0,
                         width,
                         height,
                         format: PixelFormat::BgrX32,
-                        data: raw.data.clone(),
+                        data: Arc::clone(&data),
                         stride,
                     };
 
@@ -157,9 +166,9 @@ impl DisplayHub {
                         {
                             coalesce_dirty_rects(
                                 find_dirty_rects(
-                                    &prev.data,
+                                    prev.data.as_ref(),
                                     prev.stride,
-                                    &raw.data,
+                                    data.as_ref(),
                                     raw.stride,
                                     raw.width as usize,
                                     raw.height as usize,
@@ -179,8 +188,16 @@ impl DisplayHub {
                     // frame while the console update itself was among the
                     // dropped messages — then a static console produces no
                     // further dirty rects and the client stays stuck forever.
+                    //
+                    // `BitmapUpdate::data` is `Arc<[u8]>`, so this clone is
+                    // cheap (no framebuffer memcpy).
                     *self.latest_full.lock().unwrap() = Some(full.clone());
-                    previous = Some(raw);
+                    previous = Some(PrevFrame {
+                        width: raw.width,
+                        height: raw.height,
+                        stride: raw.stride,
+                        data,
+                    });
 
                     for rect in &dirty_rects {
                         let (Some(w), Some(h)) = (
