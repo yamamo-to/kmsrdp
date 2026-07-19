@@ -363,31 +363,43 @@ impl Bridge {
             FILE_DIRECTORY_FILE,
         )?;
         let file_id = reply.file_id;
+        let result = self.enumerate_directory(device_id, parent, file_id);
+        let _ = self.submit_close(device_id, file_id);
+        Ok(result?
+            .into_iter()
+            .map(|e| e.file_name.trim_end_matches('\0').to_owned())
+            .collect())
+    }
+
+    /// QueryDirectory loop shared by [`Self::refresh_dir`] (lookup/getattr
+    /// cache fill) and FUSE `readdir` (already holds an open `file_id`).
+    fn enumerate_directory(
+        &self,
+        device_id: u32,
+        parent: &str,
+        file_id: u32,
+    ) -> Result<Vec<DirectoryEntry>, Errno> {
         let pattern = if parent == "\\" {
             "\\*".to_owned()
         } else {
             format!("{parent}\\*")
         };
-        let mut names = Vec::new();
+        let mut entries = Vec::new();
         let mut first = Some(pattern);
         loop {
             match self.submit_query_dir(device_id, file_id, first.take()) {
                 Ok(Some(entry)) => {
-                    let name = entry.file_name.trim_end_matches('\0').to_owned();
                     self.cache_entry(device_id, parent, &entry);
+                    let name = entry.file_name.trim_end_matches('\0');
                     if !name.is_empty() && name != "." && name != ".." {
-                        names.push(name);
+                        entries.push(entry);
                     }
                 }
                 Ok(None) => break,
-                Err(e) => {
-                    let _ = self.submit_close(device_id, file_id);
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         }
-        let _ = self.submit_close(device_id, file_id);
-        Ok(names)
+        Ok(entries)
     }
 
     fn lookup_child(&self, device_id: u32, parent: &str, name: &str) -> Result<FileAttr, Errno> {
@@ -512,36 +524,24 @@ impl Filesystem for FuseFs {
 
         // Always re-enumerate from the start into a local list; FUSE offset
         // is an opaque cursor we treat as 1-based entry index.
-        let mut entries = Vec::new();
-        let pattern = if path == "\\" {
-            "\\*".to_owned()
-        } else {
-            format!("{path}\\*")
-        };
-        let mut first = Some(pattern);
-        loop {
-            match bridge.submit_query_dir(device_id, file_id, first.take()) {
-                Ok(Some(entry)) => {
-                    bridge.cache_entry(device_id, &path, &entry);
-                    let name = entry.file_name.trim_end_matches('\0').to_owned();
-                    if name.is_empty() || name == "." || name == ".." {
-                        continue;
-                    }
-                    let child = join_win(&path, &name);
-                    let ino = bridge.inode_for(device_id, &child);
-                    let kind = if entry.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    entries.push((ino, kind, name));
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    reply.error(e);
-                    return;
-                }
+        let listed = match bridge.enumerate_directory(device_id, &path, file_id) {
+            Ok(entries) => entries,
+            Err(e) => {
+                reply.error(e);
+                return;
             }
+        };
+        let mut entries = Vec::with_capacity(listed.len());
+        for entry in listed {
+            let name = entry.file_name.trim_end_matches('\0').to_owned();
+            let child = join_win(&path, &name);
+            let child_ino = bridge.inode_for(device_id, &child);
+            let kind = if entry.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
+            entries.push((child_ino, kind, name));
         }
 
         let mut next = offset;

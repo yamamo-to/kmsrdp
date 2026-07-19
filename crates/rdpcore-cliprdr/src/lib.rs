@@ -4,8 +4,8 @@
 
 pub mod pdu;
 
-use rdpcore_pdu::mcs::SendData;
-use rdpcore_pdu::{DecodeError, svc, x224};
+use rdpcore_pdu::svc::wrap_indication;
+use rdpcore_pdu::{DecodeError, svc};
 
 /// One clipboard format, identified by its standard numeric ID (this
 /// crate only ever produces/expects `pdu::CF_UNICODETEXT`).
@@ -203,23 +203,6 @@ impl CliprdrChannel {
         };
         wrap_indication(self.user_channel_id, self.channel_id, body)
     }
-}
-
-fn wrap_indication(initiator: u16, channel_id: u16, data: Vec<u8>) -> Vec<Vec<u8>> {
-    svc::chunkify(&data)
-        .into_iter()
-        .map(|chunk| {
-            x224::wrap_data(
-                &SendData {
-                    initiator,
-                    channel_id,
-                    data: chunk,
-                    complete: true,
-                }
-                .encode_indication(),
-            )
-        })
-        .collect()
 }
 
 #[cfg(test)]

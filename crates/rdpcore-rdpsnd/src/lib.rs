@@ -7,8 +7,7 @@
 pub mod pdu;
 
 use rdpcore_pdu::DecodeError;
-use rdpcore_pdu::mcs::SendData;
-use rdpcore_pdu::x224;
+use rdpcore_pdu::svc::wrap_indication;
 
 pub trait RdpsndError: std::error::Error + Send {}
 impl<T: std::error::Error + Send> RdpsndError for T {}
@@ -154,27 +153,6 @@ impl Drop for RdpsndChannel {
     fn drop(&mut self) {
         self.handler.stop();
     }
-}
-
-/// Applies static-virtual-channel chunking (MS-RDPBCGR 2.2.6.1) to `data`,
-/// then wraps each resulting chunk as its own MCS Send Data Indication +
-/// X.224 Data TPDU - the full framing stack a real client expects for
-/// static channel traffic, in wire order, ready to write one after another.
-fn wrap_indication(initiator: u16, channel_id: u16, data: Vec<u8>) -> Vec<Vec<u8>> {
-    rdpcore_pdu::svc::chunkify(&data)
-        .into_iter()
-        .map(|chunk| {
-            x224::wrap_data(
-                &SendData {
-                    initiator,
-                    channel_id,
-                    data: chunk,
-                    complete: true,
-                }
-                .encode_indication(),
-            )
-        })
-        .collect()
 }
 
 #[cfg(test)]

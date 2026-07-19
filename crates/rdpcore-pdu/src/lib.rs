@@ -3,9 +3,8 @@
 //! layer meant to be exhaustively unit-tested (and, eventually, fuzzed)
 //! against real captured client/server bytes.
 //!
-//! Phase 0 scope: TPKT framing (`tpkt`) and the X.224 Connection
-//! Request/Confirm exchange (`x224`), which is the first thing a client and
-//! this server exchange, in cleartext, before any TLS upgrade.
+//! Covers TPKT/X.224, MCS, GCC, capabilities, FastPath, static-channel
+//! SVC framing, and related codecs used by the rest of the stack.
 
 pub mod ber;
 pub mod capability_sets;

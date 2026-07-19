@@ -414,9 +414,8 @@ impl MultiFragmentUpdateCapability {
     }
 }
 
-/// Always advertises zero codecs - this server only ever sends raw/
-/// uncompressed bitmap updates (phase 1; a real codec is a later,
-/// additive phase).
+/// Always advertises zero codecs - this server only ever sends raw /
+/// uncompressed bitmap updates (compressed codecs would be additive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BitmapCodecsCapability;
 

@@ -11,8 +11,13 @@
 pub mod echo;
 pub mod pdu;
 
+use rdpcore_pdu::svc::wrap_indication;
+use rdpcore_pdu::{DecodeError, svc};
+
+#[cfg(test)]
 use rdpcore_pdu::mcs::SendData;
-use rdpcore_pdu::{DecodeError, svc, x224};
+#[cfg(test)]
+use rdpcore_pdu::x224;
 
 /// One dynamic channel's behavior. `on_open`/`on_data` return payloads to
 /// send in response, if any - [`DvcMux`] takes care of DVC-layer framing
@@ -210,23 +215,6 @@ impl DvcMux {
             .flat_map(|dvc_pdu| wrap_indication(self.user_channel_id, self.channel_id, dvc_pdu))
             .collect()
     }
-}
-
-fn wrap_indication(initiator: u16, channel_id: u16, data: Vec<u8>) -> Vec<Vec<u8>> {
-    svc::chunkify(&data)
-        .into_iter()
-        .map(|chunk| {
-            x224::wrap_data(
-                &SendData {
-                    initiator,
-                    channel_id,
-                    data: chunk,
-                    complete: true,
-                }
-                .encode_indication(),
-            )
-        })
-        .collect()
 }
 
 #[cfg(test)]

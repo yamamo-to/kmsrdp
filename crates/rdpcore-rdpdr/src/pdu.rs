@@ -1,6 +1,6 @@
-//! MS-RDPEFS (RDPDR) core header and connection-sequence PDUs: filesystem
-//! ("drive") devices only, no printer/port/smartcard. Every message shares
-//! a 4-byte `RDPDR_HEADER` (Component, PacketId, both u16 LE) riding as the
+//! MS-RDPEFS (RDPDR) core header and connection-sequence PDUs for
+//! filesystem ("drive") and printer devices. Every message shares a
+//! 4-byte `RDPDR_HEADER` (Component, PacketId, both u16 LE) riding as the
 //! whole static-channel payload (after SVC chunking, see
 //! `rdpcore_pdu::svc`) over `"rdpdr"`.
 //!

@@ -16,6 +16,8 @@
 
 use crate::DecodeError;
 use crate::cursor::{ReadCursor, WriteBuf};
+use crate::mcs::SendData;
+use crate::x224;
 
 pub const CHANNEL_FLAG_FIRST: u32 = 0x0000_0001;
 pub const CHANNEL_FLAG_LAST: u32 = 0x0000_0002;
@@ -25,6 +27,27 @@ pub const CHANNEL_FLAG_LAST: u32 = 0x0000_0002;
 /// capability set (this one doesn't, yet - see
 /// `rdpcore_connector`'s `VirtualChannelCapability` usage).
 pub const DEFAULT_CHUNK_LENGTH: usize = 1600;
+
+/// Applies static-virtual-channel chunking (MS-RDPBCGR 2.2.6.1) to `data`,
+/// then wraps each resulting chunk as its own MCS Send Data Indication +
+/// X.224 Data TPDU - the full framing stack a real client expects for
+/// static channel traffic, in wire order, ready to write one after another.
+pub fn wrap_indication(initiator: u16, channel_id: u16, data: Vec<u8>) -> Vec<Vec<u8>> {
+    chunkify(&data)
+        .into_iter()
+        .map(|chunk| {
+            x224::wrap_data(
+                &SendData {
+                    initiator,
+                    channel_id,
+                    data: chunk,
+                    complete: true,
+                }
+                .encode_indication(),
+            )
+        })
+        .collect()
+}
 
 /// Splits `data` into one-or-more Channel-PDU-Header-prefixed chunks, each
 /// ready to become its own MCS Send Data Request/Indication payload.

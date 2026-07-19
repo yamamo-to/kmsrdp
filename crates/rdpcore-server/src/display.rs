@@ -13,10 +13,9 @@ pub struct DesktopSize {
     pub height: u16,
 }
 
-/// Phase 1 only ever produces raw BGRX8888 - the same in-memory layout
+/// Currently only raw BGRX8888 - the same in-memory layout
 /// `kmsrdp::capture` already reads straight off DRM/KMS, so no per-pixel
-/// conversion is needed on the way in (a real codec is a later, additive
-/// phase - see the crate's design notes).
+/// conversion is needed on the way in (compressed codecs would be additive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
     BgrX32,
