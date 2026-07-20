@@ -1142,6 +1142,7 @@ fn encode_bitmap_update(
     (batches, stats)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_bitmap_rect(
     bitmap: &BitmapUpdate,
     row_bytes: usize,

@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn solid_red_tile_has_header_and_body() {
-        let data = vec![0u8, 0, 255, 0xFF].repeat(4);
+        let data = [0u8, 0, 255, 0xFF].repeat(4);
         let out = encode(&data, 2, 2, 4, 3);
         assert!(out.len() >= 20);
         assert_eq!(out[16], 3);

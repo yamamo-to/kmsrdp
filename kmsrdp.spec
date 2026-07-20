@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.21
+Version:        0.1.22
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -97,6 +97,9 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Mon Jul 20 2026 kmsrdp contributors <noreply@example.com> - 0.1.22-1
+- Fix clippy warnings (useless_vec, too_many_arguments) for CI
+
 * Mon Jul 20 2026 kmsrdp contributors <noreply@example.com> - 0.1.21-1
 - Apply rustfmt fixes for CI
 
