@@ -1171,6 +1171,7 @@ fn push_bitmap_rect(
             usize::from(tile_height),
         );
         if compressed.len() < tile_data.len() {
+            // Bytes, not pixels — see BitmapRect docs (MS-RDPBCGR vs mstsc).
             (compressed, Some(tile_width * 4))
         } else {
             (tile_data, None)

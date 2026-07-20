@@ -323,8 +323,16 @@ const BITMAP_COMPRESSION: u16 = 0x0001;
 /// `Some(scan_width_bytes)` when `data` is an RDP6-Planar-compressed
 /// stream (`crate::rdp6::encode`) - `BITMAP_COMPRESSION` is set and an
 /// 8-byte `bitmapComprHdr` precedes `data` (MS-RDPBCGR
-/// 2.2.9.1.1.3.1.2.3). `cbScanWidth` is the scan line width in **bytes**
-/// (must be divisible by 4), typically `width * bytes_per_pixel`.
+/// 2.2.9.1.1.3.1.2.3).
+///
+/// # `cbScanWidth` units (spec vs wire)
+///
+/// MS-RDPBCGR §2.2.9.1.1.3.1.2.3 defines `cbScanWidth` as the bitmap width
+/// **in pixels** (must be divisible by 4). On the wire, Windows mstsc and
+/// FreeRDP's shadow server treat it as the scan-line stride **in bytes**
+/// (`width * bytes_per_pixel`). Sending the pixel count breaks mstsc after
+/// handshake; this field therefore carries **bytes**, matching that de
+/// facto behavior rather than the written wording.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitmapRect {
     pub dest_left: u16,
