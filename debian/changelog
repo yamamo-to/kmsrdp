@@ -1,3 +1,9 @@
+kmsrdp (0.1.21) unstable; urgency=medium
+
+  * Apply rustfmt fixes for CI.
+
+ -- kmsrdp contributors <noreply@example.com>  Mon, 20 Jul 2026 23:49:00 +0900
+
 kmsrdp (0.1.20) unstable; urgency=medium
 
   * Fix RDP6 cbScanWidth encoding so mstsc displays after handshake.

@@ -1230,9 +1230,7 @@ fn encode_nscodec_update(
 }
 
 fn encode_update_to_wire_frames(update_code: u8, body: &[u8]) -> Vec<Vec<u8>> {
-    let chunks: Vec<&[u8]> = body
-        .chunks(fastpath::MAX_FASTPATH_CHUNK_SIZE)
-        .collect();
+    let chunks: Vec<&[u8]> = body.chunks(fastpath::MAX_FASTPATH_CHUNK_SIZE).collect();
     let count = chunks.len().max(1);
     chunks
         .into_iter()

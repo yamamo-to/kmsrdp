@@ -362,8 +362,7 @@ impl BitmapRect {
                     scan_width_bytes.is_multiple_of(4),
                     "cbScanWidth ({scan_width_bytes}) must be divisible by 4 (MS-RDPBCGR 2.2.9.1.1.3.1.2.3)"
                 );
-                let uncompressed_size =
-                    usize::from(self.height) * usize::from(scan_width_bytes);
+                let uncompressed_size = usize::from(self.height) * usize::from(scan_width_bytes);
                 out.write_u16_le(BITMAP_COMPRESSION);
                 out.write_u16_le(bitmap_length as u16);
                 out.write_u16_le(0); // cbCompFirstRowSize, fixed 0
