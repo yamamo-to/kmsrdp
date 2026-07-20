@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.19
+Version:        0.1.20
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -97,6 +97,9 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Mon Jul 20 2026 kmsrdp contributors <noreply@example.com> - 0.1.20-1
+- Fix RDP6 cbScanWidth encoding so mstsc displays after handshake
+
 * Mon Jul 20 2026 kmsrdp contributors <noreply@example.com> - 0.1.19-1
 - Update README for NSCodec, listen-address config, and limitation accuracy
 

@@ -320,11 +320,11 @@ const BITMAP_COMPRESSION: u16 = 0x0001;
 /// `TS_BITMAP_DATA` convention - get this backwards and the image renders
 /// upside down. `compressed_scan_width`: `None` for raw/uncompressed
 /// `data` (`flags` written as 0, `data.len()` is `bitmapLength` directly);
-/// `Some(scan_width_pixels)` when `data` is an RDP6-Planar-compressed
+/// `Some(scan_width_bytes)` when `data` is an RDP6-Planar-compressed
 /// stream (`crate::rdp6::encode`) - `BITMAP_COMPRESSION` is set and an
 /// 8-byte `bitmapComprHdr` precedes `data` (MS-RDPBCGR
-/// 2.2.9.1.1.3.1.2.3). Per that header, `cbScanWidth` is the bitmap
-/// width in **pixels** (must be divisible by 4), not the byte stride.
+/// 2.2.9.1.1.3.1.2.3). `cbScanWidth` is the scan line width in **bytes**
+/// (must be divisible by 4), typically `width * bytes_per_pixel`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitmapRect {
     pub dest_left: u16,
@@ -349,7 +349,7 @@ impl BitmapRect {
         out.write_u16_le(self.bits_per_pixel);
 
         match self.compressed_scan_width {
-            Some(scan_width_px) => {
+            Some(scan_width_bytes) => {
                 // `bitmapLength` is a 16-bit field, same truncation risk
                 // as the raw path below - compressed tiles are expected
                 // to always be far smaller than the raw source anyway.
@@ -359,17 +359,16 @@ impl BitmapRect {
                     "compressed BitmapRect ({bitmap_length} bytes incl. header) exceeds the 16-bit bitmapLength field"
                 );
                 debug_assert!(
-                    scan_width_px.is_multiple_of(4),
-                    "cbScanWidth ({scan_width_px}) must be divisible by 4 (MS-RDPBCGR 2.2.9.1.1.3.1.2.3)"
+                    scan_width_bytes.is_multiple_of(4),
+                    "cbScanWidth ({scan_width_bytes}) must be divisible by 4 (MS-RDPBCGR 2.2.9.1.1.3.1.2.3)"
                 );
-                let bytes_per_pixel = usize::from(self.bits_per_pixel / 8);
                 let uncompressed_size =
-                    usize::from(self.height) * usize::from(scan_width_px) * bytes_per_pixel;
+                    usize::from(self.height) * usize::from(scan_width_bytes);
                 out.write_u16_le(BITMAP_COMPRESSION);
                 out.write_u16_le(bitmap_length as u16);
                 out.write_u16_le(0); // cbCompFirstRowSize, fixed 0
                 out.write_u16_le(self.data.len() as u16); // cbCompMainBodySize
-                out.write_u16_le(scan_width_px); // cbScanWidth (pixels)
+                out.write_u16_le(scan_width_bytes); // cbScanWidth (bytes)
                 out.write_u16_le(uncompressed_size as u16); // cbUncompressedSize
                 out.write_slice(&self.data);
             }
@@ -587,19 +586,19 @@ mod tests {
                 height: 64,
                 bits_per_pixel: 32,
                 data: compressed_payload.clone(),
-                compressed_scan_width: Some(64), // pixels, not bytes
+                compressed_scan_width: Some(64 * 4), // bytes (cbScanWidth)
             }],
         };
         let encoded = bitmap.encode();
         let decoded = BitmapUpdateData::decode(&encoded).unwrap();
         assert_eq!(decoded, bitmap);
         assert_eq!(decoded.rectangles[0].data, compressed_payload);
-        assert_eq!(decoded.rectangles[0].compressed_scan_width, Some(64));
+        assert_eq!(decoded.rectangles[0].compressed_scan_width, Some(64 * 4));
         // Layout: updateType(2) + count(2) + dest(8) + wh+bpp(6) + flags(2)
         // + bitmapLength(2) + firstRow(2) + mainBody(2) + scanWidth(2)
         // + uncompressedSize(2) = bytes [28..30].
         assert_eq!(&encoded[28..30], &(64u16 * 64 * 4).to_le_bytes());
-        assert_eq!(&encoded[26..28], &64u16.to_le_bytes()); // cbScanWidth in pixels
+        assert_eq!(&encoded[26..28], &(256u16).to_le_bytes()); // cbScanWidth in bytes
     }
 
     #[test]

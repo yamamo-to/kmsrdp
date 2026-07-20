@@ -1170,7 +1170,7 @@ fn push_bitmap_rect(
             usize::from(tile_height),
         );
         if compressed.len() < tile_data.len() {
-            (compressed, Some(tile_width))
+            (compressed, Some(tile_width * 4))
         } else {
             (tile_data, None)
         }

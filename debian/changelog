@@ -1,3 +1,9 @@
+kmsrdp (0.1.20) unstable; urgency=medium
+
+  * Fix RDP6 cbScanWidth encoding so mstsc displays after handshake.
+
+ -- kmsrdp contributors <noreply@example.com>  Mon, 20 Jul 2026 23:46:00 +0900
+
 kmsrdp (0.1.19) unstable; urgency=medium
 
   * Update README for NSCodec, listen-address config, and limitation accuracy.
