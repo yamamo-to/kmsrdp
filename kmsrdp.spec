@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.17
+Version:        0.1.18
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -97,6 +97,9 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Mon Jul 20 2026 kmsrdp contributors <noreply@example.com> - 0.1.18-1
+- Silence rdpcore-server compile warnings for unused channel IDs
+
 * Mon Jul 20 2026 kmsrdp contributors <noreply@example.com> - 0.1.17-1
 - NSCodec SurfaceCommands for macOS Windows App; Mac clipboard startup delay
 

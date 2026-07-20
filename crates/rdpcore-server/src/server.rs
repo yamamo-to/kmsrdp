@@ -454,7 +454,7 @@ impl Session {
                 rdpsnd_audio_rx = Some(rx);
                 Some(channel)
             }
-            (Some(channel_id), None) => None,
+            (Some(_channel_id), None) => None,
             _ => None,
         };
 
@@ -482,7 +482,7 @@ impl Session {
                 cliprdr_event_rx = Some(rx);
                 Some(channel)
             }
-            (Some(channel_id), None) => None,
+            (Some(_channel_id), None) => None,
             _ => None,
         };
 
@@ -568,7 +568,7 @@ impl Session {
                 rdpdr_wake_rx = Some(wake_rx);
                 Some(channel)
             }
-            (Some(channel_id), None) => None,
+            (Some(_channel_id), None) => None,
             _ => None,
         };
 

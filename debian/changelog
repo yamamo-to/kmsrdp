@@ -1,3 +1,9 @@
+kmsrdp (0.1.18) unstable; urgency=medium
+
+  * Silence rdpcore-server compile warnings for unused channel IDs.
+
+ -- kmsrdp contributors <noreply@example.com>  Mon, 20 Jul 2026 21:22:00 +0900
+
 kmsrdp (0.1.17) unstable; urgency=medium
 
   * NSCodec SurfaceCommands for macOS Windows App compatibility and speed.
