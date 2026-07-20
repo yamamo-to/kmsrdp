@@ -1,3 +1,10 @@
+kmsrdp (0.1.17) unstable; urgency=medium
+
+  * NSCodec SurfaceCommands for macOS Windows App compatibility and speed.
+  * Delay first CLIPRDR paste on Mac clients to avoid startup disconnects.
+
+ -- kmsrdp contributors <noreply@example.com>  Mon, 20 Jul 2026 21:10:00 +0900
+
 kmsrdp (0.1.16) unstable; urgency=medium
 
   * Add KMSRDP_BIND and KMSRDP_PORT for listen address and port.

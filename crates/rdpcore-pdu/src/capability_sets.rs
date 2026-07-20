@@ -110,7 +110,13 @@ pub const CAPSET_POINTER: u16 = 0x08;
 pub const CAPSET_INPUT: u16 = 0x0D;
 pub const CAPSET_VIRTUAL_CHANNEL: u16 = 0x14;
 pub const CAPSET_MULTIFRAGMENT_UPDATE: u16 = 0x1A;
+pub const CAPSET_SURFACE_COMMANDS: u16 = 0x1C;
 pub const CAPSET_BITMAP_CODECS: u16 = 0x1D;
+
+/// NSCodec GUID `{CA8D1BB9-000F-154F-589F-AE2D1A87E2D6}` (MS-RDPNSC).
+pub const NSCODEC_GUID: [u8; 16] = [
+    0xB9, 0x1B, 0x8D, 0xCA, 0x0F, 0x00, 0x4F, 0x15, 0x58, 0x9F, 0xAE, 0x2D, 0x1A, 0x87, 0xE2, 0xD6,
+];
 
 /// One entry in a capability-set list, decoded structurally (type + raw
 /// body) without interpreting the body - see module docs for why that's
@@ -210,6 +216,10 @@ pub struct BitmapCapability {
     pub desktop_resize_flag: bool,
 }
 
+/// MS-RDPBCGR 2.2.7.1.2 `drawingFlags` — MUST be set when the server sends
+/// RDP6 planar streams with the NA (no-alpha) bit set (`FormatHeader` 0x30).
+pub const DRAW_ALLOW_SKIP_ALPHA: u8 = 0x08;
+
 impl BitmapCapability {
     pub fn encode_body(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(24);
@@ -223,7 +233,7 @@ impl BitmapCapability {
         out.write_u16_le(self.desktop_resize_flag as u16);
         out.write_u16_le(1); // bitmapCompressionFlag, must be nonzero
         out.write_u8(0); // highColorFlags, hardcoded
-        out.write_u8(0); // drawingFlags
+        out.write_u8(DRAW_ALLOW_SKIP_ALPHA); // drawingFlags
         out.write_u16_le(1); // multipleRectangleSupport, hardcoded
         out.write_u16_le(0); // pad2octets
         out
@@ -414,18 +424,95 @@ impl MultiFragmentUpdateCapability {
     }
 }
 
-/// Always advertises zero codecs - this server only ever sends raw /
-/// uncompressed bitmap updates (compressed codecs would be additive).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct BitmapCodecsCapability;
+/// Advertises NSCodec + SurfaceCommands so macOS Windows App can receive
+/// compressed SurfaceBits updates instead of raw fast-path bitmaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceCommandsCapability;
+
+impl SurfaceCommandsCapability {
+    pub fn encode_body(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8);
+        // SET_SURFACE_BITS | FRAME_MARKER | STREAM_SURFACE_BITS
+        out.write_u32_le(0x02 | 0x10 | 0x40);
+        out.write_u32_le(0);
+        out
+    }
+}
+
+/// Negotiated NSCodec parameters from the client's Confirm Active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NsCodecNegotiated {
+    pub codec_id: u8,
+    pub color_loss_level: u8,
+}
+
+/// Walks the client's Confirm Active capability list and returns NSCodec
+/// parameters when both the client and server support it.
+pub fn parse_client_nscodec(
+    capabilities: &[RawCapabilitySet],
+    server_cll: u8,
+) -> Option<NsCodecNegotiated> {
+    let body = capabilities
+        .iter()
+        .find(|c| c.set_type == CAPSET_BITMAP_CODECS)?
+        .body
+        .as_slice();
+    let mut cursor = ReadCursor::new(body);
+    let codec_count = cursor.read_u8().ok()?;
+    for _ in 0..codec_count {
+        let guid = cursor.read_slice(16).ok()?;
+        if guid != NSCODEC_GUID {
+            let _id = cursor.read_u8().ok()?;
+            let prop_len = cursor.read_u16_le().ok()?;
+            cursor.read_slice(usize::from(prop_len)).ok()?;
+            continue;
+        }
+        let codec_id = cursor.read_u8().ok()?;
+        let prop_len = cursor.read_u16_le().ok()?;
+        if prop_len < 3 {
+            return None;
+        }
+        let _dynamic = cursor.read_u8().ok()?;
+        let _subsampling = cursor.read_u8().ok()?;
+        let client_cll = cursor.read_u8().ok()?.clamp(1, 7);
+        return Some(NsCodecNegotiated {
+            codec_id,
+            color_loss_level: client_cll.min(server_cll.max(1)),
+        });
+    }
+    None
+}
+
+/// Advertises one NSCodec entry (CLL=3) for macOS Windows App compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BitmapCodecsCapability {
+    pub nscodec_id: u8,
+    pub color_loss_level: u8,
+}
+
+impl Default for BitmapCodecsCapability {
+    fn default() -> Self {
+        Self {
+            nscodec_id: 1,
+            color_loss_level: 3,
+        }
+    }
+}
 
 impl BitmapCodecsCapability {
     pub fn encode_body(&self) -> Vec<u8> {
-        // codecCount = 0, plus a trailing pad byte so lengthCapability is
-        // even. MS-RDPBCGR capability sets are conventionally even-sized;
-        // an odd 5-byte CAPSETTYPE_BITMAP_CODECS has been observed to make
-        // mstsc send a malformed follow-up PDU after Demand Active.
-        vec![0, 0]
+        let mut out = Vec::with_capacity(24);
+        out.push(1); // codecCount
+        out.write_slice(&NSCODEC_GUID);
+        out.push(self.nscodec_id);
+        out.write_u16_le(3); // NSCodec property length
+        out.push(1); // dynamic fidelity allowed
+        out.push(1); // subsampling allowed
+        out.push(self.color_loss_level.clamp(1, 7));
+        if !out.len().is_multiple_of(2) {
+            out.push(0);
+        }
+        out
     }
 }
 
@@ -438,6 +525,7 @@ pub struct ServerCapabilities {
     pub input: InputCapability,
     pub virtual_channel: VirtualChannelCapability,
     pub multifragment_update: MultiFragmentUpdateCapability,
+    pub surface_commands: SurfaceCommandsCapability,
     pub bitmap_codecs: BitmapCodecsCapability,
 }
 
@@ -464,6 +552,12 @@ impl ServerCapabilities {
             out,
             CAPSET_MULTIFRAGMENT_UPDATE,
             &self.multifragment_update.encode_body(),
+        );
+        count += 1;
+        write_capset(
+            out,
+            CAPSET_SURFACE_COMMANDS,
+            &self.surface_commands.encode_body(),
         );
         count += 1;
         write_capset(out, CAPSET_BITMAP_CODECS, &self.bitmap_codecs.encode_body());
@@ -620,7 +714,8 @@ mod tests {
             multifragment_update: MultiFragmentUpdateCapability {
                 max_request_size: 8 * 1024 * 1024,
             },
-            bitmap_codecs: BitmapCodecsCapability,
+            surface_commands: SurfaceCommandsCapability,
+            bitmap_codecs: BitmapCodecsCapability::default(),
         }
     }
 
@@ -683,6 +778,7 @@ mod tests {
             cap
         );
         assert_eq!(cap.encode_body().len(), 24);
+        assert_eq!(cap.encode_body()[19], DRAW_ALLOW_SKIP_ALPHA);
     }
 
     #[test]
@@ -739,8 +835,13 @@ mod tests {
     }
 
     #[test]
-    fn bitmap_codecs_zero_count_is_one_byte() {
-        assert_eq!(BitmapCodecsCapability.encode_body(), [0, 0]);
+    fn bitmap_codecs_advertises_nscodec() {
+        let body = BitmapCodecsCapability::default().encode_body();
+        assert_eq!(body[0], 1);
+        assert_eq!(&body[1..17], &NSCODEC_GUID);
+        assert_eq!(body[17], 1); // codec id
+        assert_eq!(body[18..20], [3, 0]); // property length
+        assert_eq!(body[22], 3); // CLL
     }
 
     #[test]
@@ -771,7 +872,7 @@ mod tests {
 
         let confirm = ConfirmActive::decode(&with_originator).unwrap();
         assert_eq!(confirm.share_id, 0x1000);
-        assert_eq!(confirm.capabilities.len(), 8);
+        assert_eq!(confirm.capabilities.len(), 9);
         assert!(
             confirm
                 .capabilities

@@ -16,9 +16,9 @@ pub use rdpcore_pdu::x224::SecurityProtocol;
 
 use rdpcore_pdu::capability_sets::{
     BitmapCapability, BitmapCodecsCapability, ConfirmActive, DeactivateAllPdu, DemandActive,
-    GeneralCapability, InputCapability, MultiFragmentUpdateCapability, OrderCapability,
-    PointerCapability, ServerCapabilities, ShareControlHeader, ShareControlPduType,
-    VirtualChannelCapability,
+    GeneralCapability, InputCapability, MultiFragmentUpdateCapability, NsCodecNegotiated,
+    OrderCapability, PointerCapability, ServerCapabilities, ShareControlHeader,
+    ShareControlPduType, SurfaceCommandsCapability, VirtualChannelCapability, parse_client_nscodec,
 };
 use rdpcore_pdu::client_info::ClientInfoPdu;
 use rdpcore_pdu::cursor::ReadCursor;
@@ -63,6 +63,10 @@ pub struct AcceptedConnection {
     pub share_id: u32,
     pub desktop_width: u16,
     pub desktop_height: u16,
+    /// CS_CORE `clientName` from the client's Connect Initial GCC block.
+    pub client_name: String,
+    /// NSCodec negotiated in Confirm Active (macOS Windows App).
+    pub nscodec: Option<NsCodecNegotiated>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +140,7 @@ pub struct Acceptor {
     desktop_height: u16,
     static_channel_names: Vec<String>,
     message_channel_id: Option<u16>,
+    client_name: String,
     /// Echo of the client's RDP Negotiation Request `requestedProtocols`
     /// (MS-RDPBCGR: SC_CORE.clientRequestedProtocols MUST match this).
     client_requested_protocols: u32,
@@ -145,6 +150,7 @@ pub struct Acceptor {
     selected_protocol: SecurityProtocol,
     /// MCS user-data reassembly for Confirm Active when mstsc fragments it.
     confirm_active_buf: Vec<u8>,
+    nscodec: Option<NsCodecNegotiated>,
 }
 
 impl Acceptor {
@@ -155,9 +161,11 @@ impl Acceptor {
             desktop_height,
             static_channel_names: Vec::new(),
             message_channel_id: None,
+            client_name: String::new(),
             client_requested_protocols: SecurityProtocol::SSL.0,
             selected_protocol: SecurityProtocol::SSL,
             confirm_active_buf: Vec::new(),
+            nscodec: None,
         }
     }
 
@@ -453,6 +461,7 @@ impl Acceptor {
         let connect_initial = ConnectInitial::decode(payload)?;
         let request = ConferenceCreateRequest::decode(&connect_initial.user_data)?;
         let client_blocks = ClientGccBlocks::decode(&request.client_gcc_blocks)?;
+        self.client_name = client_blocks.core.client_name.clone();
 
         self.static_channel_names = client_blocks
             .network
@@ -619,7 +628,8 @@ impl Acceptor {
             multifragment_update: MultiFragmentUpdateCapability {
                 max_request_size: 8 * 1024 * 1024,
             },
-            bitmap_codecs: BitmapCodecsCapability,
+            surface_commands: SurfaceCommandsCapability,
+            bitmap_codecs: BitmapCodecsCapability::default(),
         };
         DemandActive {
             share_id: SHARE_ID,
@@ -658,7 +668,7 @@ impl Acceptor {
 
         let data = std::mem::take(&mut self.confirm_active_buf);
         let confirm = try_decode_confirm_active(&data)?;
-        let _ = confirm;
+        self.nscodec = parse_client_nscodec(&confirm.capabilities, 3);
 
         // MS-RDPBCGR 1.3.1.1: Server Synchronize is sent in response to
         // Confirm Active; Server Cooperate follows immediately. mstsc waits
@@ -733,6 +743,8 @@ impl Acceptor {
                         share_id: SHARE_ID,
                         desktop_width: self.desktop_width,
                         desktop_height: self.desktop_height,
+                        client_name: self.client_name.clone(),
+                        nscodec: self.nscodec,
                     }),
                 ));
             }

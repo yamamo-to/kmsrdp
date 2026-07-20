@@ -112,6 +112,7 @@ impl CliprdrBackendFactory for LocalClipboardFactory {
         Box::new(LocalClipboardBackend {
             sender,
             remote_has_text: false,
+            paste_requested: false,
         })
     }
 }
@@ -119,6 +120,9 @@ impl CliprdrBackendFactory for LocalClipboardFactory {
 struct LocalClipboardBackend {
     sender: UnboundedSender<ClipboardMessage>,
     remote_has_text: bool,
+    /// Avoid duplicate remote paste requests when the client sends several
+    /// Format List PDUs during startup (common on macOS Windows App).
+    paste_requested: bool,
 }
 
 impl core::fmt::Debug for LocalClipboardBackend {
@@ -136,11 +140,18 @@ impl CliprdrBackend for LocalClipboardBackend {
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
         self.remote_has_text = available_formats.iter().any(|f| f.id == CF_UNICODETEXT);
-        if self.remote_has_text {
-            let _ = self
-                .sender
-                .send(ClipboardMessage::SendInitiatePaste(CF_UNICODETEXT));
+        if !self.remote_has_text || self.paste_requested {
+            return;
         }
+        self.paste_requested = true;
+        // Pulling the remote clipboard immediately during CLIPRDR startup
+        // overlaps channel setup on macOS Windows App and has been observed
+        // to coincide with abrupt disconnects. Delay the first paste request.
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _ = sender.send(ClipboardMessage::SendInitiatePaste(CF_UNICODETEXT));
+        });
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {

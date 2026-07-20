@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex};
 use rdpcore_cliprdr::{CliprdrBackendFactory, CliprdrChannel};
 use rdpcore_connector::{AcceptedConnection, Acceptor, AcceptorEvent, ConnectorError};
 use rdpcore_dvc::DvcMux;
-use rdpcore_pdu::fastpath::{self, FastPathInputEvent, UPDATE_CODE_BITMAP, keyboard_flags};
+use rdpcore_pdu::capability_sets::NsCodecNegotiated;
+use rdpcore_pdu::fastpath::{
+    self, FastPathInputEvent, UPDATE_CODE_BITMAP, UPDATE_CODE_SURFACE_COMMANDS, keyboard_flags,
+};
 use rdpcore_rdpdr::{DriveConsumerFactory, RdpdrChannel};
 use rdpcore_rdpeai::{AudioInputBackendFactory, AudioInputHandler};
 use rdpcore_rdpsnd::{RdpsndChannel, RdpsndServerMessage, SoundServerFactory};
@@ -405,11 +408,12 @@ impl Session {
             }
         };
 
-        self.run_steady_state(tls, acceptor, accepted).await
+        self.run_steady_state(peer, tls, acceptor, accepted).await
     }
 
     async fn run_steady_state<S>(
         &self,
+        _peer: SocketAddr,
         stream: S,
         mut acceptor: Acceptor,
         accepted: AcceptedConnection,
@@ -450,6 +454,7 @@ impl Session {
                 rdpsnd_audio_rx = Some(rx);
                 Some(channel)
             }
+            (Some(channel_id), None) => None,
             _ => None,
         };
 
@@ -477,6 +482,7 @@ impl Session {
                 cliprdr_event_rx = Some(rx);
                 Some(channel)
             }
+            (Some(channel_id), None) => None,
             _ => None,
         };
 
@@ -511,6 +517,10 @@ impl Session {
                             }
                         },
                     )));
+                eprintln!(
+                    "rdp[{peer}]: DVC echo smoke test: queued {} follow-up frame(s)",
+                    echo_frames.len()
+                );
                 for bytes in echo_frames {
                     let _ = frame_sender.send(Frame {
                         channel: ChannelKey::Static(channel_id),
@@ -558,8 +568,18 @@ impl Session {
                 rdpdr_wake_rx = Some(wake_rx);
                 Some(channel)
             }
+            (Some(channel_id), None) => None,
             _ => None,
         };
+
+        let client_label = trim_client_name(&accepted.client_name);
+        let bitmap_policy = bitmap_encode_policy(client_label, accepted.nscodec);
+        let defer_ms = initial_bitmap_defer_ms(client_label);
+        let mut bitmap_gate_open = defer_ms == 0;
+        let mut bitmap_gate = Box::pin(tokio::time::sleep(std::time::Duration::from_millis(
+            defer_ms,
+        )));
+        let mut deferred_bitmap: Option<BitmapUpdate> = None;
 
         // Set while a server-initiated resize (Deactivate-All + new Demand
         // Active, see `Acceptor::begin_resize`) is in flight: slow-path
@@ -583,9 +603,20 @@ impl Session {
 
         loop {
             tokio::select! {
+                _ = &mut bitmap_gate, if !bitmap_gate_open => {
+                    bitmap_gate_open = true;
+                    if let Some(bitmap) = deferred_bitmap.take()
+                        && send_outbound_bitmap(&bitmap, &frame_sender, &bitmap_policy)
+                            .await
+                            .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
                 frame = read_steady_state_frame(&mut read_half) => {
-                    match frame? {
-                        SteadyStateFrame::FastPathInput(bytes) => {
+                    match frame {
+                        Err(e) => return Err(e.into()),
+                        Ok(SteadyStateFrame::FastPathInput(bytes)) => {
                             match fastpath::FastPathInput::decode(&bytes) {
                                 Ok(input_pdu) => {
                                     let mut input = self.input.lock().unwrap();
@@ -596,7 +627,7 @@ impl Session {
                                 Err(e) => eprintln!("dropping malformed fast-path input frame: {e}"),
                             }
                         }
-                        SteadyStateFrame::SlowPath(bytes) if resizing => {
+                        Ok(SteadyStateFrame::SlowPath(bytes)) if resizing => {
                             // Handshake may already be done (batched FontList in a
                             // prior frame, or a missed Accepted event). Never call
                             // step() on a finished acceptor — that only spams
@@ -606,7 +637,9 @@ impl Session {
                                 if flush_pending_resize_bitmap(
                                     &mut pending_after_resize,
                                     &frame_sender,
+                                    &bitmap_policy,
                                 )
+                                .await
                                 .is_err()
                                 {
                                     return Ok(());
@@ -630,7 +663,7 @@ impl Session {
                                             .send(Frame { channel: ChannelKey::Io, priority: Priority::Latency, bytes: result.response })
                                             .is_err()
                                     {
-                                        return Ok(()); // writer task gone - connection's over
+                                        return Ok(());
                                     }
                                     if acceptor.is_finished()
                                         || matches!(result.event, AcceptorEvent::Accepted(_))
@@ -639,7 +672,9 @@ impl Session {
                                         if flush_pending_resize_bitmap(
                                             &mut pending_after_resize,
                                             &frame_sender,
+                                            &bitmap_policy,
                                         )
+                                        .await
                                         .is_err()
                                         {
                                             return Ok(());
@@ -654,7 +689,9 @@ impl Session {
                                         if flush_pending_resize_bitmap(
                                             &mut pending_after_resize,
                                             &frame_sender,
+                                            &bitmap_policy,
                                         )
+                                        .await
                                         .is_err()
                                         {
                                             return Ok(());
@@ -677,7 +714,7 @@ impl Session {
                                 }
                             }
                         }
-                        SteadyStateFrame::SlowPath(bytes) => {
+                        Ok(SteadyStateFrame::SlowPath(bytes)) => {
                             if let Err(e) =
                                 handle_slow_path_frame(&bytes, rdpsnd.as_mut(), cliprdr.as_mut(), dvc.as_mut(), rdpdr.as_mut(), &frame_sender)
                             {
@@ -687,8 +724,9 @@ impl Session {
                     }
                 }
                 update = updates.next_update() => {
-                    match update? {
-                        Some(DisplayUpdate::Bitmap(bitmap)) if resizing => {
+                    match update {
+                        Err(e) => return Err(e),
+                        Ok(Some(DisplayUpdate::Bitmap(bitmap))) if resizing => {
                             retain_bitmap_during_resize(
                                 &mut pending_after_resize,
                                 bitmap,
@@ -696,30 +734,38 @@ impl Session {
                                 resize_desktop.height,
                             );
                         }
-                        Some(DisplayUpdate::Bitmap(bitmap)) => {
-                            for wire_frame in encode_bitmap_update(&bitmap) {
-                                if frame_sender.send(Frame { channel: ChannelKey::Io, priority: Priority::Bulk, bytes: wire_frame }).is_err() {
-                                    return Ok(()); // writer task gone - connection's over
-                                }
+                        Ok(Some(DisplayUpdate::Bitmap(bitmap))) if !bitmap_gate_open => {
+                            deferred_bitmap = Some(bitmap);
+                        }
+                        Ok(Some(DisplayUpdate::Bitmap(bitmap))) => {
+                            if send_outbound_bitmap(
+                                &bitmap,
+                                &frame_sender,
+                                &bitmap_policy,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return Ok(());
                             }
                         }
-                        Some(DisplayUpdate::Resized(size)) if resizing => {
+                        Ok(Some(DisplayUpdate::Resized(size))) if resizing => {
                             eprintln!("dropping resize to {}x{}: a previous resize is still in flight", size.width, size.height);
                         }
-                        Some(DisplayUpdate::Resized(size)) => {
+                        Ok(Some(DisplayUpdate::Resized(size))) => {
                             match acceptor.begin_resize(size.width, size.height) {
                                 Ok(response) => {
                                     resizing = true;
                                     resize_desktop = size;
                                     pending_after_resize = None;
                                     if frame_sender.send(Frame { channel: ChannelKey::Io, priority: Priority::Latency, bytes: response }).is_err() {
-                                        return Ok(()); // writer task gone - connection's over
+                                        return Ok(());
                                     }
                                 }
                                 Err(e) => eprintln!("failed to start resize to {}x{}: {e}", size.width, size.height),
                             }
                         }
-                        None => return Ok(()),
+                        Ok(None) => return Ok(()),
                     }
                 }
                 wave = recv_optional(&mut rdpsnd_audio_rx) => {
@@ -760,6 +806,50 @@ impl Session {
             }
         }
     }
+}
+
+fn trim_client_name(name: &str) -> &str {
+    name.trim_end_matches('\0').trim()
+}
+
+fn client_needs_compat_workarounds(client_name: &str) -> bool {
+    let n = client_name.to_ascii_lowercase();
+    n.contains("mac") || n.contains("darwin") || n.contains("iphone") || n.contains("ipad")
+}
+
+fn initial_bitmap_defer_ms(client_name: &str) -> u64 {
+    if client_needs_compat_workarounds(client_name) {
+        400
+    } else {
+        0
+    }
+}
+
+async fn send_outbound_bitmap(
+    bitmap: &BitmapUpdate,
+    frame_sender: &FrameSender,
+    policy: &BitmapEncodePolicy,
+) -> Result<(), ()> {
+    let batches = if let Some((codec_id, cll)) = policy.nscodec {
+        encode_nscodec_update(bitmap, codec_id, cll).0
+    } else {
+        encode_bitmap_update(bitmap, policy).0
+    };
+    for batch in &batches {
+        for wire_frame in batch {
+            if frame_sender
+                .send(Frame {
+                    channel: ChannelKey::Io,
+                    priority: Priority::Bulk,
+                    bytes: wire_frame.clone(),
+                })
+                .is_err()
+            {
+                return Err(());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Awaits the next message from an optional channel - never resolves if
@@ -924,93 +1014,223 @@ fn translate_mouse(pointer_flags: u16, x: u16, y: u16) -> MouseEvent {
 /// `bitmapLength` field that overflowed before fragmentation even runs).
 const TILE_SIZE: u16 = 64;
 
-fn flush_pending_resize_bitmap(
+async fn flush_pending_resize_bitmap(
     pending: &mut Option<BitmapUpdate>,
     frame_sender: &FrameSender,
+    policy: &BitmapEncodePolicy,
 ) -> Result<(), ()> {
     let Some(bitmap) = pending.take() else {
         return Ok(());
     };
-    for wire_frame in encode_bitmap_update(&bitmap) {
-        if frame_sender
-            .send(Frame {
-                channel: ChannelKey::Io,
-                priority: Priority::Bulk,
-                bytes: wire_frame,
-            })
-            .is_err()
-        {
-            return Err(());
-        }
-    }
-    Ok(())
+    send_outbound_bitmap(&bitmap, frame_sender, policy).await
 }
 
-/// Splits one `BitmapUpdate` into one-or-more wire-ready `FastPathOutput`
-/// byte buffers (each already TS_FP_UPDATE_PDU-framed, ready for
-/// `write_all`): first tiled into `TILE_SIZE`-square rectangles (so every
-/// `TS_BITMAP_DATA.bitmapLength` fits in 16 bits), then the combined
-/// encoded bytes are fragmented at `MAX_FASTPATH_CHUNK_SIZE` - each
-/// fragment is its own PDU/write rather than bundled, matching how
-/// [`rdpcore_transport`] schedules each fragment as its own `Frame`.
-fn encode_bitmap_update(bitmap: &BitmapUpdate) -> Vec<Vec<u8>> {
+#[derive(Debug, Clone, Copy)]
+struct BitmapEncodePolicy {
+    use_rdp6_planar: bool,
+    max_rects_per_update: usize,
+    nscodec: Option<(u8, u8)>,
+}
+
+const COMPAT_MAX_RECTS_PER_UPDATE: usize = 32;
+
+fn max_raw_strip_height(width: u16) -> u16 {
+    let row_bytes = usize::from(width).saturating_mul(4);
+    if row_bytes == 0 {
+        return 1;
+    }
+    (65535usize / row_bytes).max(1) as u16
+}
+
+fn bitmap_encode_policy(
+    client_name: &str,
+    nscodec: Option<NsCodecNegotiated>,
+) -> BitmapEncodePolicy {
+    let compat_mode = client_needs_compat_workarounds(client_name);
+    // macOS Windows App: prefer NSCodec SurfaceCommands (IronRDP path). Raw
+    // fast-path bitmaps work but are ~9MB/frame; RDP6 planar disconnects.
+    let nscodec = if compat_mode {
+        nscodec.map(|n| (n.codec_id, n.color_loss_level))
+    } else {
+        None
+    };
+    BitmapEncodePolicy {
+        use_rdp6_planar: !compat_mode,
+        max_rects_per_update: if compat_mode {
+            COMPAT_MAX_RECTS_PER_UPDATE
+        } else {
+            usize::MAX
+        },
+        nscodec,
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct BitmapWireStats {
+    tiles: u32,
+    compressed_tiles: u32,
+    raw_tiles: u32,
+    encoded_bytes: usize,
+    update_batches: u32,
+}
+
+/// Splits one `BitmapUpdate` into wire-ready `FastPathOutput` byte buffers,
+/// batched for strict clients (macOS Windows App).
+fn encode_bitmap_update(
+    bitmap: &BitmapUpdate,
+    policy: &BitmapEncodePolicy,
+) -> (Vec<Vec<Vec<u8>>>, BitmapWireStats) {
     let width = bitmap.width.get();
     let height = bitmap.height.get();
     let row_bytes = usize::from(width) * 4;
 
     let mut rectangles = Vec::new();
-    let mut tile_y = 0u16;
-    while tile_y < height {
-        let tile_height = TILE_SIZE.min(height - tile_y);
-        let mut tile_x = 0u16;
-        while tile_x < width {
-            let tile_width = TILE_SIZE.min(width - tile_x);
-            let tile_row_bytes = usize::from(tile_width) * 4;
+    let mut stats = BitmapWireStats::default();
 
-            // Bottom-up within this tile's own bounds, not the whole frame.
-            let mut tile_data = Vec::with_capacity(tile_row_bytes * usize::from(tile_height));
-            for row in (0..tile_height).rev() {
-                let src_row = usize::from(tile_y + row);
-                let src_start = src_row * row_bytes + usize::from(tile_x) * 4;
-                tile_data.extend_from_slice(&bitmap.data[src_start..src_start + tile_row_bytes]);
+    if policy.use_rdp6_planar {
+        let mut tile_y = 0u16;
+        while tile_y < height {
+            let tile_height = TILE_SIZE.min(height - tile_y);
+            let mut tile_x = 0u16;
+            while tile_x < width {
+                let tile_width = TILE_SIZE.min(width - tile_x);
+                push_bitmap_rect(
+                    bitmap,
+                    row_bytes,
+                    tile_x,
+                    tile_y,
+                    tile_width,
+                    tile_height,
+                    policy,
+                    &mut rectangles,
+                    &mut stats,
+                );
+                tile_x += TILE_SIZE;
             }
-
-            // RDP6 Planar compression is lossless, so it's always safe to
-            // use whenever it actually shrinks the tile; solid-color and
-            // smooth-gradient regions (extremely common in real desktop
-            // content) routinely compress 10x+. Falling back to raw
-            // whenever compression doesn't help (e.g. noisy/photographic
-            // content) avoids ever expanding a tile.
-            let compressed = rdpcore_pdu::rdp6::encode(
-                &tile_data,
-                usize::from(tile_width),
-                usize::from(tile_height),
-            );
-            let (data, compressed_scan_width) = if compressed.len() < tile_data.len() {
-                (compressed, Some(tile_width * 4))
-            } else {
-                (tile_data, None)
-            };
-
-            rectangles.push(fastpath::BitmapRect {
-                dest_left: bitmap.x + tile_x,
-                dest_top: bitmap.y + tile_y,
-                dest_right: bitmap.x + tile_x + tile_width - 1,
-                dest_bottom: bitmap.y + tile_y + tile_height - 1,
-                width: tile_width,
-                height: tile_height,
-                bits_per_pixel: 32,
-                data,
-                compressed_scan_width,
-            });
-            tile_x += TILE_SIZE;
+            tile_y += TILE_SIZE;
         }
-        tile_y += TILE_SIZE;
+    } else {
+        // Raw: tile into full-width strips so each rect carries as many scanlines
+        // as the 16-bit `bitmapLength` field allows (IronRDP-style chunking).
+        let strip_height = max_raw_strip_height(width);
+        let mut tile_y = 0u16;
+        while tile_y < height {
+            let th = strip_height.min(height - tile_y);
+            push_bitmap_rect(
+                bitmap,
+                row_bytes,
+                0,
+                tile_y,
+                width,
+                th,
+                policy,
+                &mut rectangles,
+                &mut stats,
+            );
+            tile_y += th;
+        }
     }
 
-    let bitmap_bytes = fastpath::BitmapUpdateData { rectangles }.encode();
+    let max_rects = policy.max_rects_per_update.min(rectangles.len().max(1));
+    let mut batches = Vec::new();
+    for chunk in rectangles.chunks(max_rects) {
+        let wire = encode_rectangles_to_wire_frames(chunk);
+        stats.encoded_bytes += chunk.iter().map(|r| r.data.len()).sum::<usize>();
+        stats.update_batches += 1;
+        batches.push(wire);
+    }
+    (batches, stats)
+}
 
-    let chunks: Vec<&[u8]> = bitmap_bytes
+fn push_bitmap_rect(
+    bitmap: &BitmapUpdate,
+    row_bytes: usize,
+    tile_x: u16,
+    tile_y: u16,
+    tile_width: u16,
+    tile_height: u16,
+    policy: &BitmapEncodePolicy,
+    rectangles: &mut Vec<fastpath::BitmapRect>,
+    stats: &mut BitmapWireStats,
+) {
+    let tile_row_bytes = usize::from(tile_width) * 4;
+
+    let mut tile_data = Vec::with_capacity(tile_row_bytes * usize::from(tile_height));
+    for row in (0..tile_height).rev() {
+        let src_row = usize::from(tile_y + row);
+        let src_start = src_row * row_bytes + usize::from(tile_x) * 4;
+        tile_data.extend_from_slice(&bitmap.data[src_start..src_start + tile_row_bytes]);
+    }
+
+    let planar_ok = policy.use_rdp6_planar && tile_width.is_multiple_of(4);
+    let (data, compressed_scan_width) = if planar_ok {
+        let compressed = rdpcore_pdu::rdp6::encode(
+            &tile_data,
+            usize::from(tile_width),
+            usize::from(tile_height),
+        );
+        if compressed.len() < tile_data.len() {
+            (compressed, Some(tile_width))
+        } else {
+            (tile_data, None)
+        }
+    } else {
+        (tile_data, None)
+    };
+
+    stats.tiles += 1;
+    if compressed_scan_width.is_some() {
+        stats.compressed_tiles += 1;
+    } else {
+        stats.raw_tiles += 1;
+    }
+
+    rectangles.push(fastpath::BitmapRect {
+        dest_left: bitmap.x + tile_x,
+        dest_top: bitmap.y + tile_y,
+        dest_right: bitmap.x + tile_x + tile_width - 1,
+        dest_bottom: bitmap.y + tile_y + tile_height - 1,
+        width: tile_width,
+        height: tile_height,
+        bits_per_pixel: 32,
+        data,
+        compressed_scan_width,
+    });
+}
+
+fn encode_nscodec_update(
+    bitmap: &BitmapUpdate,
+    codec_id: u8,
+    color_loss_level: u8,
+) -> (Vec<Vec<Vec<u8>>>, BitmapWireStats) {
+    let data = rdpcore_pdu::nscodec::encode(
+        &bitmap.data,
+        bitmap.width.get(),
+        bitmap.height.get(),
+        bitmap.stride.get(),
+        color_loss_level,
+    );
+    let body = rdpcore_pdu::surface_commands::encode_set_surface_bits(
+        bitmap.x,
+        bitmap.y,
+        bitmap.width.get(),
+        bitmap.height.get(),
+        codec_id,
+        &data,
+    );
+    let wire = encode_update_to_wire_frames(UPDATE_CODE_SURFACE_COMMANDS, &body);
+    let stats = BitmapWireStats {
+        tiles: 1,
+        compressed_tiles: 1,
+        raw_tiles: 0,
+        encoded_bytes: data.len(),
+        update_batches: 1,
+    };
+    (vec![wire], stats)
+}
+
+fn encode_update_to_wire_frames(update_code: u8, body: &[u8]) -> Vec<Vec<u8>> {
+    let chunks: Vec<&[u8]> = body
         .chunks(fastpath::MAX_FASTPATH_CHUNK_SIZE)
         .collect();
     let count = chunks.len().max(1);
@@ -1029,7 +1249,7 @@ fn encode_bitmap_update(bitmap: &BitmapUpdate) -> Vec<Vec<u8>> {
             };
             fastpath::FastPathOutput {
                 updates: vec![fastpath::FastPathUpdatePdu {
-                    update_code: UPDATE_CODE_BITMAP,
+                    update_code,
                     fragmentation,
                     data: chunk.to_vec(),
                 }],
@@ -1037,6 +1257,14 @@ fn encode_bitmap_update(bitmap: &BitmapUpdate) -> Vec<Vec<u8>> {
             .encode()
         })
         .collect()
+}
+
+fn encode_rectangles_to_wire_frames(rectangles: &[fastpath::BitmapRect]) -> Vec<Vec<u8>> {
+    let bitmap_bytes = fastpath::BitmapUpdateData {
+        rectangles: rectangles.to_vec(),
+    }
+    .encode();
+    encode_update_to_wire_frames(UPDATE_CODE_BITMAP, &bitmap_bytes)
 }
 
 fn covers_desktop(bitmap: &BitmapUpdate, width: u16, height: u16) -> bool {
@@ -1066,6 +1294,8 @@ mod tests {
     use super::{covers_desktop, retain_bitmap_during_resize};
     use crate::display::{BitmapUpdate, PixelFormat};
     use core::num::{NonZeroU16, NonZeroUsize};
+
+    use super::{bitmap_encode_policy, encode_bitmap_update, max_raw_strip_height};
 
     fn bitmap(x: u16, y: u16, width: u16, height: u16, fill: u8) -> BitmapUpdate {
         let w = NonZeroU16::new(width).unwrap();
@@ -1107,5 +1337,24 @@ mod tests {
         let kept = pending.unwrap();
         assert!(covers_desktop(&kept, 100, 50));
         assert_eq!(kept.data[0], 3);
+    }
+
+    #[test]
+    fn raw_strip_height_fits_bitmap_length_field() {
+        assert_eq!(max_raw_strip_height(1920), 8);
+        assert!(1920usize * 4 * usize::from(max_raw_strip_height(1920)) <= 65535usize);
+    }
+
+    #[test]
+    fn mac_compat_full_frame_uses_few_strip_tiles() {
+        let policy = bitmap_encode_policy("m1-mac-mini", None);
+        assert!(!policy.use_rdp6_planar);
+        assert_eq!(policy.max_rects_per_update, 32);
+
+        let frame = bitmap(0, 0, 1920, 1200, 0);
+        let (_wire, stats) = encode_bitmap_update(&frame, &policy);
+        assert_eq!(stats.tiles, 150); // 1200 / 8 scanline strips
+        assert_eq!(stats.update_batches, 5); // ceil(150 / 32)
+        assert_eq!(stats.raw_tiles, 150);
     }
 }
