@@ -31,5 +31,6 @@ drive access (client drives appear under the session user's
 (CredSSP/NTLMv2; no Kerberos) and uses a newly generated self-signed TLS
 certificate on every start.
 
-Do not expose it directly to the public Internet. Restrict TCP port 3389 to
-trusted clients and use a trusted LAN, VPN, or SSH tunnel.
+Do not expose it directly to the public Internet. Restrict the RDP listen
+address (defaults `0.0.0.0:3389`; `KMSRDP_BIND` / `KMSRDP_PORT`) to trusted
+clients and use a trusted LAN, VPN, or SSH tunnel.

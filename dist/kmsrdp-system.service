@@ -17,8 +17,9 @@ RestartSec=2
 EnvironmentFile=-/etc/kmsrdp/kmsrdp.env
 
 # Keep only the capabilities required for DRM capture, /dev/uinput, and
-# binding TCP 3389. Device and network namespaces cannot be isolated because
-# kmsrdp must reach the host GPU/input devices and the active desktop session.
+# binding privileged listen ports (default 3389; see KMSRDP_PORT). Device
+# and network namespaces cannot be isolated because kmsrdp must reach the
+# host GPU/input devices and the active desktop session.
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes

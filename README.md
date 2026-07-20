@@ -11,8 +11,8 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
 > Experimental. Authenticated clients get full screen, keyboard/mouse,
 > clipboard, audio, and optional drive access. TLS uses a **new self-signed
 > certificate every start**; NLA is CredSSP/NTLMv2 only (no Kerberos).
-> **Do not expose TCP 3389 to the public Internet** — use a firewall, VPN,
-> or SSH tunnel on a trusted network.
+> **Do not expose the RDP listen port (default 3389) to the public
+> Internet** — use a firewall, VPN, or SSH tunnel on a trusted network.
 
 ## Features
 
@@ -31,7 +31,7 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
 ## Limitations
 
 - Single monitor; concurrent clients share one desktop and one input device
-- Listens on `0.0.0.0:3389` only (no bind-address option)
+- Listen address/port via `KMSRDP_BIND` / `KMSRDP_PORT` (defaults `0.0.0.0:3389`)
 - Framebuffers: single-plane XRGB8888/ARGB8888 only
 - Drive FUSE: no delete/rename/setattr; no printer/CUPS yet
 - CJK IME and clipboard need X11 (`DISPLAY` / `XAUTHORITY`)
@@ -51,7 +51,8 @@ KMSRDP_USER=myuser KMSRDP_PASSWORD=mypassword ./target/release/rdp_server
 ```
 
 Connect with `xfreerdp /v:<host> /cert:ignore /u:myuser /p:mypassword`, or
-mstsc (NLA). Optional: `KMSRDP_TLS_HOSTS=host,1.2.3.4` for certificate SANs;
+mstsc (NLA). Optional: `KMSRDP_BIND=127.0.0.1` / `KMSRDP_PORT=3390` for the
+listen address; `KMSRDP_TLS_HOSTS=host,1.2.3.4` for certificate SANs;
 `KMSRDP_DISPLAY=DP-1` or `card1:DP-1` to pick a connector (disables NvFBC
 fallback).
 
@@ -95,7 +96,7 @@ sudo systemctl enable --now kmsrdp.service
 ## Security
 
 Treat a connected client like a person at the console. Use a strong password,
-keep env files mode `0600`, and restrict who can reach port 3389. Report
+keep env files mode `0600`, and restrict who can reach the listen port. Report
 vulnerabilities via GitHub Security Advisories — see [SECURITY.md](SECURITY.md).
 
 ## License
