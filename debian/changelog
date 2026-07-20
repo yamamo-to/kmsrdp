@@ -1,3 +1,9 @@
+kmsrdp (0.1.19) unstable; urgency=medium
+
+  * Update README for NSCodec, listen-address config, and limitation accuracy.
+
+ -- kmsrdp contributors <noreply@example.com>  Mon, 20 Jul 2026 21:36:00 +0900
+
 kmsrdp (0.1.18) unstable; urgency=medium
 
   * Silence rdpcore-server compile warnings for unused channel IDs.

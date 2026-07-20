@@ -17,28 +17,31 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
 ## Features
 
 - **Display:** DRM/KMS capture (Linear mmap or GBM/EGL detile); NVIDIA NvFBC
-  fallback when no CRTC is bound; dirty 64×64 tiles + RDP 6.0 Planar codec;
-  optional `KMSRDP_DISPLAY` for connector selection
+  fallback when no CRTC is bound; dirty 64×64 tiles; RDP 6.0 planar (typical
+  clients) or NSCodec SurfaceCommands (macOS Windows App); optional
+  `KMSRDP_DISPLAY` for connector selection
 - **Input:** `uinput` mouse/keyboard; CJK IME text on X11 (XTest)
 - **Clipboard:** text-only CLIPRDR; one process-wide local poller shared by
   all sessions
 - **Audio:** output (RDPSND / `parec`) and mic input (MS-RDPEAI); per connection
 - **Drives:** RDPDR → FUSE at `$XDG_RUNTIME_DIR/kmsrdp/drives/<DosName>`
   (list/read/write/create/mkdir; shared until the last session leaves)
-- **Auth / transport:** TLS + password; optional NLA; priority-aware writes
-  so audio is not starved by graphics
+- **Auth / transport:** TLS + password; NLA (CredSSP/NTLMv2) when the client
+  requests it; configurable listen address (`KMSRDP_BIND` / `KMSRDP_PORT`);
+  priority-aware writes so audio is not starved by graphics
 
 ## Limitations
 
 - Single monitor; concurrent clients share one desktop and one input device
-- Listen address/port via `KMSRDP_BIND` / `KMSRDP_PORT` (defaults `0.0.0.0:3389`)
-- Framebuffers: single-plane XRGB8888/ARGB8888 only
+- Framebuffers: single-plane XRGB8888/ARGB8888 only (tiled modifiers are
+  detiled via GBM/EGL when needed)
 - Drive FUSE: no delete/rename/setattr; no printer/CUPS yet
-- CJK IME and clipboard need X11 (`DISPLAY` / `XAUTHORITY`)
+- CJK IME needs X11 (XTest); not available on Wayland-only sessions
 - Needs `CAP_SYS_ADMIN`, `CAP_DAC_OVERRIDE`, `CAP_NET_BIND_SERVICE` on the binary
 
-**Tested:** Proxmox VM (VirtIO-GPU/QXL) via Guacamole; NVIDIA/Xorg via NvFBC
-fallback. See module docs for NvFBC / GBM details.
+**Tested:** Proxmox VM (VirtIO-GPU/QXL) via Guacamole and direct clients;
+NVIDIA/Xorg via NvFBC fallback; macOS Windows App (NSCodec). See module docs
+for NvFBC / GBM details.
 
 ## Quick start
 
@@ -50,11 +53,11 @@ sudo setcap cap_sys_admin,cap_dac_override,cap_net_bind_service+ep \
 KMSRDP_USER=myuser KMSRDP_PASSWORD=mypassword ./target/release/rdp_server
 ```
 
-Connect with `xfreerdp /v:<host> /cert:ignore /u:myuser /p:mypassword`, or
-mstsc (NLA). Optional: `KMSRDP_BIND=127.0.0.1` / `KMSRDP_PORT=3390` for the
-listen address; `KMSRDP_TLS_HOSTS=host,1.2.3.4` for certificate SANs;
-`KMSRDP_DISPLAY=DP-1` or `card1:DP-1` to pick a connector (disables NvFBC
-fallback).
+Connect with `xfreerdp /v:<host> /cert:ignore /u:myuser /p:mypassword`, mstsc,
+or the macOS Windows App. Optional: `KMSRDP_BIND=127.0.0.1` /
+`KMSRDP_PORT=3390` to restrict the listen address; `KMSRDP_TLS_HOSTS=host,1.2.3.4`
+for certificate SANs; `KMSRDP_DISPLAY=DP-1` or `card1:DP-1` to pick a connector
+(disables NvFBC fallback).
 
 Audio needs `parec` / `paplay` / `pactl` on `$PATH`. Root FUSE mounts need
 `user_allow_other` in `/etc/fuse.conf`.
