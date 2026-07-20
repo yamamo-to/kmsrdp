@@ -1,3 +1,9 @@
+kmsrdp (0.1.16) unstable; urgency=medium
+
+  * Add KMSRDP_BIND and KMSRDP_PORT for listen address and port.
+
+ -- kmsrdp contributors <noreply@example.com>  Mon, 20 Jul 2026 10:54:00 +0900
+
 kmsrdp (0.1.15) unstable; urgency=medium
 
   * Shorten README and correct shared-clipboard description.

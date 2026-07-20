@@ -159,8 +159,8 @@ async fn main() -> Result<()> {
 
     // Bind before creating the uinput device so a missing CAP_NET_BIND_SERVICE
     // (or a busy port) fails without spamming `input: kmsrdp as ...` on every
-    // systemd restart.
-    let addr: SocketAddr = "0.0.0.0:3389".parse()?;
+    // systemd restart. Override with KMSRDP_BIND / KMSRDP_PORT.
+    let addr = listen_addr()?;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
@@ -217,4 +217,35 @@ async fn main() -> Result<()> {
          `xfreerdp /cert:ignore /u:<user> /p:<password>` or mstsc)"
     );
     server.run().await
+}
+
+/// Listen address from `KMSRDP_BIND` (default `0.0.0.0`) and `KMSRDP_PORT`
+/// (default `3389`). `KMSRDP_BIND` accepts an IPv4/IPv6 address (`127.0.0.1`,
+/// `::`, optional `[::1]` brackets).
+fn listen_addr() -> Result<SocketAddr> {
+    let port: u16 = match std::env::var("KMSRDP_PORT") {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            trimmed.parse().map_err(|_| {
+                anyhow::anyhow!("KMSRDP_PORT must be an integer port 1-65535, got {raw:?}")
+            })?
+        }
+        Err(_) => 3389,
+    };
+    if port == 0 {
+        anyhow::bail!("KMSRDP_PORT must be non-zero");
+    }
+
+    let bind = std::env::var("KMSRDP_BIND").unwrap_or_else(|_| "0.0.0.0".to_owned());
+    let bind = bind.trim();
+    let bind = bind
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(bind);
+    let ip: std::net::IpAddr = bind.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "KMSRDP_BIND must be an IP address (e.g. 0.0.0.0, 127.0.0.1, ::), got {bind:?}"
+        )
+    })?;
+    Ok(SocketAddr::new(ip, port))
 }
