@@ -18,6 +18,7 @@ pub mod licensing;
 pub mod mcs;
 pub mod nscodec;
 pub mod per;
+pub mod pointer;
 pub mod rdp6;
 pub mod surface_commands;
 pub mod svc;

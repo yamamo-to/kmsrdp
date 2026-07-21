@@ -18,7 +18,8 @@ use rdpcore_pdu::capability_sets::{
     BitmapCapability, BitmapCodecsCapability, ConfirmActive, DeactivateAllPdu, DemandActive,
     GeneralCapability, InputCapability, MultiFragmentUpdateCapability, NsCodecNegotiated,
     OrderCapability, PointerCapability, ServerCapabilities, ShareControlHeader,
-    ShareControlPduType, SurfaceCommandsCapability, VirtualChannelCapability, parse_client_nscodec,
+    ShareControlPduType, SurfaceCommandsCapability, VirtualChannelCapability,
+    parse_client_max_request_size, parse_client_nscodec,
 };
 use rdpcore_pdu::client_info::ClientInfoPdu;
 use rdpcore_pdu::cursor::ReadCursor;
@@ -67,6 +68,10 @@ pub struct AcceptedConnection {
     pub client_name: String,
     /// NSCodec negotiated in Confirm Active (macOS Windows App).
     pub nscodec: Option<NsCodecNegotiated>,
+    /// Client MultiFragmentUpdate MaxRequestSize (reassembly budget).
+    /// `None` if the client omitted the capability; callers should fall back
+    /// to the server's advertised value.
+    pub max_request_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +156,7 @@ pub struct Acceptor {
     /// MCS user-data reassembly for Confirm Active when mstsc fragments it.
     confirm_active_buf: Vec<u8>,
     nscodec: Option<NsCodecNegotiated>,
+    max_request_size: Option<u32>,
 }
 
 impl Acceptor {
@@ -166,6 +172,7 @@ impl Acceptor {
             selected_protocol: SecurityProtocol::SSL,
             confirm_active_buf: Vec::new(),
             nscodec: None,
+            max_request_size: None,
         }
     }
 
@@ -669,6 +676,7 @@ impl Acceptor {
         let data = std::mem::take(&mut self.confirm_active_buf);
         let confirm = try_decode_confirm_active(&data)?;
         self.nscodec = parse_client_nscodec(&confirm.capabilities, 3);
+        self.max_request_size = parse_client_max_request_size(&confirm.capabilities);
 
         // MS-RDPBCGR 1.3.1.1: Server Synchronize is sent in response to
         // Confirm Active; Server Cooperate follows immediately. mstsc waits
@@ -745,12 +753,15 @@ impl Acceptor {
                         desktop_height: self.desktop_height,
                         client_name: self.client_name.clone(),
                         nscodec: self.nscodec,
+                        max_request_size: self.max_request_size,
                     }),
                 ));
             }
             // A real client may send other Data PDUs interleaved here (e.g.
-            // stray input); tolerate and ignore them rather than error.
-            ShareDataPduType::FontMap => {}
+            // stray input / suppress); tolerate and ignore them rather than error.
+            ShareDataPduType::FontMap
+            | ShareDataPduType::RefreshRect
+            | ShareDataPduType::SuppressOutput => {}
         }
 
         self.state = State::WaitFinalization(progress);

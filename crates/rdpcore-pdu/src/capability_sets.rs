@@ -446,6 +446,20 @@ pub struct NsCodecNegotiated {
     pub color_loss_level: u8,
 }
 
+/// Walks the client's Confirm Active capability list and returns the
+/// MultiFragmentUpdate `MaxRequestSize` when present.
+pub fn parse_client_max_request_size(capabilities: &[RawCapabilitySet]) -> Option<u32> {
+    let body = capabilities
+        .iter()
+        .find(|c| c.set_type == CAPSET_MULTIFRAGMENT_UPDATE)?
+        .body
+        .as_slice();
+    MultiFragmentUpdateCapability::decode_body(body)
+        .ok()
+        .map(|c| c.max_request_size)
+        .filter(|&n| n > 0)
+}
+
 /// Walks the client's Confirm Active capability list and returns NSCodec
 /// parameters when both the client and server support it.
 pub fn parse_client_nscodec(

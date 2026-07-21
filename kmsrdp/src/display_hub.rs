@@ -287,6 +287,10 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
             }
         }
     }
+
+    fn latest_full_frame(&self) -> Option<BitmapUpdate> {
+        self.latest_full.lock().unwrap().clone()
+    }
 }
 
 #[async_trait::async_trait]

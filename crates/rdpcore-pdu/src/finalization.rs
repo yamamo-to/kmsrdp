@@ -12,6 +12,10 @@ pub enum ShareDataPduType {
     Control,
     FontList,
     FontMap,
+    /// Client → server: redraw requested areas (MS-RDPBCGR 2.2.11.2).
+    RefreshRect,
+    /// Client → server: pause/resume display updates (MS-RDPBCGR 2.2.11.3).
+    SuppressOutput,
 }
 
 impl ShareDataPduType {
@@ -21,6 +25,8 @@ impl ShareDataPduType {
             Self::FontList => 0x27,
             Self::FontMap => 0x28,
             Self::Synchronize => 0x1F,
+            Self::RefreshRect => 0x21,
+            Self::SuppressOutput => 0x23,
         }
     }
 
@@ -30,6 +36,8 @@ impl ShareDataPduType {
             0x27 => Self::FontList,
             0x28 => Self::FontMap,
             0x1F => Self::Synchronize,
+            0x21 => Self::RefreshRect,
+            0x23 => Self::SuppressOutput,
             _ => return None,
         })
     }
@@ -241,6 +249,63 @@ impl FontPdu {
             entry_size: cursor.read_u16_le()?,
         })
     }
+}
+
+/// Inclusive rectangle from Refresh Rect / Suppress Output (MS-RDPBCGR 2.2.11.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InclusiveRect {
+    pub left: u16,
+    pub top: u16,
+    pub right: u16,
+    pub bottom: u16,
+}
+
+impl InclusiveRect {
+    pub fn decode(cursor: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            left: cursor.read_u16_le()?,
+            top: cursor.read_u16_le()?,
+            right: cursor.read_u16_le()?,
+            bottom: cursor.read_u16_le()?,
+        })
+    }
+}
+
+/// Parse `TS_SUPPRESS_OUTPUT_PDU` body after the Share Data Header.
+/// Returns whether display updates are allowed.
+pub fn decode_suppress_output(body: &[u8]) -> Result<bool, DecodeError> {
+    let mut cursor = ReadCursor::new(body);
+    let allow = cursor.read_u8()?;
+    let _pad0 = cursor.read_u8()?;
+    let _pad1 = cursor.read_u8()?;
+    let _pad2 = cursor.read_u8()?;
+    match allow {
+        0 => Ok(false),
+        1 => {
+            if cursor.remaining() >= 8 {
+                let _ = InclusiveRect::decode(&mut cursor)?;
+            }
+            Ok(true)
+        }
+        _ => Err(DecodeError::InvalidValue {
+            field: "suppress_output.allow_display_updates",
+            reason: "expected 0 or 1",
+        }),
+    }
+}
+
+/// Parse `TS_REFRESH_RECT_PDU` body after the Share Data Header.
+pub fn decode_refresh_rect(body: &[u8]) -> Result<Vec<InclusiveRect>, DecodeError> {
+    let mut cursor = ReadCursor::new(body);
+    let count = cursor.read_u8()?;
+    let _pad0 = cursor.read_u8()?;
+    let _pad1 = cursor.read_u8()?;
+    let _pad2 = cursor.read_u8()?;
+    let mut rects = Vec::with_capacity(usize::from(count));
+    for _ in 0..count {
+        rects.push(InclusiveRect::decode(&mut cursor)?);
+    }
+    Ok(rects)
 }
 
 #[cfg(test)]

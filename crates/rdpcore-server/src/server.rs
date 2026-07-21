@@ -8,6 +8,10 @@ use rdpcore_pdu::capability_sets::NsCodecNegotiated;
 use rdpcore_pdu::fastpath::{
     self, FastPathInputEvent, UPDATE_CODE_BITMAP, UPDATE_CODE_SURFACE_COMMANDS, keyboard_flags,
 };
+use rdpcore_pdu::finalization::{
+    DataPdu, ShareDataPduType, decode_refresh_rect, decode_suppress_output,
+};
+use rdpcore_pdu::surface_commands::{FRAME_ACTION_BEGIN, FRAME_ACTION_END, encode_frame_marker};
 use rdpcore_rdpdr::{DriveConsumerFactory, RdpdrChannel};
 use rdpcore_rdpeai::{AudioInputBackendFactory, AudioInputHandler};
 use rdpcore_rdpsnd::{RdpsndChannel, RdpsndServerMessage, SoundServerFactory};
@@ -573,13 +577,27 @@ impl Session {
         };
 
         let client_label = trim_client_name(&accepted.client_name);
-        let bitmap_policy = bitmap_encode_policy(client_label, accepted.nscodec);
+        let server_mfu = 8 * 1024 * 1024u32;
+        let max_request_size = accepted
+            .max_request_size
+            .unwrap_or(server_mfu)
+            .min(server_mfu)
+            .max(fastpath::MAX_FASTPATH_CHUNK_SIZE as u32);
+        let bitmap_policy =
+            bitmap_encode_policy(client_label, accepted.nscodec, max_request_size as usize);
         let defer_ms = initial_bitmap_defer_ms(client_label);
         let mut bitmap_gate_open = defer_ms == 0;
         let mut bitmap_gate = Box::pin(tokio::time::sleep(std::time::Duration::from_millis(
             defer_ms,
         )));
         let mut deferred_bitmap: Option<BitmapUpdate> = None;
+        let mut display_updates_allowed = true;
+        let mut frame_id = 1u32;
+        let io_channel_id = accepted.io_channel_id;
+
+        // No soft-cursor PDUs: we do not track the host cursor shape, and a
+        // DIY Color Pointer showed up as a square block beside the client's
+        // local cursor. Leave pointer drawing to the client.
 
         // Set while a server-initiated resize (Deactivate-All + new Demand
         // Active, see `Acceptor::begin_resize`) is in flight: slow-path
@@ -605,10 +623,16 @@ impl Session {
             tokio::select! {
                 _ = &mut bitmap_gate, if !bitmap_gate_open => {
                     bitmap_gate_open = true;
-                    if let Some(bitmap) = deferred_bitmap.take()
-                        && send_outbound_bitmap(&bitmap, &frame_sender, &bitmap_policy)
-                            .await
-                            .is_err()
+                    if display_updates_allowed
+                        && let Some(bitmap) = deferred_bitmap.take()
+                        && send_outbound_bitmap(
+                            &bitmap,
+                            &frame_sender,
+                            &bitmap_policy,
+                            &mut frame_id,
+                        )
+                        .await
+                        .is_err()
                     {
                         return Ok(());
                     }
@@ -638,6 +662,8 @@ impl Session {
                                     &mut pending_after_resize,
                                     &frame_sender,
                                     &bitmap_policy,
+                                    &mut frame_id,
+                                    display_updates_allowed,
                                 )
                                 .await
                                 .is_err()
@@ -646,12 +672,19 @@ impl Session {
                                 }
                                 if let Err(e) = handle_slow_path_frame(
                                     &bytes,
+                                    io_channel_id,
+                                    &mut display_updates_allowed,
+                                    updates.as_mut(),
                                     rdpsnd.as_mut(),
                                     cliprdr.as_mut(),
                                     dvc.as_mut(),
                                     rdpdr.as_mut(),
                                     &frame_sender,
-                                ) {
+                                    &bitmap_policy,
+                                    &mut frame_id,
+                                )
+                                .await
+                                {
                                     eprintln!("dropping malformed slow-path frame after resize: {e}");
                                 }
                                 continue;
@@ -673,6 +706,8 @@ impl Session {
                                             &mut pending_after_resize,
                                             &frame_sender,
                                             &bitmap_policy,
+                                            &mut frame_id,
+                                            display_updates_allowed,
                                         )
                                         .await
                                         .is_err()
@@ -690,6 +725,8 @@ impl Session {
                                             &mut pending_after_resize,
                                             &frame_sender,
                                             &bitmap_policy,
+                                            &mut frame_id,
+                                            display_updates_allowed,
                                         )
                                         .await
                                         .is_err()
@@ -698,12 +735,19 @@ impl Session {
                                         }
                                         if let Err(err) = handle_slow_path_frame(
                                             &bytes,
+                                            io_channel_id,
+                                            &mut display_updates_allowed,
+                                            updates.as_mut(),
                                             rdpsnd.as_mut(),
                                             cliprdr.as_mut(),
                                             dvc.as_mut(),
                                             rdpdr.as_mut(),
                                             &frame_sender,
-                                        ) {
+                                            &bitmap_policy,
+                                            &mut frame_id,
+                                        )
+                                        .await
+                                        {
                                             eprintln!(
                                                 "dropping malformed slow-path frame after resize: {err}"
                                             );
@@ -715,8 +759,20 @@ impl Session {
                             }
                         }
                         Ok(SteadyStateFrame::SlowPath(bytes)) => {
-                            if let Err(e) =
-                                handle_slow_path_frame(&bytes, rdpsnd.as_mut(), cliprdr.as_mut(), dvc.as_mut(), rdpdr.as_mut(), &frame_sender)
+                            if let Err(e) = handle_slow_path_frame(
+                                &bytes,
+                                io_channel_id,
+                                &mut display_updates_allowed,
+                                updates.as_mut(),
+                                rdpsnd.as_mut(),
+                                cliprdr.as_mut(),
+                                dvc.as_mut(),
+                                rdpdr.as_mut(),
+                                &frame_sender,
+                                &bitmap_policy,
+                                &mut frame_id,
+                            )
+                            .await
                             {
                                 eprintln!("dropping malformed slow-path frame: {e}");
                             }
@@ -737,11 +793,13 @@ impl Session {
                         Ok(Some(DisplayUpdate::Bitmap(bitmap))) if !bitmap_gate_open => {
                             deferred_bitmap = Some(bitmap);
                         }
+                        Ok(Some(DisplayUpdate::Bitmap(_))) if !display_updates_allowed => {}
                         Ok(Some(DisplayUpdate::Bitmap(bitmap))) => {
                             if send_outbound_bitmap(
                                 &bitmap,
                                 &frame_sender,
                                 &bitmap_policy,
+                                &mut frame_id,
                             )
                             .await
                             .is_err()
@@ -829,24 +887,41 @@ async fn send_outbound_bitmap(
     bitmap: &BitmapUpdate,
     frame_sender: &FrameSender,
     policy: &BitmapEncodePolicy,
+    frame_id: &mut u32,
 ) -> Result<(), ()> {
     let batches = if let Some((codec_id, cll)) = policy.nscodec {
-        encode_nscodec_update(bitmap, codec_id, cll).0
+        encode_nscodec_update(bitmap, codec_id, cll, policy.max_request_size).0
     } else {
         encode_bitmap_update(bitmap, policy).0
     };
-    for batch in &batches {
-        for wire_frame in batch {
-            if frame_sender
-                .send(Frame {
-                    channel: ChannelKey::Io,
-                    priority: Priority::Bulk,
-                    bytes: wire_frame.clone(),
-                })
-                .is_err()
-            {
-                return Err(());
-            }
+
+    let id = *frame_id;
+    *frame_id = frame_id.wrapping_add(1).max(1);
+    let begin = encode_update_to_wire_frames(
+        UPDATE_CODE_SURFACE_COMMANDS,
+        &encode_frame_marker(FRAME_ACTION_BEGIN, id),
+        policy.max_request_size,
+    );
+    let end = encode_update_to_wire_frames(
+        UPDATE_CODE_SURFACE_COMMANDS,
+        &encode_frame_marker(FRAME_ACTION_END, id),
+        policy.max_request_size,
+    );
+
+    for wire_frame in begin
+        .into_iter()
+        .chain(batches.into_iter().flatten())
+        .chain(end)
+    {
+        if frame_sender
+            .send(Frame {
+                channel: ChannelKey::Io,
+                priority: Priority::Bulk,
+                bytes: wire_frame,
+            })
+            .is_err()
+        {
+            return Err(());
         }
     }
     Ok(())
@@ -863,22 +938,71 @@ async fn recv_optional<T>(rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<T
     }
 }
 
-/// Slow-path (TPKT/X.224/MCS) traffic at steady state: today this is
-/// rdpsnd control messages (format negotiation replies, WaveConfirm) and
-/// cliprdr messages, dispatched by MCS channel ID. Unrecognized channel
-/// IDs are silently ignored rather than treated as an error - a real
-/// client may have other static channels open that this server doesn't
-/// implement.
-fn handle_slow_path_frame(
+/// Slow-path traffic at steady state: static channels plus IO-channel
+/// Suppress Output / Refresh Rect (MS-RDPBCGR 2.2.11).
+#[allow(clippy::too_many_arguments)]
+async fn handle_slow_path_frame(
     bytes: &[u8],
+    io_channel_id: u16,
+    display_updates_allowed: &mut bool,
+    updates: &mut dyn crate::display::RdpServerDisplayUpdates,
     rdpsnd: Option<&mut RdpsndChannel>,
     cliprdr: Option<&mut CliprdrChannel>,
     dvc: Option<&mut DvcMux>,
     rdpdr: Option<&mut RdpdrChannel>,
     frame_sender: &rdpcore_transport::FrameSender,
+    policy: &BitmapEncodePolicy,
+    frame_id: &mut u32,
 ) -> anyhow::Result<()> {
     let payload = rdpcore_pdu::x224::unwrap_data(bytes)?;
     let send_data = rdpcore_pdu::mcs::SendData::decode_request(payload)?;
+
+    if send_data.channel_id == io_channel_id {
+        if let Ok(data_pdu) = DataPdu::decode(&send_data.data) {
+            match data_pdu.pdu_type2 {
+                ShareDataPduType::SuppressOutput => {
+                    if let Ok(allow) = decode_suppress_output(&data_pdu.body) {
+                        let was = *display_updates_allowed;
+                        *display_updates_allowed = allow;
+                        if allow
+                            && !was
+                            && let Some(full) = updates.latest_full_frame()
+                        {
+                            let _ =
+                                send_outbound_bitmap(&full, frame_sender, policy, frame_id).await;
+                        }
+                    }
+                }
+                ShareDataPduType::RefreshRect => {
+                    if let Ok(rects) = decode_refresh_rect(&data_pdu.body)
+                        && let Some(full) = updates.latest_full_frame()
+                    {
+                        if rects.is_empty() {
+                            let _ =
+                                send_outbound_bitmap(&full, frame_sender, policy, frame_id).await;
+                        } else {
+                            for rect in rects {
+                                let w = rect.right.saturating_sub(rect.left).saturating_add(1);
+                                let h = rect.bottom.saturating_sub(rect.top).saturating_add(1);
+                                let (Some(nw), Some(nh)) =
+                                    (core::num::NonZeroU16::new(w), core::num::NonZeroU16::new(h))
+                                else {
+                                    continue;
+                                };
+                                if let Some(sub) = full.sub(rect.left, rect.top, nw, nh) {
+                                    let _ =
+                                        send_outbound_bitmap(&sub, frame_sender, policy, frame_id)
+                                            .await;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
 
     if let Some(channel) = rdpsnd
         && send_data.channel_id == channel.channel_id()
@@ -951,12 +1075,8 @@ fn dispatch_input_event(input: &mut dyn RdpServerInputHandler, event: FastPathIn
         } => {
             input.mouse(translate_mouse(pointer_flags, x, y));
         }
-        FastPathInputEvent::Sync { .. } => {} // lock-key state sync, not acted on
+        FastPathInputEvent::Sync { .. } => {}
         FastPathInputEvent::Unicode { flags, code } => {
-            // `KeyboardEvent::UnicodePressed` is a fire-once event (see its
-            // doc comment) - the paired release carries no useful
-            // information here and is dropped, same as a real
-            // ironrdp-server-backed handler would see.
             if flags & keyboard_flags::RELEASE == 0 {
                 input.keyboard(KeyboardEvent::UnicodePressed(code));
             }
@@ -1018,11 +1138,17 @@ async fn flush_pending_resize_bitmap(
     pending: &mut Option<BitmapUpdate>,
     frame_sender: &FrameSender,
     policy: &BitmapEncodePolicy,
+    frame_id: &mut u32,
+    display_updates_allowed: bool,
 ) -> Result<(), ()> {
+    if !display_updates_allowed {
+        *pending = None;
+        return Ok(());
+    }
     let Some(bitmap) = pending.take() else {
         return Ok(());
     };
-    send_outbound_bitmap(&bitmap, frame_sender, policy).await
+    send_outbound_bitmap(&bitmap, frame_sender, policy, frame_id).await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1030,6 +1156,7 @@ struct BitmapEncodePolicy {
     use_rdp6_planar: bool,
     max_rects_per_update: usize,
     nscodec: Option<(u8, u8)>,
+    max_request_size: usize,
 }
 
 const COMPAT_MAX_RECTS_PER_UPDATE: usize = 32;
@@ -1045,6 +1172,7 @@ fn max_raw_strip_height(width: u16) -> u16 {
 fn bitmap_encode_policy(
     client_name: &str,
     nscodec: Option<NsCodecNegotiated>,
+    max_request_size: usize,
 ) -> BitmapEncodePolicy {
     let compat_mode = client_needs_compat_workarounds(client_name);
     // macOS Windows App: prefer NSCodec SurfaceCommands (IronRDP path). Raw
@@ -1054,14 +1182,19 @@ fn bitmap_encode_policy(
     } else {
         None
     };
+    // Keep each reassembled Fast-Path Update under MaxRequestSize. A 64x64
+    // compressed tile is typically a few KB; use a conservative per-rect budget.
+    let size_limited_rects = (max_request_size / 8192).max(1);
+    let max_rects_per_update = if compat_mode {
+        COMPAT_MAX_RECTS_PER_UPDATE.min(size_limited_rects)
+    } else {
+        size_limited_rects
+    };
     BitmapEncodePolicy {
         use_rdp6_planar: !compat_mode,
-        max_rects_per_update: if compat_mode {
-            COMPAT_MAX_RECTS_PER_UPDATE
-        } else {
-            usize::MAX
-        },
+        max_rects_per_update,
         nscodec,
+        max_request_size,
     }
 }
 
@@ -1134,7 +1267,7 @@ fn encode_bitmap_update(
     let max_rects = policy.max_rects_per_update.min(rectangles.len().max(1));
     let mut batches = Vec::new();
     for chunk in rectangles.chunks(max_rects) {
-        let wire = encode_rectangles_to_wire_frames(chunk);
+        let wire = encode_rectangles_to_wire_frames(chunk, policy.max_request_size);
         stats.encoded_bytes += chunk.iter().map(|r| r.data.len()).sum::<usize>();
         stats.update_batches += 1;
         batches.push(wire);
@@ -1204,6 +1337,7 @@ fn encode_nscodec_update(
     bitmap: &BitmapUpdate,
     codec_id: u8,
     color_loss_level: u8,
+    max_request_size: usize,
 ) -> (Vec<Vec<Vec<u8>>>, BitmapWireStats) {
     let data = rdpcore_pdu::nscodec::encode(
         &bitmap.data,
@@ -1220,7 +1354,7 @@ fn encode_nscodec_update(
         codec_id,
         &data,
     );
-    let wire = encode_update_to_wire_frames(UPDATE_CODE_SURFACE_COMMANDS, &body);
+    let wire = encode_update_to_wire_frames(UPDATE_CODE_SURFACE_COMMANDS, &body, max_request_size);
     let stats = BitmapWireStats {
         tiles: 1,
         compressed_tiles: 1,
@@ -1231,8 +1365,14 @@ fn encode_nscodec_update(
     (vec![wire], stats)
 }
 
-fn encode_update_to_wire_frames(update_code: u8, body: &[u8]) -> Vec<Vec<u8>> {
-    let chunks: Vec<&[u8]> = body.chunks(fastpath::MAX_FASTPATH_CHUNK_SIZE).collect();
+fn encode_update_to_wire_frames(
+    update_code: u8,
+    body: &[u8],
+    max_request_size: usize,
+) -> Vec<Vec<u8>> {
+    // Cap per-fragment payload so reassembly cannot exceed MaxRequestSize.
+    let chunk = fastpath::MAX_FASTPATH_CHUNK_SIZE.min(max_request_size.max(1));
+    let chunks: Vec<&[u8]> = body.chunks(chunk).collect();
     let count = chunks.len().max(1);
     chunks
         .into_iter()
@@ -1259,12 +1399,15 @@ fn encode_update_to_wire_frames(update_code: u8, body: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn encode_rectangles_to_wire_frames(rectangles: &[fastpath::BitmapRect]) -> Vec<Vec<u8>> {
+fn encode_rectangles_to_wire_frames(
+    rectangles: &[fastpath::BitmapRect],
+    max_request_size: usize,
+) -> Vec<Vec<u8>> {
     let bitmap_bytes = fastpath::BitmapUpdateData {
         rectangles: rectangles.to_vec(),
     }
     .encode();
-    encode_update_to_wire_frames(UPDATE_CODE_BITMAP, &bitmap_bytes)
+    encode_update_to_wire_frames(UPDATE_CODE_BITMAP, &bitmap_bytes, max_request_size)
 }
 
 fn covers_desktop(bitmap: &BitmapUpdate, width: u16, height: u16) -> bool {
@@ -1347,7 +1490,7 @@ mod tests {
 
     #[test]
     fn mac_compat_full_frame_uses_few_strip_tiles() {
-        let policy = bitmap_encode_policy("m1-mac-mini", None);
+        let policy = bitmap_encode_policy("m1-mac-mini", None, 8 * 1024 * 1024);
         assert!(!policy.use_rdp6_planar);
         assert_eq!(policy.max_rects_per_update, 32);
 

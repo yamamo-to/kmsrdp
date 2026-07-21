@@ -96,4 +96,9 @@ pub trait RdpServerDisplay: Send + Sync {
 #[async_trait]
 pub trait RdpServerDisplayUpdates: Send {
     async fn next_update(&mut self) -> anyhow::Result<Option<DisplayUpdate>>;
+
+    /// Latest full-desktop frame, if the backend keeps one (for Refresh Rect).
+    fn latest_full_frame(&self) -> Option<BitmapUpdate> {
+        None
+    }
 }

@@ -1,3 +1,10 @@
+kmsrdp (0.1.24) unstable; urgency=medium
+
+  * Frame Marker, Suppress Output / Refresh Rect, and MaxRequestSize handling.
+  * Leave mouse pointer drawing to the client (no soft-cursor PDUs).
+
+ -- kmsrdp contributors <noreply@example.com>  Tue, 21 Jul 2026 09:26:00 +0900
+
 kmsrdp (0.1.23) unstable; urgency=medium
 
   * Document cbScanWidth bytes-vs-pixels interop note (MS-RDPBCGR vs mstsc).

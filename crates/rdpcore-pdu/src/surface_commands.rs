@@ -1,9 +1,24 @@
 //! SurfaceCommands fast-path updates (MS-RDPBCGR 2.2.9.2) carrying
-//! NSCodec-compressed bitmaps via `SetSurfaceBits`.
+//! NSCodec-compressed bitmaps via `SetSurfaceBits`, plus Frame Marker.
 
 use crate::cursor::WriteBuf;
 
 const CMD_SET_SURFACE_BITS: u16 = 0x01;
+const CMD_FRAME_MARKER: u16 = 0x0004;
+
+/// `SURFACECMD_FRAMEACTION_BEGIN` (MS-RDPBCGR 2.2.9.2.3).
+pub const FRAME_ACTION_BEGIN: u16 = 0x0000;
+/// `SURFACECMD_FRAMEACTION_END` (MS-RDPBCGR 2.2.9.2.3).
+pub const FRAME_ACTION_END: u16 = 0x0001;
+
+/// Encode one `TS_FRAME_MARKER` command body (without the fast-path header).
+pub fn encode_frame_marker(frame_action: u16, frame_id: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.write_u16_le(CMD_FRAME_MARKER);
+    out.write_u16_le(frame_action);
+    out.write_u32_le(frame_id);
+    out
+}
 
 /// Exclusive rectangle: `right`/`bottom` are one past the last pixel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
