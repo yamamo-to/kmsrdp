@@ -45,13 +45,17 @@ struct DisplaySelector {
     connector: String,
 }
 
-impl DisplaySelector {
-    fn parse(value: &str) -> Result<Option<Self>, String> {
-        let value = value.trim();
-        if value.is_empty() {
-            return Ok(None);
-        }
+/// How `KMSRDP_DISPLAY` selects capture sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DisplayMode {
+    /// Unset or `all`: every connected CRTC, composited into one canvas.
+    All,
+    /// Named connector (`DP-1` or `card1:DP-1`): that head only.
+    Single(DisplaySelector),
+}
 
+impl DisplaySelector {
+    fn parse_connector(value: &str) -> Result<Self, String> {
         let (card, connector) = match value.split_once(':') {
             Some((card, connector)) => {
                 let card = card.trim();
@@ -65,8 +69,7 @@ impl DisplaySelector {
             }
             None => (None, value.to_string()),
         };
-
-        Ok(Some(Self { card, connector }))
+        Ok(Self { card, connector })
     }
 
     fn matches(&self, card: &str, connector: &str) -> bool {
@@ -81,14 +84,28 @@ impl DisplaySelector {
     }
 }
 
-static DISPLAY_SELECTOR: OnceLock<Result<Option<DisplaySelector>, String>> = OnceLock::new();
+impl DisplayMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("all") {
+            return Ok(Self::All);
+        }
+        Ok(Self::Single(DisplaySelector::parse_connector(value)?))
+    }
 
-fn display_selector() -> io::Result<Option<&'static DisplaySelector>> {
-    let configured = DISPLAY_SELECTOR.get_or_init(|| {
-        DisplaySelector::parse(&std::env::var("KMSRDP_DISPLAY").unwrap_or_else(|_| String::new()))
+    fn is_single(&self) -> bool {
+        matches!(self, Self::Single(_))
+    }
+}
+
+static DISPLAY_MODE: OnceLock<Result<DisplayMode, String>> = OnceLock::new();
+
+fn display_mode() -> io::Result<&'static DisplayMode> {
+    let configured = DISPLAY_MODE.get_or_init(|| {
+        DisplayMode::parse(&std::env::var("KMSRDP_DISPLAY").unwrap_or_else(|_| String::new()))
     });
     match configured {
-        Ok(selector) => Ok(selector.as_ref()),
+        Ok(mode) => Ok(mode),
         Err(reason) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("invalid KMSRDP_DISPLAY: {reason}"),
@@ -132,20 +149,28 @@ fn connector_crtc_via_atomic_prop(
     Ok(None)
 }
 
-struct OpenedCard {
+struct CardCtx {
     card: Card,
     path: String,
     name: String,
-    crtc: crtc::Handle,
-    connector: String,
 }
 
-/// Find the configured connected connector with an active CRTC. When
-/// `KMSRDP_DISPLAY` is unset, this preserves the original "first usable
-/// connector" behavior.
-fn open_usable_card() -> io::Result<OpenedCard> {
-    let selector = display_selector()?;
+struct EnumeratedHead {
+    card_idx: usize,
+    crtc: crtc::Handle,
+    connector: String,
+    /// CRTC position in the host virtual desktop.
+    x: i32,
+    y: i32,
+}
+
+/// Open DRM cards and collect active heads per [`display_mode`].
+fn open_drm_cards_and_heads() -> io::Result<(Vec<CardCtx>, Vec<EnumeratedHead>)> {
+    let mode = display_mode()?;
+    let mut cards = Vec::new();
+    let mut heads = Vec::new();
     let mut discovered = Vec::new();
+
     let mut entries: Vec<_> = fs::read_dir("/dev/dri")?.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
 
@@ -167,49 +192,72 @@ fn open_usable_card() -> io::Result<OpenedCard> {
             }
         };
 
-        match find_crtc_on_card(&card, card_name) {
-            Ok((crtc, connector)) => {
-                return Ok(OpenedCard {
-                    card,
-                    path: path_str,
-                    name: card_name.to_owned(),
-                    crtc,
-                    connector,
-                });
+        let _ = card.set_client_capability(drm::ClientCapability::UniversalPlanes, true);
+        let _ = card.set_client_capability(drm::ClientCapability::Atomic, true);
+        let _ = card.release_master_lock();
+
+        let card_idx = cards.len();
+        let before = heads.len();
+        match collect_heads_on_card(
+            &card,
+            card_name,
+            card_idx,
+            mode,
+            &mut heads,
+            &mut discovered,
+        ) {
+            Ok(()) => {
+                if heads.len() > before {
+                    cards.push(CardCtx {
+                        card,
+                        path: path_str,
+                        name: card_name.to_owned(),
+                    });
+                }
             }
             Err(e) => {
                 discovered.push(format!("{card_name}: {e}"));
             }
         }
+
+        if matches!(mode, DisplayMode::Single(_)) && !heads.is_empty() {
+            break;
+        }
     }
 
-    let reason = match selector {
-        Some(selector) => format!(
-            "requested display {} is not an active DRM connector",
-            selector.configured_name()
-        ),
-        None => "no usable card/connector/CRTC found (is a display actually active?)".to_string(),
-    };
-    let discovered = if discovered.is_empty() {
-        "none".to_string()
-    } else {
-        discovered.join(", ")
-    };
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("{reason}; discovered DRM connectors: {discovered}"),
-    ))
+    if heads.is_empty() {
+        let reason = match mode {
+            DisplayMode::All => {
+                "no usable card/connector/CRTC found (is a display actually active?)".to_string()
+            }
+            DisplayMode::Single(sel) => format!(
+                "requested display {} is not an active DRM connector",
+                sel.configured_name()
+            ),
+        };
+        let discovered = if discovered.is_empty() {
+            "none".to_string()
+        } else {
+            discovered.join(", ")
+        };
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{reason}; discovered DRM connectors: {discovered}"),
+        ));
+    }
+
+    Ok((cards, heads))
 }
 
-/// Resolve the currently active CRTC on an already-open card without
-/// reopening the DRM device. Keeping the same fd is important: repeatedly
-/// opening the card while Xorg is dropping DRM master can prevent fbcon
-/// from restoring the text console after logout.
-fn find_crtc_on_card(card: &Card, card_name: &str) -> io::Result<(crtc::Handle, String)> {
-    let selector = display_selector()?;
+fn collect_heads_on_card(
+    card: &Card,
+    card_name: &str,
+    card_idx: usize,
+    mode: &DisplayMode,
+    heads: &mut Vec<EnumeratedHead>,
+    discovered: &mut Vec<String>,
+) -> io::Result<()> {
     let resources = card.resource_handles()?;
-    let mut discovered = Vec::new();
-
     for &conn_handle in resources.connectors() {
         let Ok(conn) = card.get_connector(conn_handle, false) else {
             continue;
@@ -234,29 +282,74 @@ fn find_crtc_on_card(card: &Card, card_name: &str) -> io::Result<(crtc::Handle, 
                 }
             },
         };
-        discovered.push(format!("{qualified_name} (active)"));
-        if selector.is_some_and(|wanted| !wanted.matches(card_name, &connector_name)) {
+
+        if let DisplayMode::Single(wanted) = mode
+            && !wanted.matches(card_name, &connector_name)
+        {
+            discovered.push(format!("{qualified_name} (active, skipped)"));
             continue;
         }
-        return Ok((crtc_handle, connector_name));
-    }
 
-    let reason = match selector {
-        Some(selector) => format!(
-            "requested display {} is not active on {card_name}",
-            selector.configured_name()
-        ),
-        None => format!("no active connector found on {card_name}"),
-    };
-    let discovered = if discovered.is_empty() {
-        "none".to_string()
-    } else {
-        discovered.join(", ")
-    };
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("{reason}; discovered DRM connectors: {discovered}"),
-    ))
+        let info = card.get_crtc(crtc_handle)?;
+        let (px, py) = info.position();
+        discovered.push(format!("{qualified_name} (active @{px},{py})"));
+        heads.push(EnumeratedHead {
+            card_idx,
+            crtc: crtc_handle,
+            connector: connector_name,
+            x: px as i32,
+            y: py as i32,
+        });
+
+        if matches!(mode, DisplayMode::Single(_)) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Refresh head list on already-open cards (same fds).
+fn refresh_heads(cards: &[CardCtx]) -> io::Result<Vec<EnumeratedHead>> {
+    let mode = display_mode()?;
+    let mut heads = Vec::new();
+    let mut discovered = Vec::new();
+    for (card_idx, ctx) in cards.iter().enumerate() {
+        collect_heads_on_card(
+            &ctx.card,
+            &ctx.name,
+            card_idx,
+            mode,
+            &mut heads,
+            &mut discovered,
+        )?;
+        if matches!(mode, DisplayMode::Single(_)) && !heads.is_empty() {
+            break;
+        }
+    }
+    if heads.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no active connector on open cards; discovered: {}",
+                if discovered.is_empty() {
+                    "none".to_string()
+                } else {
+                    discovered.join(", ")
+                }
+            ),
+        ));
+    }
+    Ok(heads)
+}
+
+/// Inclusive monitor rectangle in the composited virtual desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorGeom {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub primary: bool,
 }
 
 /// A raw BGRX8888 frame straight out of DRM, before any pixel-format
@@ -274,6 +367,8 @@ pub struct RawFrame {
     /// showing the previous tiles; the display hub treats this as a
     /// mandatory full-frame refresh.
     pub force_full: bool,
+    /// Monitor layout relative to this frame's origin (always ≥1 entry).
+    pub monitors: Vec<MonitorGeom>,
 }
 
 /// Stateful screen capturer. The DRM card fd stays open for this object's
@@ -291,7 +386,7 @@ impl Capturer {
                 drm: Some(drm),
                 drm_open_error: None,
             }),
-            Err(drm_err) if display_selector()?.is_some() => {
+            Err(drm_err) if display_mode()?.is_single() => {
                 // NvFBC captures the X screen as a whole and cannot honor a
                 // connector selection. Falling back here would silently show
                 // a different display than the administrator requested.
@@ -308,7 +403,7 @@ impl Capturer {
         let drm_error = match &mut self.drm {
             Some(drm) => match drm.capture() {
                 Ok(frame) => return Ok(frame),
-                Err(drm_err) if display_selector()?.is_some() => return Err(drm_err),
+                Err(drm_err) if display_mode()?.is_single() => return Err(drm_err),
                 Err(drm_err) => drm_err.to_string(),
             },
             None => self
@@ -324,6 +419,13 @@ impl Capturer {
                 stride: width as usize * 4,
                 data,
                 force_full: false,
+                monitors: vec![MonitorGeom {
+                    left: 0,
+                    top: 0,
+                    right: width.saturating_sub(1) as i32,
+                    bottom: height.saturating_sub(1) as i32,
+                    primary: true,
+                }],
             }),
             Err(nvfbc_err) => Err(io::Error::other(format!(
                 "DRM/KMS capture failed ({drm_error}), \
@@ -333,69 +435,101 @@ impl Capturer {
     }
 }
 
-struct DrmCapturer {
-    card: Card,
-    card_path: String,
-    card_name: String,
-    crtc: crtc::Handle,
+struct HeadFbState {
     connector: String,
-    /// Last primary-plane framebuffer handle we successfully captured.
-    /// `None` until the first frame; a change forces a full-frame refresh.
     last_fb: Option<u32>,
+}
+
+struct DrmCapturer {
+    cards: Vec<CardCtx>,
+    /// Per-head last FB id, keyed by connector name (stable across refresh).
+    head_fb: Vec<HeadFbState>,
+}
+
+struct CapturedHead {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    stride: usize,
+    data: Vec<u8>,
+    force_full: bool,
+    connector: String,
 }
 
 impl DrmCapturer {
     fn open() -> io::Result<Self> {
-        let opened = open_usable_card()?;
-
-        // Needed to see primary/cursor planes via plane_handles(), and to read
-        // CRTC_X/Y-style properties later on.
-        opened
-            .card
-            .set_client_capability(drm::ClientCapability::UniversalPlanes, true)?;
-        opened
-            .card
-            .set_client_capability(drm::ClientCapability::Atomic, true)?;
-
-        // We may have become DRM master by being the first opener. Drop it
-        // once, then retain this non-master fd for all subsequent captures.
-        let _ = opened.card.release_master_lock();
-        eprintln!(
-            "kmsrdp: capturing DRM display {}:{}",
-            opened.name, opened.connector
-        );
-
-        Ok(Self {
-            card: opened.card,
-            card_path: opened.path,
-            card_name: opened.name,
-            crtc: opened.crtc,
-            connector: opened.connector,
-            last_fb: None,
-        })
+        let (cards, heads) = open_drm_cards_and_heads()?;
+        for h in &heads {
+            let card = &cards[h.card_idx];
+            eprintln!(
+                "kmsrdp: capturing DRM display {}:{} @{},{}",
+                card.name, h.connector, h.x, h.y
+            );
+        }
+        let head_fb = heads
+            .iter()
+            .map(|h| HeadFbState {
+                connector: h.connector.clone(),
+                last_fb: None,
+            })
+            .collect();
+        Ok(Self { cards, head_fb })
     }
 
     fn capture(&mut self) -> io::Result<RawFrame> {
-        let (crtc, connector) = find_crtc_on_card(&self.card, &self.card_name)?;
-        self.crtc = crtc;
-        if connector != self.connector {
-            eprintln!(
-                "kmsrdp: capturing DRM display {}:{connector}",
-                self.card_name
-            );
-            self.connector = connector;
+        let heads = refresh_heads(&self.cards)?;
+        // Drop FB state for connectors that disappeared; keep known ones.
+        self.head_fb
+            .retain(|s| heads.iter().any(|h| h.connector == s.connector));
+        for h in &heads {
+            if !self.head_fb.iter().any(|s| s.connector == h.connector) {
+                self.head_fb.push(HeadFbState {
+                    connector: h.connector.clone(),
+                    last_fb: None,
+                });
+            }
         }
 
-        let (plane_handle, plane_info) = self
+        let mut captured = Vec::with_capacity(heads.len());
+        for head in &heads {
+            let piece = self.capture_head(head)?;
+            captured.push(piece);
+        }
+
+        if captured.len() == 1 {
+            let c = captured.pop().unwrap();
+            return Ok(RawFrame {
+                width: c.width,
+                height: c.height,
+                stride: c.stride,
+                data: c.data,
+                force_full: c.force_full,
+                monitors: vec![MonitorGeom {
+                    left: 0,
+                    top: 0,
+                    right: c.width.saturating_sub(1) as i32,
+                    bottom: c.height.saturating_sub(1) as i32,
+                    primary: true,
+                }],
+            });
+        }
+
+        Ok(compose_heads(&captured))
+    }
+
+    fn capture_head(&mut self, head: &EnumeratedHead) -> io::Result<CapturedHead> {
+        let card_ctx = &self.cards[head.card_idx];
+        let (plane_handle, plane_info) = card_ctx
             .card
             .plane_handles()?
             .into_iter()
             .find_map(|handle| {
-                let info = self.card.get_plane(handle).ok()?;
-                if info.crtc() != Some(self.crtc) {
+                let info = card_ctx.card.get_plane(handle).ok()?;
+                if info.crtc() != Some(head.crtc) {
                     return None;
                 }
-                let ty = plane_type(&self.card, handle).ok()?;
+                let ty = plane_type(&card_ctx.card, handle).ok()?;
                 (ty == "Primary").then_some((handle, info))
             })
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no primary plane for CRTC"))?;
@@ -408,20 +542,29 @@ impl DrmCapturer {
             )
         })?;
         let fb_id = u32::from(fb_handle);
-        let force_full = self.last_fb.is_some_and(|prev| prev != fb_id);
+        let prev = self
+            .head_fb
+            .iter()
+            .find(|s| s.connector == head.connector)
+            .and_then(|s| s.last_fb);
+        let force_full = prev.is_some_and(|p| p != fb_id);
         if force_full {
             eprintln!(
-                "kmsrdp: primary-plane framebuffer changed ({:?} -> {fb_id}); \
+                "kmsrdp: primary-plane framebuffer changed on {}:{} ({prev:?} -> {fb_id}); \
                  forcing full-frame refresh for connected clients",
-                self.last_fb
+                card_ctx.name, head.connector
             );
         }
-        self.last_fb = Some(fb_id);
+        if let Some(state) = self
+            .head_fb
+            .iter_mut()
+            .find(|s| s.connector == head.connector)
+        {
+            state.last_fb = Some(fb_id);
+        }
 
-        // Prefer GetFB2 (fourcc + modifier + per-plane offsets/pitches), fall
-        // back to legacy GetFB, exactly like export_fb2()/export_fb() upstream.
         let (size, fourcc, modifier, buffers, pitches, offsets) =
-            match self.card.get_planar_framebuffer(fb_handle) {
+            match card_ctx.card.get_planar_framebuffer(fb_handle) {
                 Ok(fb) => (
                     fb.size(),
                     fb.pixel_format(),
@@ -432,14 +575,13 @@ impl DrmCapturer {
                 ),
                 Err(e) => {
                     eprintln!("GetFB2 failed ({e}), falling back to legacy GetFB");
-                    let fb = self.card.get_framebuffer(fb_handle)?;
+                    let fb = card_ctx.card.get_framebuffer(fb_handle)?;
                     let mut buffers = [None; 4];
                     buffers[0] = fb.buffer();
                     let mut pitches = [0u32; 4];
                     pitches[0] = fb.pitch();
                     (
                         fb.size(),
-                        // Legacy GetFB has no fourcc; DRM only ever used XRGB8888 here.
                         DrmFourcc::Xrgb8888,
                         Some(DrmModifier::Linear),
                         buffers,
@@ -452,44 +594,27 @@ impl DrmCapturer {
         let buf_handle = buffers[0].ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "framebuffer has no plane-0 buffer")
         })?;
-        let fd = self.card.buffer_to_prime_fd(buf_handle, drm::CLOEXEC)?;
+        let fd = card_ctx.card.buffer_to_prime_fd(buf_handle, drm::CLOEXEC)?;
         let (width, height) = size;
 
-        // Plain Linear XRGB8888/ARGB8888 can be read back with a CPU mmap;
-        // tiled (vendor-modifier) framebuffers of the same formats go through a
-        // GBM/EGL detile pass instead. Anything else (e.g. multi-plane YUV)
-        // isn't supported by either path.
         let is_plain_bgrx = matches!(fourcc, DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888)
             && matches!(modifier, None | Some(DrmModifier::Linear));
         let is_detileable_bgrx =
             matches!(fourcc, DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888) && modifier.is_some();
 
-        if is_plain_bgrx {
+        let (stride, data) = if is_plain_bgrx {
             let pitch = pitches[0] as usize;
             let map_len = pitch * height as usize;
-
-            // Safety: `fd` is a dma-buf we just exported ourselves via PRIME,
-            // backing a buffer at least `pitch * height` bytes; nothing else in
-            // this process writes to it concurrently.
             let mmap = unsafe {
                 MmapOptions::new()
                     .len(map_len)
                     .map(fd.as_raw_fd())
                     .map_err(|e| io::Error::other(format!("mmap failed: {e}")))?
             };
-
-            return Ok(RawFrame {
-                width,
-                height,
-                stride: pitch,
-                data: mmap.to_vec(),
-                force_full,
-            });
-        }
-
-        if is_detileable_bgrx {
+            (pitch, mmap.to_vec())
+        } else if is_detileable_bgrx {
             let data = gpu_detile::detile_to_bgrx(
-                &self.card_path,
+                &card_ctx.path,
                 fd.as_raw_fd(),
                 fourcc,
                 modifier.expect("checked by is_detileable_bgrx"),
@@ -498,22 +623,136 @@ impl DrmCapturer {
                 offsets[0],
                 pitches[0],
             )?;
-            return Ok(RawFrame {
-                width,
-                height,
-                stride: width as usize * 4,
-                data,
-                force_full,
-            });
-        }
+            (width as usize * 4, data)
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "format {fourcc:?} / modifier {modifier:?} isn't supported \
+                     (need XRGB8888/ARGB8888)"
+                ),
+            ));
+        };
 
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "format {fourcc:?} / modifier {modifier:?} isn't supported \
-                 (need XRGB8888/ARGB8888)"
-            ),
-        ))
+        Ok(CapturedHead {
+            x: head.x,
+            y: head.y,
+            width,
+            height,
+            stride,
+            data,
+            force_full,
+            connector: head.connector.clone(),
+        })
+    }
+}
+
+/// Compose multiple head captures into one bounding-box canvas.
+fn compose_heads(heads: &[CapturedHead]) -> RawFrame {
+    let min_x = heads.iter().map(|h| h.x).min().unwrap_or(0);
+    let min_y = heads.iter().map(|h| h.y).min().unwrap_or(0);
+    let max_x = heads
+        .iter()
+        .map(|h| h.x + h.width as i32)
+        .max()
+        .unwrap_or(0);
+    let max_y = heads
+        .iter()
+        .map(|h| h.y + h.height as i32)
+        .max()
+        .unwrap_or(0);
+    let canvas_w = (max_x - min_x).max(1) as u32;
+    let canvas_h = (max_y - min_y).max(1) as u32;
+    let stride = canvas_w as usize * 4;
+    let mut data = vec![0u8; stride * canvas_h as usize];
+    let force_full = heads.iter().any(|h| h.force_full);
+
+    // Primary: head closest to origin (then first).
+    let primary_idx = heads
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, h)| (h.x * h.x + h.y * h.y, h.connector.as_str()))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    let mut monitors = Vec::with_capacity(heads.len());
+    for (i, head) in heads.iter().enumerate() {
+        let dx = head.x - min_x;
+        let dy = head.y - min_y;
+        blit_bgrx(
+            &mut data,
+            stride,
+            canvas_w,
+            canvas_h,
+            &head.data,
+            head.stride,
+            head.width,
+            head.height,
+            dx,
+            dy,
+        );
+        monitors.push(MonitorGeom {
+            left: dx,
+            top: dy,
+            right: dx + head.width as i32 - 1,
+            bottom: dy + head.height as i32 - 1,
+            primary: i == primary_idx,
+        });
+    }
+
+    RawFrame {
+        width: canvas_w,
+        height: canvas_h,
+        stride,
+        data,
+        force_full,
+        monitors,
+    }
+}
+
+/// Copy a tightly-or-padded BGRX source rectangle into `dst` at (`dst_x`,`dst_y`).
+#[allow(clippy::too_many_arguments)]
+fn blit_bgrx(
+    dst: &mut [u8],
+    dst_stride: usize,
+    dst_w: u32,
+    dst_h: u32,
+    src: &[u8],
+    src_stride: usize,
+    src_w: u32,
+    src_h: u32,
+    dst_x: i32,
+    dst_y: i32,
+) {
+    let src_w = src_w as i32;
+    let src_h = src_h as i32;
+    let dst_w = dst_w as i32;
+    let dst_h = dst_h as i32;
+    for row in 0..src_h {
+        let dy = dst_y + row;
+        if dy < 0 || dy >= dst_h {
+            continue;
+        }
+        let mut src_col0 = 0i32;
+        let mut dst_col0 = dst_x;
+        let mut copy_w = src_w;
+        if dst_col0 < 0 {
+            src_col0 = -dst_col0;
+            copy_w += dst_col0;
+            dst_col0 = 0;
+        }
+        if dst_col0 + copy_w > dst_w {
+            copy_w = dst_w - dst_col0;
+        }
+        if copy_w <= 0 || src_col0 >= src_w {
+            continue;
+        }
+        let bytes = copy_w as usize * 4;
+        let s = row as usize * src_stride + src_col0 as usize * 4;
+        let d = dy as usize * dst_stride + dst_col0 as usize * 4;
+        if s + bytes <= src.len() && d + bytes <= dst.len() {
+            dst[d..d + bytes].copy_from_slice(&src[s..s + bytes]);
+        }
     }
 }
 
@@ -540,17 +779,21 @@ pub fn capture_frame() -> io::Result<image::RgbImage> {
 
 #[cfg(test)]
 mod tests {
-    use super::DisplaySelector;
+    use super::*;
 
     #[test]
-    fn empty_display_selector_uses_default() {
-        assert_eq!(DisplaySelector::parse("").unwrap(), None);
-        assert_eq!(DisplaySelector::parse("  ").unwrap(), None);
+    fn empty_or_all_display_mode_composites_all() {
+        assert_eq!(DisplayMode::parse("").unwrap(), DisplayMode::All);
+        assert_eq!(DisplayMode::parse("  ").unwrap(), DisplayMode::All);
+        assert_eq!(DisplayMode::parse("all").unwrap(), DisplayMode::All);
+        assert_eq!(DisplayMode::parse("ALL").unwrap(), DisplayMode::All);
     }
 
     #[test]
     fn connector_only_selector_matches_any_card() {
-        let selector = DisplaySelector::parse(" DP-1 ").unwrap().unwrap();
+        let DisplayMode::Single(selector) = DisplayMode::parse(" DP-1 ").unwrap() else {
+            panic!("expected single");
+        };
         assert!(selector.matches("card0", "DP-1"));
         assert!(selector.matches("card1", "DP-1"));
         assert!(!selector.matches("card0", "HDMI-A-1"));
@@ -558,7 +801,9 @@ mod tests {
 
     #[test]
     fn qualified_selector_matches_one_card_and_connector() {
-        let selector = DisplaySelector::parse("card1:DP-1").unwrap().unwrap();
+        let DisplayMode::Single(selector) = DisplayMode::parse("card1:DP-1").unwrap() else {
+            panic!("expected single");
+        };
         assert!(selector.matches("card1", "DP-1"));
         assert!(!selector.matches("card0", "DP-1"));
         assert!(!selector.matches("card1", "DP-2"));
@@ -566,8 +811,44 @@ mod tests {
 
     #[test]
     fn malformed_qualified_selector_is_rejected() {
-        assert!(DisplaySelector::parse(":DP-1").is_err());
-        assert!(DisplaySelector::parse("card0:").is_err());
-        assert!(DisplaySelector::parse("card0:DP-1:extra").is_err());
+        assert!(DisplayMode::parse(":DP-1").is_err());
+        assert!(DisplayMode::parse("card0:").is_err());
+        assert!(DisplayMode::parse("card0:DP-1:extra").is_err());
+    }
+
+    #[test]
+    fn compose_two_heads_side_by_side() {
+        let left = CapturedHead {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+            stride: 8,
+            data: vec![1, 0, 0, 0, 2, 0, 0, 0],
+            force_full: false,
+            connector: "A".into(),
+        };
+        let right = CapturedHead {
+            x: 2,
+            y: 0,
+            width: 2,
+            height: 1,
+            stride: 8,
+            data: vec![3, 0, 0, 0, 4, 0, 0, 0],
+            force_full: true,
+            connector: "B".into(),
+        };
+        let frame = compose_heads(&[left, right]);
+        assert_eq!((frame.width, frame.height), (4, 1));
+        assert!(frame.force_full);
+        assert_eq!(frame.data[0], 1);
+        assert_eq!(frame.data[4], 2);
+        assert_eq!(frame.data[8], 3);
+        assert_eq!(frame.data[12], 4);
+        assert_eq!(frame.monitors.len(), 2);
+        assert!(frame.monitors[0].primary);
+        assert!(!frame.monitors[1].primary);
+        assert_eq!(frame.monitors[1].left, 2);
+        assert_eq!(frame.monitors[1].right, 3);
     }
 }

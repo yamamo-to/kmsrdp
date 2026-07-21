@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 use rdpcore_server::diff::{Rect, find_dirty_rects};
 use rdpcore_server::{
-    BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay,
+    BitmapUpdate, DesktopSize, DisplayUpdate, MonitorLayoutEntry, PixelFormat, RdpServerDisplay,
     RdpServerDisplayUpdates,
 };
 use tokio::sync::broadcast;
@@ -38,6 +38,7 @@ pub struct DisplayHub {
     /// Latest full-frame bitmap, so a late or lagged subscriber can paint
     /// a consistent canvas instead of waiting for the next dirty-rect change.
     latest_full: Arc<Mutex<Option<BitmapUpdate>>>,
+    monitors: Mutex<Vec<MonitorLayoutEntry>>,
 }
 
 impl DisplayHub {
@@ -47,6 +48,7 @@ impl DisplayHub {
         height: u16,
         mouse_scale: MouseScale,
         capturer: capture::Capturer,
+        monitors: Vec<MonitorLayoutEntry>,
     ) -> Arc<Self> {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let hub = Arc::new(Self {
@@ -54,6 +56,7 @@ impl DisplayHub {
             tx,
             mouse_scale,
             latest_full: Arc::new(Mutex::new(None)),
+            monitors: Mutex::new(monitors),
         });
         let capture_hub = Arc::clone(&hub);
         tokio::spawn(async move {
@@ -114,6 +117,17 @@ impl DisplayHub {
 
             match result {
                 Ok(raw) => {
+                    *self.monitors.lock().unwrap() = raw
+                        .monitors
+                        .iter()
+                        .map(|m| MonitorLayoutEntry {
+                            left: m.left,
+                            top: m.top,
+                            right: m.right,
+                            bottom: m.bottom,
+                            primary: m.primary,
+                        })
+                        .collect();
                     let current_size = DesktopSize {
                         width: raw.width as u16,
                         height: raw.height as u16,
@@ -301,6 +315,10 @@ impl RdpServerDisplay for Display {
 
     async fn updates(&self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
         Ok(Box::new(self.hub.subscribe()))
+    }
+
+    fn monitor_layout(&self) -> Vec<MonitorLayoutEntry> {
+        self.hub.monitors.lock().unwrap().clone()
     }
 }
 

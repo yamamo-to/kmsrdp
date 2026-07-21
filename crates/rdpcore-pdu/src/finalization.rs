@@ -1,6 +1,7 @@
-//! Share Data Header + the four finalization messages (MS-RDPBCGR
-//! 2.2.1.14-2.2.1.20): Synchronize, Control, Font List/Map. All four ride
-//! inside a Share Control Header `DataPdu` (type 0x7).
+//! Share Data Header + finalization / session messages (MS-RDPBCGR):
+//! Synchronize, Control, Font List/Map, Save Session Info, Monitor Layout,
+//! Refresh Rect, Suppress Output. These ride inside a Share Control Header
+//! `DataPdu` (type 0x7).
 
 use crate::DecodeError;
 use crate::capability_sets::{ShareControlHeader, ShareControlPduType};
@@ -16,6 +17,10 @@ pub enum ShareDataPduType {
     RefreshRect,
     /// Client → server: pause/resume display updates (MS-RDPBCGR 2.2.11.3).
     SuppressOutput,
+    /// Server → client: logon / session notification (MS-RDPBCGR 2.2.10).
+    SaveSessionInfo,
+    /// Server → client: monitor rectangles (MS-RDPBCGR 2.2.12.1).
+    MonitorLayout,
 }
 
 impl ShareDataPduType {
@@ -27,6 +32,8 @@ impl ShareDataPduType {
             Self::Synchronize => 0x1F,
             Self::RefreshRect => 0x21,
             Self::SuppressOutput => 0x23,
+            Self::SaveSessionInfo => 0x26,
+            Self::MonitorLayout => 0x37,
         }
     }
 
@@ -38,6 +45,8 @@ impl ShareDataPduType {
             0x1F => Self::Synchronize,
             0x21 => Self::RefreshRect,
             0x23 => Self::SuppressOutput,
+            0x26 => Self::SaveSessionInfo,
+            0x37 => Self::MonitorLayout,
             _ => return None,
         })
     }
@@ -308,6 +317,71 @@ pub fn decode_refresh_rect(body: &[u8]) -> Result<Vec<InclusiveRect>, DecodeErro
     Ok(rects)
 }
 
+/// `INFO_TYPE_PLAINNOTIFY` (MS-RDPBCGR 2.2.10.1.1).
+pub const INFO_TYPE_PLAIN_NOTIFY: u32 = 0x0000_0002;
+const PLAIN_NOTIFY_PAD: usize = 576;
+
+/// Body of `TS_SAVE_SESSION_INFO_PDU_DATA` for PLAINNOTIFY (580 bytes).
+pub fn encode_save_session_info_plain_notify() -> Vec<u8> {
+    let mut body = Vec::with_capacity(4 + PLAIN_NOTIFY_PAD);
+    body.write_u32_le(INFO_TYPE_PLAIN_NOTIFY);
+    body.resize(4 + PLAIN_NOTIFY_PAD, 0);
+    body
+}
+
+/// One monitor entry for Monitor Layout PDU (MS-RDPBCGR 2.2.12.1 / TS_MONITOR_DEF).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorDef {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub primary: bool,
+}
+
+impl MonitorDef {
+    pub const PRIMARY: u32 = 1;
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.write_i32_le(self.left);
+        out.write_i32_le(self.top);
+        out.write_i32_le(self.right);
+        out.write_i32_le(self.bottom);
+        out.write_u32_le(if self.primary { Self::PRIMARY } else { 0 });
+    }
+
+    fn decode(cursor: &mut ReadCursor<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            left: cursor.read_i32_le()?,
+            top: cursor.read_i32_le()?,
+            right: cursor.read_i32_le()?,
+            bottom: cursor.read_i32_le()?,
+            primary: cursor.read_u32_le()? & Self::PRIMARY != 0,
+        })
+    }
+}
+
+/// Body of `TS_MONITOR_LAYOUT_PDU`.
+pub fn encode_monitor_layout(monitors: &[MonitorDef]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4 + monitors.len() * 20);
+    body.write_u32_le(monitors.len() as u32);
+    for m in monitors {
+        m.encode(&mut body);
+    }
+    body
+}
+
+/// Decode Monitor Layout body (for tests / round-trip).
+pub fn decode_monitor_layout(body: &[u8]) -> Result<Vec<MonitorDef>, DecodeError> {
+    let mut cursor = ReadCursor::new(body);
+    let count = cursor.read_u32_le()? as usize;
+    let mut monitors = Vec::with_capacity(count);
+    for _ in 0..count {
+        monitors.push(MonitorDef::decode(&mut cursor)?);
+    }
+    Ok(monitors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +471,57 @@ mod tests {
         encoded.extend_from_slice(&[0xAA; 4]); // pretend padding some client tacked on
         let decoded = DataPdu::decode(&encoded).unwrap();
         assert_eq!(decoded.body.len(), 8);
+    }
+
+    #[test]
+    fn plain_notify_body_is_580_bytes() {
+        let body = encode_save_session_info_plain_notify();
+        assert_eq!(body.len(), 580);
+        assert_eq!(&body[..4], &INFO_TYPE_PLAIN_NOTIFY.to_le_bytes());
+        assert!(body[4..].iter().all(|&b| b == 0));
+
+        let pdu = DataPdu {
+            share_id: 0x1000,
+            pdu_source: 1003,
+            stream_id: STREAM_UNDEFINED,
+            pdu_type2: ShareDataPduType::SaveSessionInfo,
+            body,
+        };
+        let decoded = DataPdu::decode(&pdu.encode()).unwrap();
+        assert_eq!(decoded.pdu_type2, ShareDataPduType::SaveSessionInfo);
+        assert_eq!(decoded.body.len(), 580);
+    }
+
+    #[test]
+    fn monitor_layout_round_trip() {
+        let monitors = [
+            MonitorDef {
+                left: 0,
+                top: 0,
+                right: 1919,
+                bottom: 1079,
+                primary: true,
+            },
+            MonitorDef {
+                left: 1920,
+                top: 0,
+                right: 3839,
+                bottom: 1079,
+                primary: false,
+            },
+        ];
+        let body = encode_monitor_layout(&monitors);
+        assert_eq!(decode_monitor_layout(&body).unwrap(), monitors);
+        let pdu = DataPdu {
+            share_id: 0x1000,
+            pdu_source: 1003,
+            stream_id: STREAM_UNDEFINED,
+            pdu_type2: ShareDataPduType::MonitorLayout,
+            body,
+        };
+        assert_eq!(
+            DataPdu::decode(&pdu.encode()).unwrap().pdu_type2,
+            ShareDataPduType::MonitorLayout
+        );
     }
 }

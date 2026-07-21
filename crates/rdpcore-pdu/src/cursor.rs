@@ -108,6 +108,10 @@ impl<'a> ReadCursor<'a> {
         Ok(v)
     }
 
+    pub fn read_i32_le(&mut self) -> Result<i32, NotEnoughBytes> {
+        Ok(self.read_u32_le()? as i32)
+    }
+
     pub fn read_u64_le(&mut self) -> Result<u64, NotEnoughBytes> {
         self.ensure(8)?;
         let v = u64::from_le_bytes(self.buf[self.pos..self.pos + 8].try_into().unwrap());
@@ -138,6 +142,7 @@ pub trait WriteBuf {
     fn write_u16_be(&mut self, v: u16);
     fn write_u16_le(&mut self, v: u16);
     fn write_u32_le(&mut self, v: u32);
+    fn write_i32_le(&mut self, v: i32);
     fn write_u64_le(&mut self, v: u64);
     fn write_slice(&mut self, s: &[u8]);
 }
@@ -156,6 +161,10 @@ impl WriteBuf for Vec<u8> {
     }
 
     fn write_u32_le(&mut self, v: u32) {
+        self.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn write_i32_le(&mut self, v: i32) {
         self.extend_from_slice(&v.to_le_bytes());
     }
 

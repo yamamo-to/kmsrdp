@@ -126,9 +126,38 @@ async fn main() -> Result<()> {
     let width = initial.width as u16;
     let height = initial.height as u16;
     println!("desktop size: {width}x{height}");
+    if initial.monitors.len() > 1 {
+        println!(
+            "composite monitors: {}",
+            initial
+                .monitors
+                .iter()
+                .map(|m| format!(
+                    "{}x{}@{},{}{}",
+                    m.right - m.left + 1,
+                    m.bottom - m.top + 1,
+                    m.left,
+                    m.top,
+                    if m.primary { " (primary)" } else { "" }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let mouse_scale: MouseScale = Arc::new(Mutex::new((f64::from(width), f64::from(height))));
-    let hub = DisplayHub::start(width, height, mouse_scale.clone(), capturer);
+    let monitors = initial
+        .monitors
+        .iter()
+        .map(|m| rdpcore_server::MonitorLayoutEntry {
+            left: m.left,
+            top: m.top,
+            right: m.right,
+            bottom: m.bottom,
+            primary: m.primary,
+        })
+        .collect();
+    let hub = DisplayHub::start(width, height, mouse_scale.clone(), capturer, monitors);
     let display = Display::new(hub);
 
     let username = std::env::var("KMSRDP_USER").unwrap_or_else(|_| "kmsrdp".to_string());

@@ -18,8 +18,10 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
 
 - **Display:** DRM/KMS capture (Linear mmap or GBM/EGL detile); NVIDIA NvFBC
   fallback when no CRTC is bound; dirty 64×64 tiles; RDP 6.0 planar (typical
-  clients) or NSCodec SurfaceCommands (macOS Windows App); optional
-  `KMSRDP_DISPLAY` for connector selection
+  clients) or NSCodec SurfaceCommands (macOS Windows App); composite all
+  connected CRTCs by default (`KMSRDP_DISPLAY=all` / unset) or one connector
+  (`KMSRDP_DISPLAY=DP-1` / `card1:DP-1`); Save Session Info (PLAINNOTIFY) on
+  connect; Monitor Layout when two or more CRTCs are composited
 - **Input:** `uinput` mouse/keyboard; CJK IME text on X11 (XTest)
 - **Clipboard:** text-only CLIPRDR; one process-wide local poller shared by
   all sessions
@@ -32,7 +34,8 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
 
 ## Limitations
 
-- Single monitor; concurrent clients share one desktop and one input device
+- Concurrent clients share one (possibly composited) desktop and one input device
+- Not true per-monitor RDP windows — multi-head is one virtual desktop canvas
 - Framebuffers: single-plane XRGB8888/ARGB8888 only (tiled modifiers are
   detiled via GBM/EGL when needed)
 - Drive FUSE: no delete/rename/setattr; no printer/CUPS yet
@@ -56,8 +59,8 @@ KMSRDP_USER=myuser KMSRDP_PASSWORD=mypassword ./target/release/rdp_server
 Connect with `xfreerdp /v:<host> /cert:ignore /u:myuser /p:mypassword`, mstsc,
 or the macOS Windows App. Optional: `KMSRDP_BIND=127.0.0.1` /
 `KMSRDP_PORT=3390` to restrict the listen address; `KMSRDP_TLS_HOSTS=host,1.2.3.4`
-for certificate SANs; `KMSRDP_DISPLAY=DP-1` or `card1:DP-1` to pick a connector
-(disables NvFBC fallback).
+for certificate SANs; `KMSRDP_DISPLAY=all` (default) to composite every CRTC, or
+`DP-1` / `card1:DP-1` for a single connector (disables NvFBC fallback).
 
 Audio needs `parec` / `paplay` / `pactl` on `$PATH`. Root FUSE mounts need
 `user_allow_other` in `/etc/fuse.conf`.

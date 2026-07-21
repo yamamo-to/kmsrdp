@@ -21,7 +21,7 @@ mod transport;
 
 pub use credentials::{CredentialValidator, Credentials, ExactMatchCredentialValidator};
 pub use display::{
-    BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay,
+    BitmapUpdate, DesktopSize, DisplayUpdate, MonitorLayoutEntry, PixelFormat, RdpServerDisplay,
     RdpServerDisplayUpdates,
 };
 pub use input::{KeyboardEvent, MouseEvent, RdpServerInputHandler};

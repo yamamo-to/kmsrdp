@@ -9,7 +9,8 @@ use rdpcore_pdu::fastpath::{
     self, FastPathInputEvent, UPDATE_CODE_BITMAP, UPDATE_CODE_SURFACE_COMMANDS, keyboard_flags,
 };
 use rdpcore_pdu::finalization::{
-    DataPdu, ShareDataPduType, decode_refresh_rect, decode_suppress_output,
+    DataPdu, MonitorDef, STREAM_UNDEFINED, ShareDataPduType, decode_refresh_rect,
+    decode_suppress_output, encode_monitor_layout,
 };
 use rdpcore_pdu::surface_commands::{FRAME_ACTION_BEGIN, FRAME_ACTION_END, encode_frame_marker};
 use rdpcore_rdpdr::{DriveConsumerFactory, RdpdrChannel};
@@ -598,6 +599,44 @@ impl Session {
         // No soft-cursor PDUs: we do not track the host cursor shape, and a
         // DIY Color Pointer showed up as a square block beside the client's
         // local cursor. Leave pointer drawing to the client.
+
+        // Advertise host monitor rectangles when the virtual desktop spans
+        // more than one CRTC (clients may ignore this).
+        let monitors = self.display.monitor_layout();
+        if monitors.len() > 1 {
+            let defs: Vec<MonitorDef> = monitors
+                .iter()
+                .map(|m| MonitorDef {
+                    left: m.left,
+                    top: m.top,
+                    right: m.right,
+                    bottom: m.bottom,
+                    primary: m.primary,
+                })
+                .collect();
+            let body = DataPdu {
+                share_id: accepted.share_id,
+                pdu_source: io_channel_id,
+                stream_id: STREAM_UNDEFINED,
+                pdu_type2: ShareDataPduType::MonitorLayout,
+                body: encode_monitor_layout(&defs),
+            }
+            .encode();
+            let bytes = rdpcore_pdu::x224::wrap_data(
+                &rdpcore_pdu::mcs::SendData {
+                    initiator: accepted.user_channel_id,
+                    channel_id: io_channel_id,
+                    data: body,
+                    complete: true,
+                }
+                .encode_indication(),
+            );
+            let _ = frame_sender.send(Frame {
+                channel: ChannelKey::Io,
+                priority: Priority::Latency,
+                bytes,
+            });
+        }
 
         // Set while a server-initiated resize (Deactivate-All + new Demand
         // Active, see `Acceptor::begin_resize`) is in flight: slow-path

@@ -25,6 +25,7 @@ use rdpcore_pdu::client_info::ClientInfoPdu;
 use rdpcore_pdu::cursor::ReadCursor;
 use rdpcore_pdu::finalization::{
     ControlPdu, DataPdu, FontPdu, STREAM_UNDEFINED, ShareDataPduType, SynchronizePdu,
+    encode_save_session_info_plain_notify,
 };
 use rdpcore_pdu::gcc::{
     ClientGccBlocks, ConferenceCreateRequest, ConferenceCreateResponse, ServerCoreData,
@@ -733,6 +734,7 @@ impl Acceptor {
             }
             ShareDataPduType::FontList => {
                 response.extend(send_io_indication(server_font_map_pdu()));
+                response.extend(send_io_indication(server_save_session_info_plain_notify()));
 
                 let static_channels = self
                     .static_channel_names
@@ -761,7 +763,9 @@ impl Acceptor {
             // stray input / suppress); tolerate and ignore them rather than error.
             ShareDataPduType::FontMap
             | ShareDataPduType::RefreshRect
-            | ShareDataPduType::SuppressOutput => {}
+            | ShareDataPduType::SuppressOutput
+            | ShareDataPduType::SaveSessionInfo
+            | ShareDataPduType::MonitorLayout => {}
         }
 
         self.state = State::WaitFinalization(progress);
@@ -833,6 +837,13 @@ fn server_font_map_pdu() -> Vec<u8> {
     data_pdu_bytes(
         ShareDataPduType::FontMap,
         FontPdu::font_map_default().encode_body(),
+    )
+}
+
+fn server_save_session_info_plain_notify() -> Vec<u8> {
+    data_pdu_bytes(
+        ShareDataPduType::SaveSessionInfo,
+        encode_save_session_info_plain_notify(),
     )
 }
 

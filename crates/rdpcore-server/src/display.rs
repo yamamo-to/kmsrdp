@@ -13,6 +13,16 @@ pub struct DesktopSize {
     pub height: u16,
 }
 
+/// Inclusive monitor rectangle in the virtual desktop (for Monitor Layout PDU).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorLayoutEntry {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub primary: bool,
+}
+
 /// Currently only raw BGRX8888 - the same in-memory layout
 /// `kmsrdp::capture` already reads straight off DRM/KMS, so no per-pixel
 /// conversion is needed on the way in (compressed codecs would be additive).
@@ -91,6 +101,11 @@ pub enum DisplayUpdate {
 pub trait RdpServerDisplay: Send + Sync {
     async fn size(&self) -> DesktopSize;
     async fn updates(&self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>>;
+
+    /// Host monitor layout for the current virtual desktop (≥1 when known).
+    fn monitor_layout(&self) -> Vec<MonitorLayoutEntry> {
+        Vec::new()
+    }
 }
 
 #[async_trait]

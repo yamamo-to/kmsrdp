@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.24
+Version:        0.1.25
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -97,6 +97,10 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Tue Jul 21 2026 kmsrdp contributors <noreply@example.com> - 0.1.25-1
+- Composite multi-monitor capture with KMSRDP_DISPLAY selection
+- Save Session Info PLAINNOTIFY; Monitor Layout when compositing 2+ CRTCs
+
 * Tue Jul 21 2026 kmsrdp contributors <noreply@example.com> - 0.1.24-1
 - Frame Marker, Suppress Output / Refresh Rect, and MaxRequestSize handling
 - Leave mouse pointer drawing to the client (no soft-cursor PDUs)

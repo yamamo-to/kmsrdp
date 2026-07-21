@@ -1,3 +1,10 @@
+kmsrdp (0.1.25) unstable; urgency=medium
+
+  * Composite multi-monitor capture with KMSRDP_DISPLAY selection.
+  * Save Session Info PLAINNOTIFY; Monitor Layout when compositing 2+ CRTCs.
+
+ -- kmsrdp contributors <noreply@example.com>  Tue, 21 Jul 2026 10:39:00 +0900
+
 kmsrdp (0.1.24) unstable; urgency=medium
 
   * Frame Marker, Suppress Output / Refresh Rect, and MaxRequestSize handling.
