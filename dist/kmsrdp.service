@@ -11,6 +11,10 @@ Type=simple
 ExecStart=/usr/libexec/kmsrdp/kmsrdp-server
 Restart=on-failure
 RestartSec=2
+# Capture/FUSE can sit in uninterruptible sleep while the GPU/session tears
+# down; don't wait the default ~90s before SIGKILL on stop/shutdown.
+TimeoutStopSec=5
+KillMode=control-group
 # Avoid infinite restart spam if startup keeps failing.
 StartLimitIntervalSec=60
 StartLimitBurst=5

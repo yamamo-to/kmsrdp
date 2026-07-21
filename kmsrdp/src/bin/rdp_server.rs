@@ -245,7 +245,33 @@ async fn main() -> Result<()> {
         "RDP server listening on {addr} (TLS + optional NLA - use e.g. \
          `xfreerdp /cert:ignore /u:<user> /p:<password>` or mstsc)"
     );
-    server.run().await
+    // Exit immediately on stop signals. Tokio graceful shutdown would wait
+    // for DRM `spawn_blocking` / FUSE threads and can hang host shutdown for
+    // the default systemd TimeoutStopSec (~90s). `process::exit` skips that;
+    // the unit also uses a short TimeoutStopSec + SIGKILL as a backstop.
+    tokio::select! {
+        result = server.run() => result,
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("kmsrdp: SIGINT, exiting");
+            std::process::exit(0);
+        }
+        _ = sigterm() => {
+            eprintln!("kmsrdp: SIGTERM, exiting");
+            std::process::exit(0);
+        }
+    }
+}
+
+async fn sigterm() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut stream) => {
+            stream.recv().await;
+        }
+        Err(e) => {
+            eprintln!("kmsrdp: cannot install SIGTERM handler ({e}); waiting forever");
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// Listen address from `KMSRDP_BIND` (default `0.0.0.0`) and `KMSRDP_PORT`
