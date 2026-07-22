@@ -84,6 +84,7 @@ impl DisplayHub {
         }
         let mut previous: Option<PrevFrame> = None;
         let mut negotiated_size = *self.size.lock().unwrap();
+        let mut consecutive_failures: u32 = 0;
         loop {
             let task = tokio::task::spawn_blocking(move || {
                 let result = capturer.capture();
@@ -96,7 +97,7 @@ impl DisplayHub {
                     result
                 }
                 Err(e) => {
-                    eprintln!("capture task panicked: {e}");
+                    tracing::error!("kmsrdp: capture task panicked: {e}");
                     match tokio::task::spawn_blocking(capture::Capturer::new).await {
                         Ok(Ok(replacement)) => {
                             capturer = replacement;
@@ -104,11 +105,17 @@ impl DisplayHub {
                             continue;
                         }
                         Ok(Err(open_err)) => {
-                            eprintln!("failed to reopen capturer: {open_err}");
+                            tracing::error!(
+                                "kmsrdp: failed to reopen capturer: {open_err}; \
+                                 stopping capture loop (clients will stay black);"
+                            );
                             return;
                         }
                         Err(open_err) => {
-                            eprintln!("capturer reopen task panicked: {open_err}");
+                            tracing::error!(
+                                "kmsrdp: capturer reopen task panicked: {open_err}; \
+                                 stopping capture loop"
+                            );
                             return;
                         }
                     }
@@ -117,6 +124,12 @@ impl DisplayHub {
 
             match result {
                 Ok(raw) => {
+                    if consecutive_failures > 0 {
+                        tracing::warn!(
+                            "kmsrdp: capture recovered after {consecutive_failures} failure(s);"
+                        );
+                        consecutive_failures = 0;
+                    }
                     *self.monitors.lock().unwrap() = raw
                         .monitors
                         .iter()
@@ -158,6 +171,17 @@ impl DisplayHub {
                         NonZeroU16::new(raw.height as u16),
                         NonZeroUsize::new(raw.stride),
                     ) else {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        if should_log_capture_failure(consecutive_failures) {
+                            tracing::info!(
+                                "kmsrdp: capture returned a zero-sized frame \
+                                 ({}x{}, stride {}); clients stay black until a real frame arrives",
+                                raw.width,
+                                raw.height,
+                                raw.stride
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     };
 
@@ -226,11 +250,24 @@ impl DisplayHub {
                         let _ = self.tx.send(DisplayUpdate::Bitmap(sub));
                     }
                 }
-                Err(e) => eprintln!("capture failed: {e}"),
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if should_log_capture_failure(consecutive_failures) {
+                        tracing::warn!(
+                            "kmsrdp: capture failed ({consecutive_failures} consecutive);: {e}"
+                        )
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+}
+
+/// Log the 1st failure, then every 20th, so a dead CRTC is obvious without
+/// flooding the journal at ~20 Hz.
+fn should_log_capture_failure(consecutive: u32) -> bool {
+    consecutive == 1 || consecutive.is_multiple_of(20)
 }
 
 fn dirty_area(rects: &[Rect]) -> usize {

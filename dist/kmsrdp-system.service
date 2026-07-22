@@ -34,6 +34,9 @@ LockPersonality=yes
 RestrictRealtime=yes
 SystemCallArchitectures=native
 UMask=0077
+# Persisted self-signed TLS cert/key (tls.crt / tls.key). systemd sets
+# STATE_DIRECTORY; ProtectSystem=strict still allows writes here.
+StateDirectory=kmsrdp
 # Capture/FUSE can sit in uninterruptible sleep while the GPU/session tears
 # down; don't wait the default ~90s before SIGKILL on stop/shutdown.
 TimeoutStopSec=5

@@ -21,7 +21,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kmsrdp::audio::LocalAudioFactory;
 use kmsrdp::audio_input::VirtualMicFactory;
 use kmsrdp::capture;
@@ -86,10 +86,10 @@ impl RdpServerInputHandler for Input {
         match uinput::linux_keycode_from_rdp_scancode(code, extended) {
             Some(keycode) => {
                 if let Err(e) = self.device.key(keycode, down) {
-                    eprintln!("key injection failed: {e}");
+                    tracing::warn!(error = %e, "key injection failed");
                 }
             }
-            None => eprintln!("no keycode mapping for scancode {code:#x} (extended={extended})"),
+            None => tracing::debug!(scancode = code, extended, "no keycode mapping for scancode"),
         }
     }
 
@@ -109,40 +109,57 @@ impl RdpServerInputHandler for Input {
             MouseEvent::VerticalScroll { value } => self.device.scroll(value),
         };
         if let Err(e) = result {
-            eprintln!("mouse injection failed: {e}");
+            tracing::warn!(error = %e, "mouse injection failed");
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    kmsrdp::logging::init();
+
     // Session watcher must start first: it sets DISPLAY/XAUTHORITY/
     // XDG_RUNTIME_DIR in the process environment so that all subsequent
     // component initializations (arboard, pactl) see the right session.
     let session_rx = kmsrdp::session_watcher::start().await?;
 
-    let mut capturer = capture::Capturer::new()?;
-    let initial = capturer.capture()?;
+    let mut capturer = capture::Capturer::new().context(
+        "failed to open screen capturer (DRM/KMS). \
+         Check that a CRTC is active, KMSRDP_DISPLAY matches a connector, \
+         and the process has CAP_SYS_ADMIN/CAP_DAC_OVERRIDE",
+    )?;
+    let initial = capturer.capture().context(
+        "failed to capture the first frame. \
+         DRM found no usable CRTC/FB and NvFBC (if available) also failed — \
+         clients would see a black screen",
+    )?;
     let width = initial.width as u16;
     let height = initial.height as u16;
-    println!("desktop size: {width}x{height}");
+    if width == 0 || height == 0 {
+        anyhow::bail!(
+            "initial capture returned {}x{} — refusing to start with a blank desktop",
+            width,
+            height
+        );
+    }
+    tracing::info!(width, height, "desktop size");
     if initial.monitors.len() > 1 {
-        println!(
-            "composite monitors: {}",
-            initial
-                .monitors
-                .iter()
-                .map(|m| format!(
+        let monitors = initial
+            .monitors
+            .iter()
+            .map(|m| {
+                format!(
                     "{}x{}@{},{}{}",
                     m.right - m.left + 1,
                     m.bottom - m.top + 1,
                     m.left,
                     m.top,
                     if m.primary { " (primary)" } else { "" }
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::info!(%monitors, "composite monitors");
     }
 
     let mouse_scale: MouseScale = Arc::new(Mutex::new((f64::from(width), f64::from(height))));
@@ -170,10 +187,7 @@ async fn main() -> Result<()> {
                 .take(20)
                 .map(char::from)
                 .collect();
-            println!(
-                "KMSRDP_PASSWORD not set; generated a one-shot password for this run:\n  \
-                 user: {username}\n  password: {generated}"
-            );
+            tracing::warn!(user = %username, password = %generated, "KMSRDP_PASSWORD not set; generated one-shot password");
             generated
         }
     };
@@ -195,7 +209,7 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
 
     let device = VirtualInput::create()?;
-    println!("virtual input device created");
+    tracing::info!("virtual input device created");
 
     let input = SharedInput::new(Input {
         device,
@@ -207,7 +221,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "rdpdr-diagnostic")]
         {
             if std::env::var_os("KMSRDP_RDPDR_DIAGNOSTIC").is_some() {
-                println!("kmsrdp: RDPDR diagnostic self-test enabled (KMSRDP_RDPDR_DIAGNOSTIC)");
+                tracing::info!("RDPDR diagnostic self-test enabled (KMSRDP_RDPDR_DIAGNOSTIC)");
                 Box::new(kmsrdp::rdpdr_diagnostic::DiagnosticDriveFactory)
             } else {
                 Box::new(FuseDriveFactory::new(session_rx.clone()))
@@ -216,8 +230,8 @@ async fn main() -> Result<()> {
         #[cfg(not(feature = "rdpdr-diagnostic"))]
         {
             if std::env::var_os("KMSRDP_RDPDR_DIAGNOSTIC").is_some() {
-                eprintln!(
-                    "kmsrdp: KMSRDP_RDPDR_DIAGNOSTIC is set but this binary was built without \
+                tracing::warn!(
+                    "KMSRDP_RDPDR_DIAGNOSTIC is set but this binary was built without \
                      the rdpdr-diagnostic feature; using FUSE drives"
                 );
             }
@@ -241,10 +255,7 @@ async fn main() -> Result<()> {
         .with_nla_credentials(Some(credentials))
         .build();
 
-    println!(
-        "RDP server listening on {addr} (TLS + optional NLA - use e.g. \
-         `xfreerdp /cert:ignore /u:<user> /p:<password>` or mstsc)"
-    );
+    tracing::info!(%addr, "RDP server listening (TLS + optional NLA)");
     // Exit immediately on stop signals. Tokio graceful shutdown would wait
     // for DRM `spawn_blocking` / FUSE threads and can hang host shutdown for
     // the default systemd TimeoutStopSec (~90s). `process::exit` skips that;
@@ -252,11 +263,11 @@ async fn main() -> Result<()> {
     tokio::select! {
         result = server.run() => result,
         _ = tokio::signal::ctrl_c() => {
-            eprintln!("kmsrdp: SIGINT, exiting");
+            tracing::info!("SIGINT, exiting");
             std::process::exit(0);
         }
         _ = sigterm() => {
-            eprintln!("kmsrdp: SIGTERM, exiting");
+            tracing::info!("SIGTERM, exiting");
             std::process::exit(0);
         }
     }
@@ -268,7 +279,7 @@ async fn sigterm() {
             stream.recv().await;
         }
         Err(e) => {
-            eprintln!("kmsrdp: cannot install SIGTERM handler ({e}); waiting forever");
+            tracing::warn!(error = %e, "cannot install SIGTERM handler; waiting forever");
             std::future::pending::<()>().await;
         }
     }

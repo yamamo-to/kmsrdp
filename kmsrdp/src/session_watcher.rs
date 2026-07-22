@@ -203,7 +203,7 @@ pub async fn start() -> Result<watch::Receiver<Option<Session>>> {
     let conn = match Connection::system().await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("kmsrdp: system D-Bus unavailable ({e}), session auto-detect disabled");
+            tracing::warn!("kmsrdp: system D-Bus unavailable ({e}), session auto-detect disabled");
             let (_, rx) = watch::channel(None);
             return Ok(rx);
         }
@@ -213,22 +213,22 @@ pub async fn start() -> Result<watch::Receiver<Option<Session>>> {
     apply_session_env(&initial);
 
     if let Some(ref s) = initial {
-        eprintln!(
-            "kmsrdp: active session: user={} uid={} display={} xdg_runtime_dir={}",
-            s.username,
-            s.uid,
-            s.display.as_deref().unwrap_or("(wayland)"),
-            s.xdg_runtime_dir.display(),
+        tracing::info!(
+            user = %s.username,
+            uid = s.uid,
+            display = s.display.as_deref().unwrap_or("(wayland)"),
+            xdg_runtime_dir = %s.xdg_runtime_dir.display(),
+            "active graphical session"
         );
     } else {
-        eprintln!("kmsrdp: no active graphical session found at startup");
+        tracing::info!("no active graphical session found at startup");
     }
 
     let (tx, rx) = watch::channel(initial);
 
     tokio::spawn(async move {
         if let Err(e) = run_watcher(conn, tx).await {
-            eprintln!("kmsrdp: session watcher stopped: {e}");
+            tracing::warn!("kmsrdp: session watcher stopped: {e}");
         }
     });
 
@@ -253,14 +253,14 @@ async fn run_watcher(conn: Connection, tx: watch::Sender<Option<Session>>) -> Re
         apply_session_env(&session);
 
         if let Some(ref s) = session {
-            eprintln!(
-                "kmsrdp: session switched to user={} uid={} display={}",
-                s.username,
-                s.uid,
-                s.display.as_deref().unwrap_or("(wayland)"),
+            tracing::info!(
+                user = %s.username,
+                uid = s.uid,
+                display = s.display.as_deref().unwrap_or("(wayland)"),
+                "session switched"
             );
         } else {
-            eprintln!("kmsrdp: no active graphical session");
+            tracing::info!("no active graphical session");
         }
 
         let _ = tx.send(session);

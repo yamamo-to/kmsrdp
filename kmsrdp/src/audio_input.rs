@@ -63,16 +63,18 @@ fn ensure_null_sink_loaded(uid: u32) {
             .output();
         match result {
             Ok(output) if output.status.success() => {
-                println!(
+                tracing::info!(
                     "kmsrdp: virtual microphone ready (uid={uid}) - \
                      select '{SINK_NAME}.monitor' as a microphone input"
                 );
             }
-            Ok(output) => eprintln!(
+            Ok(output) => tracing::warn!(
                 "kmsrdp: failed to create virtual microphone sink: {}",
                 String::from_utf8_lossy(&output.stderr)
             ),
-            Err(e) => eprintln!("kmsrdp: pactl unavailable, virtual microphone won't work: {e}"),
+            Err(e) => {
+                tracing::warn!("kmsrdp: pactl unavailable, virtual microphone won't work: {e}");
+            }
         }
     }
 
@@ -134,7 +136,7 @@ fn spawn_writer(format: &AudioFormat) -> Option<Sender<Vec<u8>>> {
     let mut child: Child = match spawned {
         Ok(child) => child,
         Err(e) => {
-            eprintln!("kmsrdp: failed to start paplay for virtual microphone: {e}");
+            tracing::warn!("kmsrdp: failed to start paplay for virtual microphone: {e}");
             return None;
         }
     };

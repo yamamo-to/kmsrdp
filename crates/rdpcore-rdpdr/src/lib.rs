@@ -281,7 +281,7 @@ impl RdpdrChannel {
                     match irp::decode_create_reply(body) {
                         Ok(reply) => Ok(reply),
                         Err(e) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "rdpdr: CREATE completion decode failed ({e}); treating as I/O error"
                             );
                             Err(io_status.max(1))
@@ -291,10 +291,10 @@ impl RdpdrChannel {
                     Err(io_status)
                 };
                 if let Err(status) = result {
-                    eprintln!(
+                    tracing::warn!(
                         "rdpdr: CREATE failed NTSTATUS={status:#010x} (tag={})",
                         pending.request_tag
-                    );
+                    )
                 }
                 self.consumer.on_create_reply(pending.request_tag, result)
             }
@@ -304,7 +304,7 @@ impl RdpdrChannel {
                     match irp::decode_read_reply(body) {
                         Ok(data) => Ok(data),
                         Err(e) => {
-                            eprintln!("rdpdr: READ completion decode failed ({e})");
+                            tracing::warn!("rdpdr: READ completion decode failed ({e})");
                             Err(io_status.max(1))
                         }
                     }
@@ -318,7 +318,7 @@ impl RdpdrChannel {
                     match irp::decode_write_reply(body) {
                         Ok(n) => Ok(n),
                         Err(e) => {
-                            eprintln!("rdpdr: WRITE completion decode failed ({e})");
+                            tracing::warn!("rdpdr: WRITE completion decode failed ({e})");
                             Err(io_status.max(1))
                         }
                     }
@@ -332,14 +332,14 @@ impl RdpdrChannel {
                     match irp::decode_query_directory_reply(body) {
                         Ok(entry) => Ok(entry),
                         Err(e) => {
-                            eprintln!("rdpdr: QueryDirectory completion decode failed ({e})");
+                            tracing::warn!("rdpdr: QueryDirectory completion decode failed ({e})");
                             Err(io_status.max(1))
                         }
                     }
                 } else if io_status == irp::STATUS_NO_MORE_FILES {
                     Ok(None)
                 } else {
-                    eprintln!(
+                    tracing::warn!(
                         "rdpdr: QueryDirectory failed NTSTATUS={io_status:#010x} (tag={})",
                         pending.request_tag
                     );

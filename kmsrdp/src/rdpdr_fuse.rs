@@ -104,7 +104,7 @@ impl Bridge {
     fn enqueue(&self, command: DriveCommand) {
         self.outbound.lock().unwrap().push_back(command);
         if self.wake.send(()).is_err() {
-            eprintln!("kmsrdp: rdpdr FUSE: wake channel closed; RDP connection may be gone");
+            tracing::warn!("kmsrdp: rdpdr FUSE: wake channel closed; RDP connection may be gone");
         }
     }
 
@@ -145,19 +145,19 @@ impl Bridge {
         match rx.recv_timeout(OP_TIMEOUT) {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(status)) => {
-                eprintln!(
+                tracing::warn!(
                     "kmsrdp: rdpdr FUSE: CREATE path={path_for_log:?} device={device_id} → NTSTATUS {status:#010x}"
                 );
                 Err(ntstatus_to_errno(status))
             }
             Err(RecvTimeoutError::Timeout) => {
-                eprintln!(
-                    "kmsrdp: rdpdr FUSE: CREATE timed out path={path_for_log:?} device={device_id} (no IoCompletion)"
+                tracing::warn!(
+                    "kmsrdp: rdpdr FUSE: CREATE timed out path={path_for_log:?} device={device_id} (no IoCompletion);"
                 );
                 Err(Errno::ETIMEDOUT)
             }
             Err(RecvTimeoutError::Disconnected) => {
-                eprintln!(
+                tracing::warn!(
                     "kmsrdp: rdpdr FUSE: CREATE disconnected path={path_for_log:?} device={device_id}"
                 );
                 Err(Errno::EIO)
@@ -937,7 +937,7 @@ impl MountRegistry {
             let mut slots = self.slots.lock().unwrap();
             if let Some(slot) = slots.get_mut(&dos_name) {
                 slot.members.insert(conn_id, member);
-                println!(
+                tracing::info!(
                     "kmsrdp: rdpdr FUSE joined {} at {} ({} member(s), owner={})",
                     dos_name,
                     slot.mount_point.display(),
@@ -949,7 +949,7 @@ impl MountRegistry {
         }
 
         if let Err(e) = prepare_mount_point(&mount_point) {
-            eprintln!(
+            tracing::warn!(
                 "kmsrdp: rdpdr FUSE: failed to prepare {}: {e}",
                 mount_point.display()
             );
@@ -964,7 +964,7 @@ impl MountRegistry {
             match spawn_shared_mount(&dos_name, &mount_point, &bridge, device_id) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "kmsrdp: rdpdr FUSE: mount failed at {}: {e} \
                      (need fuse3, and usually `user_allow_other` in /etc/fuse.conf)",
                         mount_point.display()
@@ -979,7 +979,7 @@ impl MountRegistry {
             // so we do not block this connection's RDP loop.
             detach_umount(session, mount_point.clone());
             slot.members.insert(conn_id, member);
-            println!(
+            tracing::info!(
                 "kmsrdp: rdpdr FUSE joined {} at {} ({} member(s), owner={})",
                 dos_name,
                 slot.mount_point.display(),
@@ -989,7 +989,7 @@ impl MountRegistry {
             return true;
         }
 
-        println!(
+        tracing::info!(
             "kmsrdp: rdpdr FUSE mounted {} at {} (shared)",
             dos_name,
             mount_point.display()
@@ -1022,7 +1022,7 @@ impl MountRegistry {
                 ..
             } = slots.remove(dos_name).expect("slot just checked");
             drop(slots);
-            println!(
+            tracing::info!(
                 "kmsrdp: rdpdr FUSE releasing {} at {} (last connection)",
                 dos_name,
                 mount_point.display()
@@ -1048,13 +1048,13 @@ impl MountRegistry {
                 };
             }
             slot.owner_conn = new_owner;
-            println!(
+            tracing::info!(
                 "kmsrdp: rdpdr FUSE owner handoff {} → {new_owner} (no umount, {} member(s))",
                 dos_name,
                 slot.members.len()
             );
         } else {
-            println!(
+            tracing::info!(
                 "kmsrdp: rdpdr FUSE member {conn_id} left {} ({} remaining, owner={})",
                 dos_name,
                 slot.members.len(),
@@ -1097,7 +1097,7 @@ fn detach_umount(session: BackgroundSession, mount_point: PathBuf) {
         .name("kmsrdp-fuse-umount".into())
         .spawn(move || {
             if let Err(e) = session.umount_and_join() {
-                eprintln!(
+                tracing::warn!(
                     "kmsrdp: rdpdr FUSE umount/join failed for {} ({e}); trying lazy unmount",
                     mount_point.display()
                 );
@@ -1131,7 +1131,7 @@ impl DriveConsumerFactory for FuseDriveFactory {
         let (uid, gid, runtime, have_session) = match session {
             Some(ref s) => (s.uid, primary_gid(s.uid), s.xdg_runtime_dir.clone(), true),
             None => {
-                eprintln!(
+                tracing::info!(
                     "kmsrdp: rdpdr FUSE: no active session; mounts disabled for this connection"
                 );
                 (0, 0, PathBuf::from("/tmp"), false)
@@ -1175,7 +1175,7 @@ impl DriveConsumer for FuseDriveConsumer {
         }
         let name = sanitize_dos_name(dos_name);
         if name.is_empty() {
-            eprintln!("kmsrdp: rdpdr FUSE: ignoring device {device_id} with empty DosName");
+            tracing::debug!("kmsrdp: rdpdr FUSE: ignoring device {device_id} with empty DosName");
             return Vec::new();
         }
         let drives_root = self.runtime_dir.join("kmsrdp").join("drives");
@@ -1367,7 +1367,7 @@ fn ntstatus_to_errno(status: u32) -> Errno {
         0xC000_00BB | 0xC000_00A3 => Errno::ENOSYS, // NOT_SUPPORTED / NOT_IMPLEMENTED
         0xC000_0010 => Errno::EIO,
         _ => {
-            eprintln!("kmsrdp: rdpdr FUSE: unmapped NTSTATUS {status:#010x} → EIO");
+            tracing::debug!("kmsrdp: rdpdr FUSE: unmapped NTSTATUS {status:#010x} → EIO");
             Errno::EIO
         }
     }

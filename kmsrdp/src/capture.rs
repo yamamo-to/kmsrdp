@@ -187,7 +187,7 @@ fn open_drm_cards_and_heads() -> io::Result<(Vec<CardCtx>, Vec<EnumeratedHead>)>
         let card = match Card::open_read_only(&path_str) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("skip {path_str}: open failed: {e}");
+                tracing::warn!("skip {path_str}: open failed: {e}");
                 continue;
             }
         };
@@ -377,6 +377,8 @@ pub struct RawFrame {
 pub struct Capturer {
     drm: Option<DrmCapturer>,
     drm_open_error: Option<String>,
+    /// Set after the first successful frame so logs can name the backend.
+    active_backend: Option<&'static str>,
 }
 
 impl Capturer {
@@ -385,26 +387,38 @@ impl Capturer {
             Ok(drm) => Ok(Self {
                 drm: Some(drm),
                 drm_open_error: None,
+                active_backend: None,
             }),
             Err(drm_err) if display_mode()?.is_single() => {
-                // NvFBC captures the X screen as a whole and cannot honor a
-                // connector selection. Falling back here would silently show
-                // a different display than the administrator requested.
-                Err(drm_err)
+                Err(annotate_capture_error(drm_err, CapturePhase::Open))
             }
-            Err(drm_err) => Ok(Self {
-                drm: None,
-                drm_open_error: Some(drm_err.to_string()),
-            }),
+            Err(drm_err) => {
+                tracing::warn!(
+                    "kmsrdp: DRM/KMS unavailable ({drm_err}); will try NVIDIA NvFBC on capture"
+                );
+                Ok(Self {
+                    drm: None,
+                    drm_open_error: Some(drm_err.to_string()),
+                    active_backend: None,
+                })
+            }
         }
     }
 
     pub fn capture(&mut self) -> io::Result<RawFrame> {
         let drm_error = match &mut self.drm {
             Some(drm) => match drm.capture() {
-                Ok(frame) => return Ok(frame),
-                Err(drm_err) if display_mode()?.is_single() => return Err(drm_err),
-                Err(drm_err) => drm_err.to_string(),
+                Ok(frame) => {
+                    self.note_backend("DRM/KMS");
+                    return Ok(frame);
+                }
+                Err(drm_err) if display_mode()?.is_single() => {
+                    return Err(annotate_capture_error(drm_err, CapturePhase::Frame));
+                }
+                Err(drm_err) => {
+                    // Transient DRM failure with All mode: try NvFBC this tick.
+                    drm_err.to_string()
+                }
             },
             None => self
                 .drm_open_error
@@ -413,26 +427,93 @@ impl Capturer {
         };
 
         match crate::nvfbc::capture_bgrx() {
-            Ok((width, height, data)) => Ok(RawFrame {
-                width,
-                height,
-                stride: width as usize * 4,
-                data,
-                force_full: false,
-                monitors: vec![MonitorGeom {
-                    left: 0,
-                    top: 0,
-                    right: width.saturating_sub(1) as i32,
-                    bottom: height.saturating_sub(1) as i32,
-                    primary: true,
-                }],
-            }),
-            Err(nvfbc_err) => Err(io::Error::other(format!(
-                "DRM/KMS capture failed ({drm_error}), \
-                 NvFBC fallback also failed ({nvfbc_err})"
-            ))),
+            Ok((width, height, data)) => {
+                self.note_backend("NvFBC");
+                Ok(RawFrame {
+                    width,
+                    height,
+                    stride: width as usize * 4,
+                    data,
+                    force_full: false,
+                    monitors: vec![MonitorGeom {
+                        left: 0,
+                        top: 0,
+                        right: width.saturating_sub(1) as i32,
+                        bottom: height.saturating_sub(1) as i32,
+                        primary: true,
+                    }],
+                })
+            }
+            Err(nvfbc_err) => Err(annotate_capture_error(
+                io::Error::other(format!(
+                    "DRM/KMS capture failed ({drm_error}); NvFBC fallback also failed ({nvfbc_err})"
+                )),
+                CapturePhase::Frame,
+            )),
         }
     }
+
+    fn note_backend(&mut self, backend: &'static str) {
+        if self.active_backend != Some(backend) {
+            tracing::info!("kmsrdp: screen capture backend: {backend}");
+            self.active_backend = Some(backend);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CapturePhase {
+    Open,
+    Frame,
+}
+
+/// Attach short, actionable hints so journal/console logs explain a black
+/// screen instead of a bare I/O error.
+fn annotate_capture_error(err: io::Error, phase: CapturePhase) -> io::Error {
+    let msg = err.to_string();
+    let mut hints: Vec<&str> = Vec::new();
+
+    let lower = msg.to_lowercase();
+    if lower.contains("no usable card")
+        || lower.contains("not an active drm connector")
+        || lower.contains("no active connector")
+        || lower.contains("connected, inactive")
+    {
+        hints.push(
+            "no CRTC is scanning out — wake the session, plug in a display, or unset a bad KMSRDP_DISPLAY",
+        );
+    }
+    if lower.contains("no framebuffer") || lower.contains("screen off") {
+        hints.push(
+            "primary plane has no FB (VT switched away, screen locked/off, or compositor idle)",
+        );
+    }
+    if lower.contains("no primary plane") {
+        hints.push("CRTC has no primary plane — driver/modeset may still be bringing the head up");
+    }
+    if lower.contains("libnvidia-fbc") || lower.contains("nvfbc") {
+        hints.push(
+            "NvFBC needs an NVIDIA driver with libnvidia-fbc and a usable X/Wayland session on that GPU",
+        );
+    }
+    if lower.contains("permission")
+        || lower.contains("permission denied")
+        || lower.contains("eacces")
+    {
+        hints.push("missing CAP_SYS_ADMIN / CAP_DAC_OVERRIDE (or root) to open DRM nodes");
+    }
+    if hints.is_empty() {
+        match phase {
+            CapturePhase::Open => hints.push(
+                "could not open a capture source — check dmesg/journal for DRM errors and KMSRDP_DISPLAY",
+            ),
+            CapturePhase::Frame => hints.push(
+                "frame grab failed — clients may stay black until capture recovers",
+            ),
+        }
+    }
+
+    io::Error::new(err.kind(), format!("{msg} (hint: {})", hints.join("; ")))
 }
 
 struct HeadFbState {
@@ -462,10 +543,13 @@ impl DrmCapturer {
         let (cards, heads) = open_drm_cards_and_heads()?;
         for h in &heads {
             let card = &cards[h.card_idx];
-            eprintln!(
+            tracing::info!(
                 "kmsrdp: capturing DRM display {}:{} @{},{}",
-                card.name, h.connector, h.x, h.y
-            );
+                card.name,
+                h.connector,
+                h.x,
+                h.y
+            )
         }
         let head_fb = heads
             .iter()
@@ -549,10 +633,11 @@ impl DrmCapturer {
             .and_then(|s| s.last_fb);
         let force_full = prev.is_some_and(|p| p != fb_id);
         if force_full {
-            eprintln!(
+            tracing::warn!(
                 "kmsrdp: primary-plane framebuffer changed on {}:{} ({prev:?} -> {fb_id}); \
                  forcing full-frame refresh for connected clients",
-                card_ctx.name, head.connector
+                card_ctx.name,
+                head.connector
             );
         }
         if let Some(state) = self
@@ -574,7 +659,7 @@ impl DrmCapturer {
                     fb.offsets(),
                 ),
                 Err(e) => {
-                    eprintln!("GetFB2 failed ({e}), falling back to legacy GetFB");
+                    tracing::warn!("GetFB2 failed ({e}), falling back to legacy GetFB");
                     let fb = card_ctx.card.get_framebuffer(fb_handle)?;
                     let mut buffers = [None; 4];
                     buffers[0] = fb.buffer();
@@ -850,5 +935,38 @@ mod tests {
         assert!(!frame.monitors[1].primary);
         assert_eq!(frame.monitors[1].left, 2);
         assert_eq!(frame.monitors[1].right, 3);
+    }
+
+    #[test]
+    fn annotate_mentions_crtc_hint() {
+        let err = annotate_capture_error(
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no usable card/connector/CRTC found (is a display actually active?); discovered DRM connectors: none",
+            ),
+            CapturePhase::Open,
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("hint:"), "{msg}");
+        assert!(
+            msg.contains("CRTC") || msg.contains("crtc") || msg.contains("KMSRDP_DISPLAY"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn annotate_mentions_nvfbc_hint() {
+        let err = annotate_capture_error(
+            io::Error::other(
+                "DRM/KMS capture failed (x); NvFBC fallback also failed (failed to load libnvidia-fbc: ...)",
+            ),
+            CapturePhase::Frame,
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("libnvidia-fbc") || msg.contains("NvFBC"),
+            "{msg}"
+        );
+        assert!(msg.contains("hint:"), "{msg}");
     }
 }

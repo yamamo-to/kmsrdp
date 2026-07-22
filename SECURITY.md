@@ -28,8 +28,10 @@ kmsrdp provides authenticated clients with complete screen visibility,
 keyboard and mouse control, and optional clipboard, audio, and redirected
 drive access (client drives appear under the session user's
 `$XDG_RUNTIME_DIR/kmsrdp/drives/`). It supports optional NLA
-(CredSSP/NTLMv2; no Kerberos) and uses a newly generated self-signed TLS
-certificate on every start.
+(CredSSP/NTLMv2; no Kerberos) and uses a persisted self-signed TLS
+certificate by default (under systemd `StateDirectory=kmsrdp`, or paths
+from `KMSRDP_TLS_*`). Set `KMSRDP_TLS_EPHEMERAL=1` to regenerate every
+start instead.
 
 Do not expose it directly to the public Internet. Restrict the RDP listen
 address (defaults `0.0.0.0:3389`; `KMSRDP_BIND` / `KMSRDP_PORT`) to trusted

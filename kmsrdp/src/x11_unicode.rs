@@ -148,7 +148,7 @@ impl X11UnicodeTyper {
             match X11Connection::open(&display) {
                 Ok(c) => self.conn = Some(c),
                 Err(e) => {
-                    eprintln!("kmsrdp: X11 connect failed: {e}");
+                    tracing::warn!("kmsrdp: X11 connect failed: {e}");
                     return;
                 }
             }
@@ -157,7 +157,7 @@ impl X11UnicodeTyper {
         if let Some(ref mut conn) = self.conn
             && let Err(e) = conn.type_char(codepoint)
         {
-            eprintln!("kmsrdp: unicode injection failed for U+{codepoint:04X}: {e}");
+            tracing::warn!("kmsrdp: unicode injection failed for U+{codepoint:04X}: {e}");
             self.conn = None; // Force reconnect on next call.
         }
     }

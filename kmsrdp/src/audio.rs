@@ -101,7 +101,7 @@ fn run_capture(sender: UnboundedSender<RdpsndServerMessage>, child: Arc<Mutex<Op
     let mut child_proc = match spawned {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("parec spawn failed: {e}");
+            tracing::warn!("parec spawn failed: {e}");
             return;
         }
     };

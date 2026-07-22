@@ -19,6 +19,7 @@ rdpcore-transport = { path = "../rdpcore-transport" }
 sspi = { version = "0.21.3", default-features = false, features = ["aws-lc-rs"] }
 tokio = { version = "1.52.3", features = ["rt", "net", "io-util", "macros", "sync", "time"] }
 tokio-rustls = "0.26"
+tracing = "0.1.44"
 
 [features]
 default = []

@@ -19,7 +19,7 @@ impl DriveConsumerFactory for DiagnosticDriveFactory {
 
     fn build_drive_consumer(&self, _wake: UnboundedSender<()>) -> Box<dyn DriveConsumer> {
         Box::new(DirectoryListingSelfTest::new(|event| {
-            println!("rdpdr self-test: {event}")
+            tracing::info!("rdpdr self-test: {event}");
         }))
     }
 }

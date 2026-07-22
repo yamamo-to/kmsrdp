@@ -4,6 +4,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod display_hub;
 pub mod gpu_detile;
+pub mod logging;
 pub mod nvfbc;
 #[cfg(feature = "rdpdr-diagnostic")]
 pub mod rdpdr_diagnostic;

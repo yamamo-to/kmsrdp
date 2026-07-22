@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.27
+Version:        0.1.28
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -97,6 +97,11 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.28-1
+- Persist self-signed TLS identity across restarts
+- Surface capture failures with actionable hints at startup
+- Structured logging via tracing (KMSRDP_LOG / KMSRDP_LOG_FORMAT)
+
 * Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.27-1
 - Auto-detect X11 DISPLAY on tty/startx sessions for CJK Unicode injection
 

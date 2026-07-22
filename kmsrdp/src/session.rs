@@ -68,7 +68,10 @@ pub fn find_xauthority(username: &str, xdg_runtime_dir: &Path, leader_pid: u32) 
 
 /// Returns true when `display` looks like `:N` and `/tmp/.X11-unix/XN` exists.
 pub fn display_socket_exists(display: &str) -> bool {
-    let Some(n) = display.strip_prefix(':').and_then(|s| s.parse::<u32>().ok()) else {
+    let Some(n) = display
+        .strip_prefix(':')
+        .and_then(|s| s.parse::<u32>().ok())
+    else {
         return false;
     };
     PathBuf::from(format!("/tmp/.X11-unix/X{n}")).exists()
@@ -151,6 +154,9 @@ mod tests {
             return;
         }
         assert_eq!(resolve_x11_display(":0", 0).as_deref(), Some(":0"));
-        assert_eq!(resolve_x11_display("", 0).as_deref(), Some(":0"));
+        // Empty logind Display falls back to the sole /tmp/.X11-unix socket.
+        if find_display_fallback().as_deref() == Some(":0") {
+            assert_eq!(resolve_x11_display("", 0).as_deref(), Some(":0"));
+        }
     }
 }

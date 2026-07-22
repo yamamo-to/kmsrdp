@@ -20,12 +20,16 @@ use rdpcore_transport::{ChannelKey, ConnectionWriter, Frame, FrameSender, Priori
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
+use tracing::Instrument as _;
+use tracing::{debug, info, info_span, warn};
 
 use crate::credentials::{CredentialValidator, Credentials};
 use crate::credssp;
 use crate::display::{BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay};
 use crate::input::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use crate::transport::{SteadyStateFrame, read_steady_state_frame, read_tpkt_frame};
+
+static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub struct RdpServerBuilder {
     addr: Option<SocketAddr>,
@@ -244,11 +248,15 @@ impl RdpServer {
         loop {
             let (tcp, peer) = listener.accept().await?;
             let session = server.session();
-            tokio::spawn(async move {
-                if let Err(e) = session.handle_connection(tcp).await {
-                    eprintln!("connection from {peer} ended: {e}");
+            let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::spawn(
+                async move {
+                    if let Err(e) = session.handle_connection(tcp).await {
+                        warn!(error = %e, "connection ended");
+                    }
                 }
-            });
+                .instrument(info_span!("rdp", conn_id, %peer)),
+            );
         }
     }
 }
@@ -264,7 +272,7 @@ impl Session {
         // after this.
         let frame = read_tpkt_frame(&mut tcp).await?;
         let result = acceptor.step(&frame).map_err(|e| {
-            eprintln!("rdp[{peer}]: cleartext negotiation PDU error: {e}");
+            warn!("cleartext negotiation PDU error: {e}");
             e
         })?;
         tcp.write_all(&result.response).await?;
@@ -272,14 +280,14 @@ impl Session {
         match result.event {
             AcceptorEvent::TlsUpgrade => {
                 if acceptor.requires_credssp() {
-                    eprintln!("rdp[{peer}]: negotiation ok (NLA/HYBRID), starting TLS");
+                    info!("negotiation ok (NLA/HYBRID), starting TLS");
                 } else {
-                    eprintln!("rdp[{peer}]: negotiation ok (TLS), starting TLS");
+                    info!("negotiation ok (TLS), starting TLS");
                 }
             }
             AcceptorEvent::Rejected => {
-                eprintln!(
-                    "rdp[{peer}]: rejected at negotiation - client offered neither \
+                warn!(
+                    "rejected at negotiation - client offered neither \
                      PROTOCOL_HYBRID nor PROTOCOL_SSL"
                 );
                 return Ok(());
@@ -289,11 +297,11 @@ impl Session {
 
         let mut tls = match self.tls.accept(tcp).await {
             Ok(stream) => {
-                eprintln!("rdp[{peer}]: TLS established");
+                info!("TLS established");
                 stream
             }
             Err(e) => {
-                eprintln!("rdp[{peer}]: TLS handshake failed: {e}");
+                warn!("TLS handshake failed: {e}");
                 return Err(e.into());
             }
         };
@@ -302,16 +310,14 @@ impl Session {
         let mut nla_authenticated = false;
         if acceptor.requires_credssp() {
             let Some(credentials) = self.nla_credentials.clone() else {
-                eprintln!(
-                    "rdp[{peer}]: client requested NLA but server has no NLA credentials configured"
-                );
+                info!("client requested NLA but server has no NLA credentials configured");
                 return Ok(());
             };
             if self.tls_public_key.is_empty() {
-                eprintln!("rdp[{peer}]: client requested NLA but server TLS public key is missing");
+                warn!("client requested NLA but server TLS public key is missing");
                 return Ok(());
             }
-            eprintln!("rdp[{peer}]: starting CredSSP (NTLMv2)");
+            info!("starting CredSSP (NTLMv2)");
             match credssp::run_credssp_nla(
                 &mut tls,
                 self.tls_public_key.clone(),
@@ -321,11 +327,11 @@ impl Session {
             .await
             {
                 Ok(user) => {
-                    eprintln!("rdp[{peer}]: CredSSP succeeded for user {user:?}");
+                    info!("CredSSP succeeded for user {user:?}");
                     nla_authenticated = true;
                 }
                 Err(e) => {
-                    eprintln!("rdp[{peer}]: CredSSP failed: {e}");
+                    warn!("CredSSP failed: {e}");
                     return Ok(());
                 }
             }
@@ -333,21 +339,21 @@ impl Session {
 
         let accepted = loop {
             let frame = read_tpkt_frame(&mut tls).await.map_err(|e| {
-                eprintln!(
-                    "rdp[{peer}]: read failed during handshake (waiting for {}): {e}",
+                warn!(
+                    "read failed during handshake (waiting for {}): {e}",
                     acceptor.handshake_phase()
                 );
                 e
             })?;
             if frame.first() != Some(&0x03) {
-                eprintln!(
-                    "rdp[{peer}]: first byte during RDP handshake is 0x{:02x}, not TPKT 0x03",
+                debug!(
+                    "first byte during RDP handshake is 0x{:02x}, not TPKT 0x03",
                     frame.first().copied().unwrap_or(0)
                 );
             }
             let result = acceptor.step(&frame).map_err(|e| {
-                eprintln!(
-                    "rdp[{peer}]: handshake PDU error while waiting for {}: {e}",
+                warn!(
+                    "handshake PDU error while waiting for {}: {e}",
                     acceptor.handshake_phase()
                 );
                 e
@@ -360,8 +366,8 @@ impl Session {
                     }
                 }
                 AcceptorEvent::ClientInfoReceived(credentials) => {
-                    eprintln!(
-                        "rdp[{peer}]: client info user={:?} domain={:?} (nla={nla_authenticated})",
+                    info!(
+                        "client info user={:?} domain={:?} (nla={nla_authenticated})",
                         credentials.username, credentials.domain
                     );
                     let valid = if nla_authenticated {
@@ -384,8 +390,8 @@ impl Session {
                         } else {
                             "password non-empty but does not match KMSRDP_PASSWORD"
                         };
-                        eprintln!(
-                            "rdp[{peer}]: rejecting invalid credentials for user {:?} domain {:?} ({password_hint})",
+                        warn!(
+                            "rejecting invalid credentials for user {:?} domain {:?} ({password_hint})",
                             credentials.username, credentials.domain
                         );
                         acceptor.reject_client_info();
@@ -396,18 +402,18 @@ impl Session {
                     }
                     tls.write_all(&acceptor.approve_client_info()?).await?;
                     tls.flush().await?;
-                    eprintln!("rdp[{peer}]: credentials accepted, sent Demand Active");
+                    info!("credentials accepted, sent Demand Active");
                 }
                 AcceptorEvent::Accepted(accepted) => {
                     if !result.response.is_empty() {
                         tls.write_all(&result.response).await?;
                         tls.flush().await?;
                     }
-                    eprintln!("rdp[{peer}]: handshake complete");
+                    info!("handshake complete");
                     break accepted;
                 }
                 AcceptorEvent::Rejected => {
-                    eprintln!("rdp[{peer}]: rejected during handshake");
+                    warn!("rejected during handshake");
                     return Ok(());
                 }
             }
@@ -512,18 +518,14 @@ impl Session {
                         b"kmsrdp-dvc-smoketest".to_vec(),
                         |matched| {
                             if matched {
-                                println!(
-                                    "DVC echo smoke test: OK, payload round-tripped correctly"
-                                );
+                                info!("DVC echo smoke test: OK, payload round-tripped correctly");
                             } else {
-                                eprintln!(
-                                    "DVC echo smoke test: FAILED, echoed payload did not match"
-                                );
+                                warn!("DVC echo smoke test: FAILED, echoed payload did not match");
                             }
                         },
                     )));
-                eprintln!(
-                    "rdp[{peer}]: DVC echo smoke test: queued {} follow-up frame(s)",
+                info!(
+                    "DVC echo smoke test: queued {} follow-up frame(s)",
                     echo_frames.len()
                 );
                 for bytes in echo_frames {
@@ -687,7 +689,7 @@ impl Session {
                                         dispatch_input_event(&mut *input, event);
                                     }
                                 }
-                                Err(e) => eprintln!("dropping malformed fast-path input frame: {e}"),
+                                Err(e) => debug!("dropping malformed fast-path input frame: {e}"),
                             }
                         }
                         Ok(SteadyStateFrame::SlowPath(bytes)) if resizing => {
@@ -724,7 +726,7 @@ impl Session {
                                 )
                                 .await
                                 {
-                                    eprintln!("dropping malformed slow-path frame after resize: {e}");
+                                    debug!("dropping malformed slow-path frame after resize: {e}");
                                 }
                                 continue;
                             }
@@ -787,12 +789,12 @@ impl Session {
                                         )
                                         .await
                                         {
-                                            eprintln!(
+                                            debug!(
                                                 "dropping malformed slow-path frame after resize: {err}"
                                             );
                                         }
                                     } else {
-                                        eprintln!("dropping malformed frame during resize: {e}");
+                                        debug!("dropping malformed frame during resize: {e}");
                                     }
                                 }
                             }
@@ -813,7 +815,7 @@ impl Session {
                             )
                             .await
                             {
-                                eprintln!("dropping malformed slow-path frame: {e}");
+                                debug!("dropping malformed slow-path frame: {e}");
                             }
                         }
                     }
@@ -847,7 +849,7 @@ impl Session {
                             }
                         }
                         Ok(Some(DisplayUpdate::Resized(size))) if resizing => {
-                            eprintln!("dropping resize to {}x{}: a previous resize is still in flight", size.width, size.height);
+                            debug!("dropping resize to {}x{}: a previous resize is still in flight", size.width, size.height);
                         }
                         Ok(Some(DisplayUpdate::Resized(size))) => {
                             match acceptor.begin_resize(size.width, size.height) {
@@ -859,7 +861,7 @@ impl Session {
                                         return Ok(());
                                     }
                                 }
-                                Err(e) => eprintln!("failed to start resize to {}x{}: {e}", size.width, size.height),
+                                Err(e) => warn!("failed to start resize to {}x{}: {e}", size.width, size.height),
                             }
                         }
                         Ok(None) => return Ok(()),

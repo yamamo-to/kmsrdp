@@ -9,8 +9,9 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
 
 > [!WARNING]
 > Experimental. Authenticated clients get full screen, keyboard/mouse,
-> clipboard, audio, and optional drive access. TLS uses a **new self-signed
-> certificate every start**; NLA is CredSSP/NTLMv2 only (no Kerberos).
+> clipboard, audio, and optional drive access. TLS uses a **persisted
+> self-signed certificate** by default (regenerated only when missing);
+> NLA is CredSSP/NTLMv2 only (no Kerberos).
 > **Do not expose the RDP listen port (default 3389) to the public
 > Internet** — use a firewall, VPN, or SSH tunnel on a trusted network.
 
@@ -29,8 +30,11 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
 - **Drives:** RDPDR → FUSE at `$XDG_RUNTIME_DIR/kmsrdp/drives/<DosName>`
   (list/read/write/create/mkdir; shared until the last session leaves)
 - **Auth / transport:** TLS + password; NLA (CredSSP/NTLMv2) when the client
-  requests it; configurable listen address (`KMSRDP_BIND` / `KMSRDP_PORT`);
-  priority-aware writes so audio is not starved by graphics
+  requests it; persisted self-signed cert by default (`StateDirectory` or
+  `KMSRDP_TLS_*`); configurable listen address (`KMSRDP_BIND` /
+  `KMSRDP_PORT`); structured logs via `tracing` (`KMSRDP_LOG` /
+  `KMSRDP_LOG_FORMAT=json`); priority-aware writes so audio is not starved
+  by graphics
 
 ## Limitations
 
@@ -38,6 +42,9 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
 - Not true per-monitor RDP windows — multi-head is one virtual desktop canvas
 - Framebuffers: single-plane XRGB8888/ARGB8888 only (tiled modifiers are
   detiled via GBM/EGL when needed)
+- Startup fails hard if the first frame cannot be captured (no CRTC / NvFBC);
+  later capture drops are logged with hints (rate-limited) instead of a silent
+  black client
 - Drive FUSE: no delete/rename/setattr; no printer/CUPS yet
 - CJK IME needs X11 (XTest); not available on Wayland-only sessions. `startx`
   on a tty session is detected automatically (`DISPLAY` / `XAUTHORITY` from
@@ -61,7 +68,11 @@ KMSRDP_USER=myuser KMSRDP_PASSWORD=mypassword ./target/release/rdp_server
 Connect with `xfreerdp /v:<host> /cert:ignore /u:myuser /p:mypassword`, mstsc,
 or the macOS Windows App. Optional: `KMSRDP_BIND=127.0.0.1` /
 `KMSRDP_PORT=3390` to restrict the listen address; `KMSRDP_TLS_HOSTS=host,1.2.3.4`
-for certificate SANs; `KMSRDP_DISPLAY=all` (default) to composite every CRTC, or
+for certificate SANs (applied when the cert is first created — delete the
+persisted files to regenerate); `KMSRDP_TLS_DIR` / `KMSRDP_TLS_CERT`+`KEY`
+to choose where the identity is stored; `KMSRDP_TLS_EPHEMERAL=1` to skip
+persistence; `KMSRDP_LOG=debug` / `KMSRDP_LOG_FORMAT=json` for structured
+logs; `KMSRDP_DISPLAY=all` (default) to composite every CRTC, or
 `DP-1` / `card1:DP-1` for a single connector (disables NvFBC fallback).
 
 Audio needs `parec` / `paplay` / `pactl` on `$PATH`. Root FUSE mounts need

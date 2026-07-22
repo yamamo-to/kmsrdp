@@ -22,6 +22,8 @@ StartLimitBurst=5
 # environment) live here rather than in this unit file - see
 # kmsrdp.env.example in the package docs.
 EnvironmentFile=-%h/.config/kmsrdp/kmsrdp.env
+# Persisted self-signed TLS cert/key under $XDG_STATE_HOME/kmsrdp (tls.crt / tls.key).
+StateDirectory=kmsrdp
 
 [Install]
 WantedBy=graphical-session.target
