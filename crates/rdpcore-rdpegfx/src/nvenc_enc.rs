@@ -20,7 +20,7 @@ use nvenc::sys::structs::{
     NVencOpenEncodeSessionExParams, NVencPicParams,
 };
 use nvenc::sys::version::NVENC_API_VERSION;
-use nvenc::{nvenc_init, NVENCLibrary};
+use nvenc::{NVENCLibrary, nvenc_init};
 
 use crate::encoder::{EncodedAu, H264Encoder, align16};
 
@@ -49,9 +49,8 @@ impl CudaCtx {
             if cu_init(0) != 0 {
                 return Err("cuInit failed".into());
             }
-            let cu_device_get: libloading::Symbol<
-                unsafe extern "C" fn(*mut c_int, c_int) -> u32,
-            > = lib.get(b"cuDeviceGet").map_err(|e| e.to_string())?;
+            let cu_device_get: libloading::Symbol<unsafe extern "C" fn(*mut c_int, c_int) -> u32> =
+                lib.get(b"cuDeviceGet").map_err(|e| e.to_string())?;
             let mut device = 0;
             if cu_device_get(&mut device, 0) != 0 {
                 return Err("cuDeviceGet failed".into());

@@ -1,8 +1,8 @@
 //! Runtime H.264 encoder selection: NVENC → VAAPI → OpenH264.
 
-use tracing::info;
 #[cfg(any(feature = "nvenc", feature = "vaapi"))]
 use tracing::debug;
+use tracing::info;
 
 use crate::encoder::H264Encoder;
 

@@ -570,10 +570,7 @@ impl Session {
                                 bytes,
                             });
                         }
-                        info!(
-                            encoder = selected.name,
-                            "GFX AVC420 channel registered"
-                        );
+                        info!(encoder = selected.name, "GFX AVC420 channel registered");
                     }
                     Some(session)
                 }

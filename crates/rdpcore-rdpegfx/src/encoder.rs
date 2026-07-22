@@ -181,5 +181,4 @@ mod tests {
         let i420 = bgrx_to_i420(w, h, usize::from(w) * 4, &pixels, 16, 16).unwrap();
         assert_eq!(i420.len(), 16 * 16 + 2 * (8 * 8));
     }
-
 }

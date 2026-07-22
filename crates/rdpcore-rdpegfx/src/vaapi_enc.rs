@@ -11,8 +11,8 @@ use libva::{
     EncPictureParameter, EncPictureParameterBufferH264, EncSequenceParameter,
     EncSequenceParameterBufferH264, EncSliceParameter, EncSliceParameterBufferH264,
     H264EncPicFields, H264EncSeqFields, H264VuiFields, Image, MappedCodedBuffer, Picture,
-    PictureH264, RcFlags, UsageHint, VAConfigAttrib, VAConfigAttribType, VAEntrypoint, VAProfile,
-    VA_FOURCC_NV12, VA_INVALID_ID, VA_INVALID_SURFACE, VA_RT_FORMAT_YUV420,
+    PictureH264, RcFlags, UsageHint, VA_FOURCC_NV12, VA_INVALID_ID, VA_INVALID_SURFACE,
+    VA_RT_FORMAT_YUV420, VAConfigAttrib, VAConfigAttribType, VAEntrypoint, VAProfile,
 };
 
 use crate::encoder::{EncodedAu, H264Encoder, align16, bgrx_to_nv12};
@@ -217,8 +217,8 @@ impl H264Encoder for VaapiH264Encoder {
         let seq_fields = H264EncSeqFields::new(1, 1, 0, 0, 0, 1, 0, 2, 0);
         let sps = session
             .context
-            .create_buffer(BufferType::EncSequenceParameter(EncSequenceParameter::H264(
-                EncSequenceParameterBufferH264::new(
+            .create_buffer(BufferType::EncSequenceParameter(
+                EncSequenceParameter::H264(EncSequenceParameterBufferH264::new(
                     0,
                     10,
                     10,
@@ -242,8 +242,8 @@ impl H264Encoder for VaapiH264Encoder {
                     1,
                     1,
                     60,
-                ),
-            )))
+                )),
+            ))
             .map_err(|e| format!("VAAPI SPS buffer: {e}"))?;
 
         let invalid_pic = || PictureH264::new(VA_INVALID_ID, 0, VA_INVALID_SURFACE, 0, 0);
@@ -348,12 +348,8 @@ impl H264Encoder for VaapiH264Encoder {
         picture.add_buffer(pps);
         picture.add_buffer(slice);
         picture.add_buffer(rc);
-        let picture = picture
-            .begin()
-            .map_err(|e| format!("VAAPI begin: {e}"))?;
-        let picture = picture
-            .render()
-            .map_err(|e| format!("VAAPI render: {e}"))?;
+        let picture = picture.begin().map_err(|e| format!("VAAPI begin: {e}"))?;
+        let picture = picture.render().map_err(|e| format!("VAAPI render: {e}"))?;
         let picture = picture.end().map_err(|e| format!("VAAPI end: {e}"))?;
         let picture = picture
             .sync()

@@ -78,9 +78,15 @@ impl Inner {
         // WireToSurface, both trigger client protocol errors.
         if self.state == State::Ready && self.surface_configured {
             let old = self.surface_id;
-            out.push(pdu::encode_segmented_single(&pdu::encode_delete_surface(old)));
+            out.push(pdu::encode_segmented_single(&pdu::encode_delete_surface(
+                old,
+            )));
             self.surface_id = self.surface_id.wrapping_add(1).max(1);
-            info!(old_surface = old, new_surface = self.surface_id, "GFX Caps re-negotiate: deleted surface");
+            info!(
+                old_surface = old,
+                new_surface = self.surface_id,
+                "GFX Caps re-negotiate: deleted surface"
+            );
         }
 
         self.state = State::Ready;
@@ -137,7 +143,12 @@ impl Inner {
         } else {
             self.frames_in_flight = queue_depth.min(MAX_FRAMES_IN_FLIGHT);
         }
-        debug!(frame_id, queue_depth, in_flight = self.frames_in_flight, "GFX FrameAcknowledge");
+        debug!(
+            frame_id,
+            queue_depth,
+            in_flight = self.frames_in_flight,
+            "GFX FrameAcknowledge"
+        );
     }
 
     fn resize(&mut self, width: u16, height: u16) -> Option<Vec<Vec<u8>>> {
@@ -171,7 +182,12 @@ impl Inner {
             out.push(pdu::encode_segmented_single(&pdu));
         }
         self.surface_configured = true;
-        info!(width, height, surface_id = self.surface_id, "GFX surface configured");
+        info!(
+            width,
+            height,
+            surface_id = self.surface_id,
+            "GFX surface configured"
+        );
         Some(out)
     }
 
@@ -206,8 +222,9 @@ impl Inner {
             self.force_next_idr = true;
         }
 
-        let force_idr =
-            self.force_next_idr || self.frames_sent == 0 || self.frames_sent.is_multiple_of(IDR_INTERVAL_FRAMES);
+        let force_idr = self.force_next_idr
+            || self.frames_sent == 0
+            || self.frames_sent.is_multiple_of(IDR_INTERVAL_FRAMES);
         let encoded = match self
             .encoder
             .encode_bgrx(width, height, stride, pixels, force_idr)
@@ -218,7 +235,10 @@ impl Inner {
                 // instead of falling through to Planar (which leaves the GFX
                 // surface black while FrameAcks keep arriving).
                 self.force_next_idr = true;
-                match self.encoder.encode_bgrx(width, height, stride, pixels, true) {
+                match self
+                    .encoder
+                    .encode_bgrx(width, height, stride, pixels, true)
+                {
                     Ok(au) if !au.annex_b.is_empty() => au,
                     Ok(_) => {
                         debug!("GFX H.264 encode skipped (empty bitstream)");
@@ -420,10 +440,8 @@ mod tests {
     fn no_avc_capability_marks_failed() {
         let session = GfxSession::mock(32, 32);
         let mut handler = session.dvc_handler();
-        let advertise = encode_caps_advertise_for_test(&[RawCapabilitySet::flags_only(
-            CAP_VERSION_81,
-            0,
-        )]);
+        let advertise =
+            encode_caps_advertise_for_test(&[RawCapabilitySet::flags_only(CAP_VERSION_81, 0)]);
         assert!(handler.on_data(&advertise).is_empty());
         assert!(session.failed());
         assert!(!session.is_ready());

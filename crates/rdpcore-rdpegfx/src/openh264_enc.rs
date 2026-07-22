@@ -129,10 +129,7 @@ impl H264Encoder for OpenH264Encoder {
 
         // With skip_frames(false) this should be rare; still treat Skip as soft
         // failure so the session can force an IDR retry instead of Planar thrash.
-        if matches!(
-            bitstream.frame_type(),
-            openh264::encoder::FrameType::Skip
-        ) {
+        if matches!(bitstream.frame_type(), openh264::encoder::FrameType::Skip) {
             return Err("openh264 skipped frame".into());
         }
 
