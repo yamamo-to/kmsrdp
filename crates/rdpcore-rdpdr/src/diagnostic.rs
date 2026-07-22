@@ -324,4 +324,12 @@ impl DriveConsumer for DirectoryListingSelfTest {
         }
         Vec::new()
     }
+
+    fn on_set_information_reply(
+        &mut self,
+        _request_tag: u64,
+        _result: Result<(), u32>,
+    ) -> Vec<DriveCommand> {
+        Vec::new()
+    }
 }

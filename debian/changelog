@@ -1,3 +1,10 @@
+kmsrdp (0.1.30) unstable; urgency=medium
+
+  * Drive FUSE: delete, rename, and setattr (size/times).
+  * Silence unused FUSE flush/fsync/xattr warnings.
+
+ -- kmsrdp contributors <noreply@example.com>  Wed, 22 Jul 2026 15:12:00 +0900
+
 kmsrdp (0.1.29) unstable; urgency=medium
 
   * Validate config, capabilities, and helper binaries at startup.

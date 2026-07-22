@@ -2,15 +2,11 @@
 //! server-issues/client-completes IRP mechanism used to actually operate
 //! on a previously-announced filesystem device.
 //!
-//! Scope matches FreeRDP's own rdpdr server implementation exactly:
-//! CREATE, CLOSE, READ, WRITE, and DIRECTORY_CONTROL/QUERY_DIRECTORY.
-//! FreeRDP's own server doesn't implement QUERY_INFORMATION/
-//! QUERY_VOLUME_INFORMATION either (dead stub code only, confirmed by
-//! reading its source) - rather than invent those wire layouts without a
-//! tested reference to check against, this crate defers them; a
-//! `FILE_DIRECTORY_INFORMATION` entry from `QUERY_DIRECTORY` already
-//! carries every field a `stat()`-like consumer needs per file
-//! (timestamps, size, attributes), which covers the common case.
+//! Scope matches FreeRDP's own rdpdr server for the common drive ops:
+//! CREATE, CLOSE, READ, WRITE, DIRECTORY_CONTROL/QUERY_DIRECTORY, and
+//! SET_INFORMATION (rename / end-of-file / basic times / disposition). Deletes
+//! use CREATE with `DELETE` (+ `FILE_DELETE_ON_CLOSE`) and
+//! `FileDispositionInformation`, then CLOSE.
 
 use rdpcore_pdu::DecodeError;
 use rdpcore_pdu::cursor::{ReadCursor, WriteBuf};
@@ -22,6 +18,7 @@ pub const IRP_MJ_CREATE: u32 = 0x0000_0000;
 pub const IRP_MJ_CLOSE: u32 = 0x0000_0002;
 pub const IRP_MJ_READ: u32 = 0x0000_0003;
 pub const IRP_MJ_WRITE: u32 = 0x0000_0004;
+pub const IRP_MJ_SET_INFORMATION: u32 = 0x0000_0006;
 pub const IRP_MJ_DIRECTORY_CONTROL: u32 = 0x0000_000C;
 pub const IRP_MN_QUERY_DIRECTORY: u32 = 0x0000_0001;
 
@@ -33,12 +30,26 @@ pub const FILE_OVERWRITE: u32 = 0x0000_0004;
 pub const FILE_OVERWRITE_IF: u32 = 0x0000_0005;
 
 pub const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+pub const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 pub const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+pub const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 
 pub const GENERIC_READ: u32 = 0x8000_0000;
 pub const GENERIC_WRITE: u32 = 0x4000_0000;
 pub const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
+pub const FILE_READ_DATA: u32 = 0x0000_0001;
+pub const FILE_WRITE_DATA: u32 = 0x0000_0002;
+pub const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+pub const DELETE: u32 = 0x0001_0000;
 pub const SYNCHRONIZE: u32 = 0x0010_0000;
+
+pub const FILE_SHARE_READ: u32 = 0x0000_0001;
+pub const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+pub const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+/// FreeRDP server default: read+write share (no delete share).
+pub const FILE_SHARE_READ_WRITE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
+/// Prefer when opening for delete so concurrent readers do not block us.
+pub const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
 pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
@@ -49,6 +60,14 @@ pub const FILE_CREATED: u8 = 2;
 pub const FILE_OVERWRITTEN: u8 = 3;
 pub const FILE_EXISTS: u8 = 4;
 pub const FILE_DOES_NOT_EXIST: u8 = 5;
+
+/// MS-FSCC / MS-RDPEFS `FsInformationClass` values used with
+/// [`IRP_MJ_SET_INFORMATION`].
+pub const FILE_BASIC_INFORMATION: u32 = 0x0000_0004;
+pub const FILE_RENAME_INFORMATION: u32 = 0x0000_000A;
+pub const FILE_DISPOSITION_INFORMATION: u32 = 0x0000_000D;
+pub const FILE_ALLOCATION_INFORMATION: u32 = 0x0000_0013;
+pub const FILE_END_OF_FILE_INFORMATION: u32 = 0x0000_0014;
 
 /// MS-FSCC 2.4 `FileDirectoryInformation` class value - the only
 /// `FsInformationClass` this crate (and FreeRDP's own server) issues for
@@ -97,7 +116,9 @@ pub fn encode_create_request(
     out.write_u32_le(0); // AllocationSize (low)
     out.write_u32_le(0); // AllocationSize (high) - server always sends 0
     out.write_u32_le(0); // FileAttributes
-    out.write_u32_le(3); // SharedAccess - matches the reference server (read+write+delete share)
+    // FreeRDP uses read+write (3); include DELETE share so an open-for-delete
+    // is not blocked by concurrent readers (common during FUSE rm).
+    out.write_u32_le(FILE_SHARE_ALL);
     out.write_u32_le(create_disposition);
     out.write_u32_le(create_options);
     out.write_u32_le(path_bytes.len() as u32);
@@ -268,6 +289,152 @@ pub fn decode_query_directory_reply(body: &[u8]) -> Result<Option<DirectoryEntry
     }))
 }
 
+/// DR_DRIVE_SET_INFORMATION_REQ (MS-RDPEFS 2.2.3.3.9) with an arbitrary
+/// `FsInformationClass` and `SetBuffer`.
+pub fn encode_set_information_request(
+    device_id: u32,
+    file_id: u32,
+    completion_id: u32,
+    fs_information_class: u32,
+    set_buffer: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 20 + 32 + set_buffer.len());
+    write_io_request_header(
+        &mut out,
+        device_id,
+        file_id,
+        completion_id,
+        IRP_MJ_SET_INFORMATION,
+        0,
+    );
+    out.write_u32_le(fs_information_class);
+    out.write_u32_le(set_buffer.len() as u32);
+    zero_padding(&mut out, 24);
+    out.write_slice(set_buffer);
+    out
+}
+
+/// `FileDispositionInformation` SetBuffer (`DeleteFile` boolean).
+pub fn disposition_information_buffer(delete_file: bool) -> Vec<u8> {
+    vec![u8::from(delete_file)]
+}
+
+/// Mark for delete via [`FILE_DISPOSITION_INFORMATION`].
+pub fn encode_set_disposition_request(
+    device_id: u32,
+    file_id: u32,
+    completion_id: u32,
+    delete_file: bool,
+) -> Vec<u8> {
+    encode_set_information_request(
+        device_id,
+        file_id,
+        completion_id,
+        FILE_DISPOSITION_INFORMATION,
+        &disposition_information_buffer(delete_file),
+    )
+}
+
+/// `FileRenameInformation` / `RDP_FILE_RENAME_INFORMATION` SetBuffer
+/// (FreeRDP `rdpdr_server_send_device_file_rename_request` layout).
+/// `new_path` is a full Windows path such as `\\dir\\new.txt`.
+pub fn rename_information_buffer(new_path: &str, replace_if_exists: bool) -> Vec<u8> {
+    let mut name_bytes = utf16::encode_units(new_path);
+    name_bytes.write_u16_le(0); // NUL
+    let mut set_buffer = Vec::with_capacity(6 + name_bytes.len());
+    set_buffer.write_u8(u8::from(replace_if_exists));
+    set_buffer.write_u8(0); // RootDirectory (always 0 for RDP)
+    set_buffer.write_u32_le(name_bytes.len() as u32);
+    set_buffer.write_slice(&name_bytes);
+    set_buffer
+}
+
+/// Rename via [`FILE_RENAME_INFORMATION`].
+pub fn encode_set_rename_request(
+    device_id: u32,
+    file_id: u32,
+    completion_id: u32,
+    new_path: &str,
+    replace_if_exists: bool,
+) -> Vec<u8> {
+    encode_set_information_request(
+        device_id,
+        file_id,
+        completion_id,
+        FILE_RENAME_INFORMATION,
+        &rename_information_buffer(new_path, replace_if_exists),
+    )
+}
+
+/// `FileEndOfFileInformation` SetBuffer (8-byte EndOfFile).
+pub fn end_of_file_information_buffer(end_of_file: i64) -> Vec<u8> {
+    let mut set_buffer = Vec::with_capacity(8);
+    set_buffer.write_u64_le(end_of_file as u64);
+    set_buffer
+}
+
+/// Truncate/extend via [`FILE_END_OF_FILE_INFORMATION`].
+pub fn encode_set_end_of_file_request(
+    device_id: u32,
+    file_id: u32,
+    completion_id: u32,
+    end_of_file: i64,
+) -> Vec<u8> {
+    encode_set_information_request(
+        device_id,
+        file_id,
+        completion_id,
+        FILE_END_OF_FILE_INFORMATION,
+        &end_of_file_information_buffer(end_of_file),
+    )
+}
+
+/// `FileBasicInformation` SetBuffer. A time or attribute value of `0`
+/// means "do not change" (MS-FSCC). The 4-byte reserved field is omitted
+/// on the wire (FreeRDP / IronRDP convention).
+pub fn basic_information_buffer(
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    file_attributes: u32,
+) -> Vec<u8> {
+    let mut set_buffer = Vec::with_capacity(36);
+    set_buffer.write_u64_le(creation_time as u64);
+    set_buffer.write_u64_le(last_access_time as u64);
+    set_buffer.write_u64_le(last_write_time as u64);
+    set_buffer.write_u64_le(change_time as u64);
+    set_buffer.write_u32_le(file_attributes);
+    set_buffer
+}
+
+#[allow(clippy::too_many_arguments)] // mirrors MS-FSCC FileBasicInformation fields
+/// Timestamps / attributes via [`FILE_BASIC_INFORMATION`].
+pub fn encode_set_basic_information_request(
+    device_id: u32,
+    file_id: u32,
+    completion_id: u32,
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    file_attributes: u32,
+) -> Vec<u8> {
+    encode_set_information_request(
+        device_id,
+        file_id,
+        completion_id,
+        FILE_BASIC_INFORMATION,
+        &basic_information_buffer(
+            creation_time,
+            last_access_time,
+            last_write_time,
+            change_time,
+            file_attributes,
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,5 +553,55 @@ mod tests {
     #[test]
     fn query_directory_reply_empty_body_means_no_more_files() {
         assert_eq!(decode_query_directory_reply(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn set_disposition_request_is_one_byte_true() {
+        let encoded = encode_set_disposition_request(1, 2, 3, true);
+        assert_eq!(
+            &encoded[24..28],
+            &FILE_DISPOSITION_INFORMATION.to_le_bytes()
+        );
+        assert_eq!(u32::from_le_bytes(encoded[28..32].try_into().unwrap()), 1);
+        assert_eq!(encoded[32 + 24], 1);
+    }
+
+    #[test]
+    fn set_rename_request_layout_matches_freerdp() {
+        let encoded = encode_set_rename_request(1, 7, 9, "\\dir\\new.txt", false);
+        assert_eq!(&encoded[16..20], &IRP_MJ_SET_INFORMATION.to_le_bytes());
+        assert_eq!(&encoded[24..28], &FILE_RENAME_INFORMATION.to_le_bytes());
+        let length = u32::from_le_bytes(encoded[28..32].try_into().unwrap()) as usize;
+        let set_buffer = &encoded[32 + 24..];
+        assert_eq!(set_buffer.len(), length);
+        assert_eq!(set_buffer[0], 0); // ReplaceIfExists
+        assert_eq!(set_buffer[1], 0); // RootDirectory
+        let name_len = u32::from_le_bytes(set_buffer[2..6].try_into().unwrap()) as usize;
+        assert_eq!(name_len + 6, length);
+        assert_eq!(&set_buffer[6..], &{
+            let mut n = utf16::encode_units("\\dir\\new.txt");
+            n.write_u16_le(0);
+            n
+        });
+    }
+
+    #[test]
+    fn set_end_of_file_request_carries_eight_byte_size() {
+        let encoded = encode_set_end_of_file_request(1, 2, 3, 1234);
+        assert_eq!(
+            &encoded[24..28],
+            &FILE_END_OF_FILE_INFORMATION.to_le_bytes()
+        );
+        assert_eq!(u32::from_le_bytes(encoded[28..32].try_into().unwrap()), 8);
+        assert_eq!(&encoded[56..64], &1234u64.to_le_bytes());
+    }
+
+    #[test]
+    fn set_basic_information_is_36_bytes_without_reserved() {
+        let encoded =
+            encode_set_basic_information_request(1, 2, 3, 10, 20, 30, 40, FILE_ATTRIBUTE_NORMAL);
+        assert_eq!(&encoded[24..28], &FILE_BASIC_INFORMATION.to_le_bytes());
+        assert_eq!(u32::from_le_bytes(encoded[28..32].try_into().unwrap()), 36);
+        assert_eq!(encoded.len(), 32 + 24 + 36);
     }
 }

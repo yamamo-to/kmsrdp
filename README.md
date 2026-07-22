@@ -45,7 +45,7 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
 - Startup fails hard if the first frame cannot be captured (no CRTC / NvFBC);
   later capture drops are logged with hints (rate-limited) instead of a silent
   black client
-- Drive FUSE: no delete/rename/setattr; no printer/CUPS yet
+- Drive FUSE: no printer/CUPS yet
 - CJK IME needs X11 (XTest); not available on Wayland-only sessions. `startx`
   on a tty session is detected automatically (`DISPLAY` / `XAUTHORITY` from
   logind, the session leader, or a sole `/tmp/.X11-unix/X*` socket)

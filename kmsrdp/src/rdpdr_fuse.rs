@@ -8,8 +8,9 @@
 //! bridge; if that connection disconnects first, ownership is handed off by
 //! swapping the backend in place (no umount) so other sessions keep responding.
 //!
-//! Wire IRPs are limited to CREATE/CLOSE/READ/WRITE/QueryDirectory (same as
-//! FreeRDP's server). unlink/rmdir/rename/setattr therefore return ENOSYS.
+//! Wire IRPs match FreeRDP's drive server: CREATE/CLOSE/READ/WRITE/
+//! QueryDirectory plus SET_INFORMATION (rename / size / times). Deletes use
+//! CREATE with `FILE_DELETE_ON_CLOSE` then CLOSE.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
@@ -22,12 +23,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::{
     BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request, SessionACL,
 };
 use rdpcore_rdpdr::irp::{
-    CreateReply, DirectoryEntry, FILE_ATTRIBUTE_DIRECTORY, FILE_CREATE, FILE_DIRECTORY_FILE,
-    FILE_OPEN, FILE_OPEN_IF, FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT, GENERIC_READ,
-    GENERIC_WRITE, SYNCHRONIZE,
+    CreateReply, DELETE, DirectoryEntry, FILE_ATTRIBUTE_DIRECTORY, FILE_BASIC_INFORMATION,
+    FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_INFORMATION,
+    FILE_END_OF_FILE_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
+    FILE_OVERWRITE_IF, FILE_READ_DATA, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+    FILE_WRITE_ATTRIBUTES, GENERIC_READ, GENERIC_WRITE, SYNCHRONIZE, basic_information_buffer,
+    disposition_information_buffer, end_of_file_information_buffer, rename_information_buffer,
 };
 use rdpcore_rdpdr::pdu::RDPDR_DTYP_FILESYSTEM;
 use rdpcore_rdpdr::{DriveCommand, DriveConsumer, DriveConsumerFactory};
@@ -61,6 +65,7 @@ enum Pending {
     Read(mpsc::Sender<Result<Vec<u8>, u32>>),
     Write(mpsc::Sender<Result<u32, u32>>),
     QueryDir(mpsc::Sender<Result<Option<DirectoryEntry>, u32>>),
+    SetInfo(mpsc::Sender<Result<(), u32>>),
 }
 
 struct Bridge {
@@ -176,7 +181,7 @@ impl Bridge {
         });
         match rx.recv_timeout(OP_TIMEOUT) {
             Ok(0) => Ok(()),
-            Ok(_) => Ok(()), // treat non-zero close status as soft failure
+            Ok(status) => Err(ntstatus_to_errno(status)),
             Err(_) => Err(Errno::EIO),
         }
     }
@@ -252,6 +257,125 @@ impl Bridge {
             Ok(Err(status)) => Err(ntstatus_to_errno(status)),
             Err(_) => Err(Errno::EIO),
         }
+    }
+
+    fn submit_set_information(
+        &self,
+        device_id: u32,
+        file_id: u32,
+        fs_information_class: u32,
+        set_buffer: Vec<u8>,
+    ) -> Result<(), Errno> {
+        let (tx, rx) = mpsc::channel();
+        let tag = self.alloc_tag();
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(tag, Pending::SetInfo(tx));
+        self.enqueue(DriveCommand::SetInformation {
+            device_id,
+            file_id,
+            fs_information_class,
+            set_buffer,
+            request_tag: tag,
+        });
+        match rx.recv_timeout(OP_TIMEOUT) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(status)) => Err(ntstatus_to_errno(status)),
+            Err(_) => Err(Errno::EIO),
+        }
+    }
+
+    /// FreeRDP-compatible delete with a disposition fallback for stricter
+    /// clients: open with `DELETE`, mark delete-on-close and/or send
+    /// `FileDispositionInformation`, then CLOSE (actual unlink happens then).
+    fn delete_path(&self, device_id: u32, path: &str, is_dir: bool) -> Result<(), Errno> {
+        let create_options = if is_dir {
+            FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE | FILE_SYNCHRONOUS_IO_NONALERT
+        } else {
+            FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE | FILE_SYNCHRONOUS_IO_NONALERT
+        };
+        // Windows redirectors typically require DELETE in DesiredAccess when
+        // FILE_DELETE_ON_CLOSE is set; FreeRDP's own server used FILE_READ_DATA
+        // for files, which fails against some clients (Guacamole / mstsc).
+        let create = self.submit_create(
+            device_id,
+            path.to_owned(),
+            DELETE | FILE_READ_DATA | SYNCHRONIZE,
+            FILE_OPEN,
+            create_options,
+        );
+        let create = match create {
+            Ok(c) => c,
+            Err(first) => {
+                // Retry without FILE_DELETE_ON_CLOSE; disposition IRP alone.
+                tracing::debug!(
+                    "kmsrdp: rdpdr FUSE: delete CREATE(delete-on-close) failed for {path:?} ({first:?}); retrying with disposition"
+                );
+                let options = if is_dir {
+                    FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
+                } else {
+                    FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
+                };
+                self.submit_create(
+                    device_id,
+                    path.to_owned(),
+                    DELETE | SYNCHRONIZE,
+                    FILE_OPEN,
+                    options,
+                )
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        "kmsrdp: rdpdr FUSE: delete CREATE failed path={path:?} device={device_id} first={first:?} retry={e:?}"
+                    );
+                })?
+            }
+        };
+
+        // Explicit disposition so clients that ignore CreateOptions still delete.
+        if let Err(e) = self.submit_set_information(
+            device_id,
+            create.file_id,
+            FILE_DISPOSITION_INFORMATION,
+            disposition_information_buffer(true),
+        ) {
+            tracing::debug!(
+                "kmsrdp: rdpdr FUSE: FileDispositionInformation failed for {path:?} ({e:?}); relying on DELETE_ON_CLOSE if set"
+            );
+        }
+
+        match self.submit_close(device_id, create.file_id) {
+            Ok(()) => {
+                self.forget_path(device_id, path);
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "kmsrdp: rdpdr FUSE: delete CLOSE failed path={path:?} device={device_id} ({e:?})"
+                );
+                Err(e)
+            }
+        }
+    }
+
+    fn rename_path(&self, device_id: u32, old_path: &str, new_path: &str) -> Result<(), Errno> {
+        let create = self.submit_create(
+            device_id,
+            old_path.to_owned(),
+            FILE_READ_DATA | SYNCHRONIZE,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT,
+        )?;
+        let result = self.submit_set_information(
+            device_id,
+            create.file_id,
+            FILE_RENAME_INFORMATION,
+            rename_information_buffer(new_path, false),
+        );
+        let _ = self.submit_close(device_id, create.file_id);
+        result?;
+        self.remap_path(device_id, old_path, new_path);
+        Ok(())
     }
 
     fn ensure_root_ino(&self, device_id: u32) {
@@ -409,6 +533,58 @@ impl Bridge {
         }
         let _ = self.refresh_dir(device_id, parent)?;
         self.attr_for(device_id, &path).ok_or(Errno::ENOENT)
+    }
+
+    fn forget_path(&self, device_id: u32, win_path: &str) {
+        self.meta
+            .lock()
+            .unwrap()
+            .remove(&(device_id, win_path.to_owned()));
+        let ino = self
+            .path_to_ino
+            .lock()
+            .unwrap()
+            .remove(&(device_id, win_path.to_owned()));
+        if let Some(ino) = ino {
+            self.ino_to_path.lock().unwrap().remove(&(device_id, ino));
+        }
+    }
+
+    /// Remap `old_path` and any cached descendants (`old_path\\…`) to `new_path`.
+    fn remap_path(&self, device_id: u32, old_path: &str, new_path: &str) {
+        let prefix = if old_path == "\\" {
+            "\\".to_owned()
+        } else {
+            format!("{old_path}\\")
+        };
+
+        let mut path_to_ino = self.path_to_ino.lock().unwrap();
+        let mut ino_to_path = self.ino_to_path.lock().unwrap();
+        let mut meta = self.meta.lock().unwrap();
+
+        let mut remaps: Vec<(String, String, u64)> = Vec::new();
+        for ((did, path), ino) in path_to_ino.iter() {
+            if *did != device_id {
+                continue;
+            }
+            let new = if path == old_path {
+                new_path.to_owned()
+            } else if path.starts_with(&prefix) {
+                format!("{new_path}\\{}", &path[prefix.len()..])
+            } else {
+                continue;
+            };
+            remaps.push((path.clone(), new, *ino));
+        }
+
+        for (old, new, ino) in remaps {
+            path_to_ino.remove(&(device_id, old.clone()));
+            path_to_ino.insert((device_id, new.clone()), ino);
+            ino_to_path.insert((device_id, ino), new.clone());
+            if let Some(m) = meta.remove(&(device_id, old)) {
+                meta.insert((device_id, new), m);
+            }
+        }
     }
 }
 
@@ -829,46 +1005,286 @@ impl Filesystem for FuseFs {
         }
     }
 
-    fn unlink(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::ENOSYS);
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let (bridge, device_id) = self.active();
+        let Some(parent_path) = bridge.path_for(device_id, parent.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let path = join_win(&parent_path, name);
+        match bridge.delete_path(device_id, &path, false) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
     }
 
-    fn rmdir(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::ENOSYS);
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let (bridge, device_id) = self.active();
+        let Some(parent_path) = bridge.path_for(device_id, parent.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let path = join_win(&parent_path, name);
+        match bridge.delete_path(device_id, &path, true) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
     }
 
     fn rename(
         &self,
         _req: &Request,
-        _parent: INodeNo,
-        _name: &OsStr,
-        _newparent: INodeNo,
-        _newname: &OsStr,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
         _flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::ENOSYS);
+        let (bridge, device_id) = self.active();
+        let Some(parent_path) = bridge.path_for(device_id, parent.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(new_parent_path) = bridge.path_for(device_id, newparent.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let old_path = join_win(&parent_path, name);
+        let new_path = join_win(&new_parent_path, newname);
+        match bridge.rename_path(device_id, &old_path, &new_path) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
     }
 
     fn setattr(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
-        _size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
-        _ctime: Option<SystemTime>,
-        _fh: Option<FileHandle>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        ctime: Option<SystemTime>,
+        fh: Option<FileHandle>,
+        crtime: Option<SystemTime>,
+        chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        reply.error(Errno::ENOSYS);
+        let (bridge, device_id) = self.active();
+        let Some(path) = bridge.path_for(device_id, ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        let need_size = size.is_some();
+        let need_times = atime.is_some()
+            || mtime.is_some()
+            || ctime.is_some()
+            || crtime.is_some()
+            || chgtime.is_some();
+
+        if !need_size && !need_times {
+            // mode/uid/gid alone: no RDP equivalent; return current attrs.
+            match bridge.attr_for(device_id, &path) {
+                Some(attr) => reply.attr(&TTL, &attr),
+                None => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
+        let open_fh = fh.map(|h| h.0);
+        let opened = open_fh.and_then(|h| {
+            bridge
+                .opens
+                .lock()
+                .unwrap()
+                .get(&h)
+                .map(|o| (o.device_id, o.file_id))
+        });
+
+        let (file_device, file_id, close_after) = if let Some((d, f)) = opened {
+            (d, f, false)
+        } else {
+            let access = if need_size {
+                GENERIC_WRITE | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE
+            } else {
+                FILE_WRITE_ATTRIBUTES | SYNCHRONIZE
+            };
+            match bridge.submit_create(
+                device_id,
+                path.clone(),
+                access,
+                FILE_OPEN,
+                FILE_SYNCHRONOUS_IO_NONALERT,
+            ) {
+                Ok(create) => (device_id, create.file_id, true),
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
+            }
+        };
+
+        if let Some(size) = size {
+            if let Err(e) = bridge.submit_set_information(
+                file_device,
+                file_id,
+                FILE_END_OF_FILE_INFORMATION,
+                end_of_file_information_buffer(size as i64),
+            ) {
+                if close_after {
+                    let _ = bridge.submit_close(file_device, file_id);
+                }
+                reply.error(e);
+                return;
+            }
+            if let Some(meta) = bridge
+                .meta
+                .lock()
+                .unwrap()
+                .get_mut(&(device_id, path.clone()))
+            {
+                meta.size = size;
+                meta.mtime = SystemTime::now();
+                meta.ctime = SystemTime::now();
+            }
+        }
+
+        if need_times {
+            let creation = crtime.map(systemtime_to_filetime).unwrap_or(0);
+            let last_access = atime.map(time_or_now_to_filetime).unwrap_or(0);
+            let last_write = mtime.map(time_or_now_to_filetime).unwrap_or(0);
+            let change = chgtime.or(ctime).map(systemtime_to_filetime).unwrap_or(0);
+            if let Err(e) = bridge.submit_set_information(
+                file_device,
+                file_id,
+                FILE_BASIC_INFORMATION,
+                basic_information_buffer(creation, last_access, last_write, change, 0),
+            ) {
+                if close_after {
+                    let _ = bridge.submit_close(file_device, file_id);
+                }
+                reply.error(e);
+                return;
+            }
+            if let Some(meta) = bridge
+                .meta
+                .lock()
+                .unwrap()
+                .get_mut(&(device_id, path.clone()))
+            {
+                if let Some(t) = atime {
+                    meta.atime = time_or_now_to_systemtime(t);
+                }
+                if let Some(t) = mtime {
+                    meta.mtime = time_or_now_to_systemtime(t);
+                }
+                if let Some(t) = ctime.or(chgtime) {
+                    meta.ctime = t;
+                }
+                if let Some(t) = crtime {
+                    meta.crtime = t;
+                }
+            }
+        }
+
+        if close_after {
+            let _ = bridge.submit_close(file_device, file_id);
+        }
+
+        match bridge.attr_for(device_id, &path) {
+            Some(attr) => reply.attr(&TTL, &attr),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    // Writes go over RDP immediately; nothing buffered server-side to flush.
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: fuser::LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    // RDPDR has no xattr surface; answer like a filesystem without them.
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
+        reply.error(Errno::ENODATA);
+    }
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(Errno::ENOTSUP);
+    }
+
+    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(Errno::ENOTSUP);
     }
 }
 
@@ -1246,6 +1662,18 @@ impl DriveConsumer for FuseDriveConsumer {
         Vec::new()
     }
 
+    fn on_set_information_reply(
+        &mut self,
+        request_tag: u64,
+        result: Result<(), u32>,
+    ) -> Vec<DriveCommand> {
+        if let Some(Pending::SetInfo(tx)) = self.bridge.pending.lock().unwrap().remove(&request_tag)
+        {
+            let _ = tx.send(result);
+        }
+        Vec::new()
+    }
+
     fn poll_commands(&mut self) -> Vec<DriveCommand> {
         self.bridge.poll_commands()
     }
@@ -1356,6 +1784,27 @@ fn filetime_to_systemtime(ft: i64) -> SystemTime {
     UNIX_EPOCH + Duration::new(secs, nanos)
 }
 
+fn systemtime_to_filetime(t: SystemTime) -> i64 {
+    const EPOCH_DIFF: i64 = 116444736000000000;
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => {
+            EPOCH_DIFF + (d.as_secs() as i64) * 10_000_000 + (i64::from(d.subsec_nanos()) / 100)
+        }
+        Err(_) => 0,
+    }
+}
+
+fn time_or_now_to_filetime(t: fuser::TimeOrNow) -> i64 {
+    systemtime_to_filetime(time_or_now_to_systemtime(t))
+}
+
+fn time_or_now_to_systemtime(t: fuser::TimeOrNow) -> SystemTime {
+    match t {
+        fuser::TimeOrNow::Now => SystemTime::now(),
+        fuser::TimeOrNow::SpecificTime(st) => st,
+    }
+}
+
 fn ntstatus_to_errno(status: u32) -> Errno {
     match status {
         // STATUS_NO_SUCH_FILE / OBJECT_NAME_* / OBJECT_PATH_NOT_FOUND
@@ -1366,6 +1815,7 @@ fn ntstatus_to_errno(status: u32) -> Errno {
         0xC000_000D => Errno::EINVAL,               // STATUS_INVALID_PARAMETER
         0xC000_00BB | 0xC000_00A3 => Errno::ENOSYS, // NOT_SUPPORTED / NOT_IMPLEMENTED
         0xC000_0010 => Errno::EIO,
+        0xC000_0101 => Errno::ENOTEMPTY, // STATUS_DIRECTORY_NOT_EMPTY
         _ => {
             tracing::debug!("kmsrdp: rdpdr FUSE: unmapped NTSTATUS {status:#010x} → EIO");
             Errno::EIO

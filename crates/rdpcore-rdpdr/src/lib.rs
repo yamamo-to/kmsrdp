@@ -73,6 +73,15 @@ pub enum DriveCommand {
         path: Option<String>,
         request_tag: u64,
     },
+    /// `IRP_MJ_SET_INFORMATION` with a pre-encoded SetBuffer (rename,
+    /// end-of-file, basic times, …).
+    SetInformation {
+        device_id: u32,
+        file_id: u32,
+        fs_information_class: u32,
+        set_buffer: Vec<u8>,
+        request_tag: u64,
+    },
 }
 
 /// `request_tag` is an opaque correlator the consumer chose when issuing
@@ -108,6 +117,13 @@ pub trait DriveConsumer: Send {
         &mut self,
         request_tag: u64,
         result: Result<Option<irp::DirectoryEntry>, u32>,
+    ) -> Vec<DriveCommand>;
+    /// Completion for [`DriveCommand::SetInformation`]. `Ok(())` when
+    /// `IoStatus` was success.
+    fn on_set_information_reply(
+        &mut self,
+        request_tag: u64,
+        result: Result<(), u32>,
     ) -> Vec<DriveCommand>;
     /// Drain any commands queued by an external driver (e.g. FUSE) since
     /// the last poll. Reply callbacks may still return follow-up commands
@@ -348,6 +364,17 @@ impl RdpdrChannel {
                 self.consumer
                     .on_query_directory_reply(pending.request_tag, result)
             }
+            irp::IRP_MJ_SET_INFORMATION => {
+                let result = if ok { Ok(()) } else { Err(io_status) };
+                if let Err(status) = result {
+                    tracing::warn!(
+                        "rdpdr: SET_INFORMATION failed NTSTATUS={status:#010x} (tag={})",
+                        pending.request_tag
+                    );
+                }
+                self.consumer
+                    .on_set_information_reply(pending.request_tag, result)
+            }
             _ => Vec::new(),
         })
     }
@@ -420,6 +447,23 @@ impl RdpdrChannel {
                         file_id,
                         completion_id,
                         path.as_deref(),
+                    ),
+                ),
+                DriveCommand::SetInformation {
+                    device_id,
+                    file_id,
+                    fs_information_class,
+                    set_buffer,
+                    request_tag,
+                } => (
+                    irp::IRP_MJ_SET_INFORMATION,
+                    request_tag,
+                    irp::encode_set_information_request(
+                        device_id,
+                        file_id,
+                        completion_id,
+                        fs_information_class,
+                        &set_buffer,
                     ),
                 ),
             };
@@ -504,6 +548,13 @@ mod tests {
             result: Result<Option<irp::DirectoryEntry>, u32>,
         ) -> Vec<DriveCommand> {
             self.query_directory_replies.push((request_tag, result));
+            Vec::new()
+        }
+        fn on_set_information_reply(
+            &mut self,
+            _request_tag: u64,
+            _result: Result<(), u32>,
+        ) -> Vec<DriveCommand> {
             Vec::new()
         }
     }
@@ -705,6 +756,13 @@ mod tests {
                 &mut self,
                 _request_tag: u64,
                 _result: Result<Option<irp::DirectoryEntry>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_set_information_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<(), u32>,
             ) -> Vec<DriveCommand> {
                 Vec::new()
             }
