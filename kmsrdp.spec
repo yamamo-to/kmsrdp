@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.34
+Version:        0.1.35
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -98,6 +98,10 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.35-1
+- Ignore rsa Marvin Attack advisory (no upstream fix; CredSSP/NTLM only)
+- Fix fuzz CI musl/ASAN; reject hostile Monitor Layout counts (OOM)
+
 * Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.34-1
 - Cut Pulse/PipeWire audio buffer defaults (~2s) to ~20ms for RDPSND/RDPEAI
 
