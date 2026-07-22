@@ -83,18 +83,29 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install nightly Rust
-        run: rustup toolchain install nightly --profile minimal
+        run: |
+          rustup toolchain install nightly --profile minimal
+          # cargo-fuzz defaults to musl on Linux, which conflicts with ASAN
+          # (static libc). Pin the gnu target that ships with the toolchain.
+          rustup target add x86_64-unknown-linux-gnu --toolchain nightly
 
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
 
       - name: Fuzz rdpcore-pdu decoders
+        env:
+          # Defense if a runner/config injects +crt-static (ASAN-incompatible).
+          RUSTFLAGS: -C target-feature=-crt-static
         run: |
           cd crates/rdpcore-pdu
-          cargo +nightly fuzz run decode_wire -- -max_total_time=20 -max_len=8192
+          cargo +nightly fuzz run decode_wire --target x86_64-unknown-linux-gnu -- \
+            -max_total_time=20 -max_len=8192
 
       - name: Fuzz rdpcore-rdpdr decoders
+        env:
+          RUSTFLAGS: -C target-feature=-crt-static
         run: |
           cd crates/rdpcore-rdpdr
-          cargo +nightly fuzz run decode_rdpdr -- -max_total_time=20 -max_len=8192
+          cargo +nightly fuzz run decode_rdpdr --target x86_64-unknown-linux-gnu -- \
+            -max_total_time=20 -max_len=8192

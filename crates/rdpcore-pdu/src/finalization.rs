@@ -5,7 +5,7 @@
 
 use crate::DecodeError;
 use crate::capability_sets::{ShareControlHeader, ShareControlPduType};
-use crate::cursor::{ReadCursor, WriteBuf};
+use crate::cursor::{NotEnoughBytes, ReadCursor, WriteBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareDataPduType {
@@ -375,6 +375,22 @@ pub fn encode_monitor_layout(monitors: &[MonitorDef]) -> Vec<u8> {
 pub fn decode_monitor_layout(body: &[u8]) -> Result<Vec<MonitorDef>, DecodeError> {
     let mut cursor = ReadCursor::new(body);
     let count = cursor.read_u32_le()? as usize;
+    // Each TS_MONITOR_DEF is 20 bytes; reject counts that cannot fit so a
+    // hostile length cannot trigger a multi-GB `Vec::with_capacity`.
+    const MONITOR_DEF_BYTES: usize = 20;
+    let needed = count
+        .checked_mul(MONITOR_DEF_BYTES)
+        .ok_or(DecodeError::InvalidValue {
+            field: "monitor_layout.monitorCount",
+            reason: "count overflow",
+        })?;
+    if cursor.remaining() < needed {
+        return Err(NotEnoughBytes {
+            needed,
+            remaining: cursor.remaining(),
+        }
+        .into());
+    }
     let mut monitors = Vec::with_capacity(count);
     for _ in 0..count {
         monitors.push(MonitorDef::decode(&mut cursor)?);
@@ -523,5 +539,12 @@ mod tests {
             DataPdu::decode(&pdu.encode()).unwrap().pdu_type2,
             ShareDataPduType::MonitorLayout
         );
+    }
+
+    #[test]
+    fn monitor_layout_rejects_huge_count_without_allocating() {
+        // Hostile monitorCount that would previously Vec::with_capacity to OOM.
+        let body = 0xc400_01f1u32.to_le_bytes();
+        assert!(decode_monitor_layout(&body).is_err());
     }
 }
