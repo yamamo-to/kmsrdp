@@ -15,6 +15,8 @@ use rdpcore_pdu::finalization::{
 use rdpcore_pdu::surface_commands::{FRAME_ACTION_BEGIN, FRAME_ACTION_END, encode_frame_marker};
 use rdpcore_rdpdr::{DriveConsumerFactory, RdpdrChannel};
 use rdpcore_rdpeai::{AudioInputBackendFactory, AudioInputHandler};
+#[cfg(feature = "gfx")]
+use rdpcore_rdpegfx::{GfxSession, select_h264_encoder};
 use rdpcore_rdpsnd::{RdpsndChannel, RdpsndServerMessage, SoundServerFactory};
 use rdpcore_transport::{ChannelKey, ConnectionWriter, Frame, FrameSender, Priority};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -550,6 +552,41 @@ impl Session {
             mux
         });
 
+        #[cfg(feature = "gfx")]
+        let gfx_session = if gfx_env_enabled() {
+            match select_h264_encoder() {
+                Ok(selected) => {
+                    let session = GfxSession::new(
+                        selected.encoder,
+                        accepted.desktop_width,
+                        accepted.desktop_height,
+                    );
+                    if let Some(mux) = dvc.as_mut() {
+                        let frames = mux.register_channel(Box::new(session.dvc_handler()));
+                        for bytes in frames {
+                            let _ = frame_sender.send(Frame {
+                                channel: ChannelKey::Static(mux.channel_id()),
+                                priority: Priority::Bulk,
+                                bytes,
+                            });
+                        }
+                        info!(
+                            encoder = selected.name,
+                            "GFX AVC420 channel registered"
+                        );
+                    }
+                    Some(session)
+                }
+                Err(e) => {
+                    warn!("GFX encoder unavailable ({e}); using Planar/NSCodec");
+                    None
+                }
+            }
+        } else {
+            info!("GFX disabled (KMSRDP_GFX=0); using Planar/NSCodec");
+            None
+        };
+
         let rdpdr_channel_id = accepted
             .static_channels
             .iter()
@@ -659,6 +696,8 @@ impl Session {
             height: accepted.desktop_height,
         };
         let mut pending_after_resize: Option<BitmapUpdate> = None;
+        #[cfg(feature = "gfx")]
+        let mut last_gfx_data: Option<std::sync::Arc<[u8]>> = None;
 
         loop {
             tokio::select! {
@@ -666,16 +705,31 @@ impl Session {
                     bitmap_gate_open = true;
                     if display_updates_allowed
                         && let Some(bitmap) = deferred_bitmap.take()
-                        && send_outbound_bitmap(
+                    {
+                        let full = updates.latest_full_frame();
+                        #[cfg(feature = "gfx")]
+                        let gfx_attempt = Some(try_send_gfx_frame(
+                            gfx_session.as_ref(),
+                            dvc.as_ref(),
+                            &mut last_gfx_data,
+                            full.as_ref(),
+                            &bitmap,
+                            &frame_sender,
+                        ));
+                        if send_outbound_frame(
                             &bitmap,
                             &frame_sender,
                             &bitmap_policy,
                             &mut frame_id,
+                            full.as_ref(),
+                            #[cfg(feature = "gfx")]
+                            gfx_attempt,
                         )
                         .await
                         .is_err()
-                    {
-                        return Ok(());
+                        {
+                            return Ok(());
+                        }
                     }
                 }
                 frame = read_steady_state_frame(&mut read_half) => {
@@ -836,11 +890,24 @@ impl Session {
                         }
                         Ok(Some(DisplayUpdate::Bitmap(_))) if !display_updates_allowed => {}
                         Ok(Some(DisplayUpdate::Bitmap(bitmap))) => {
-                            if send_outbound_bitmap(
+                            let full = updates.latest_full_frame();
+                            #[cfg(feature = "gfx")]
+                            let gfx_attempt = Some(try_send_gfx_frame(
+                                gfx_session.as_ref(),
+                                dvc.as_ref(),
+                                &mut last_gfx_data,
+                                full.as_ref(),
+                                &bitmap,
+                                &frame_sender,
+                            ));
+                            if send_outbound_frame(
                                 &bitmap,
                                 &frame_sender,
                                 &bitmap_policy,
                                 &mut frame_id,
+                                full.as_ref(),
+                                #[cfg(feature = "gfx")]
+                                gfx_attempt,
                             )
                             .await
                             .is_err()
@@ -852,6 +919,13 @@ impl Session {
                             debug!("dropping resize to {}x{}: a previous resize is still in flight", size.width, size.height);
                         }
                         Ok(Some(DisplayUpdate::Resized(size))) => {
+                            #[cfg(feature = "gfx")]
+                            if let (Some(gfx), Some(mux)) = (gfx_session.as_ref(), dvc.as_ref())
+                                && let Some(payloads) = gfx.resize(size.width, size.height)
+                            {
+                                let _ = send_gfx_payloads(mux, &frame_sender, payloads);
+                                last_gfx_data = None;
+                            }
                             match acceptor.begin_resize(size.width, size.height) {
                                 Ok(response) => {
                                     resizing = true;
@@ -966,6 +1040,106 @@ async fn send_outbound_bitmap(
         }
     }
     Ok(())
+}
+
+/// Prefer GFX AVC420 when negotiated; otherwise Planar/NSCodec Fast-Path.
+/// GFX work is synchronous so `&DvcMux` is never held across an await.
+#[allow(clippy::too_many_arguments)]
+async fn send_outbound_frame(
+    bitmap: &BitmapUpdate,
+    frame_sender: &FrameSender,
+    policy: &BitmapEncodePolicy,
+    frame_id: &mut u32,
+    latest_full: Option<&BitmapUpdate>,
+    #[cfg(feature = "gfx")] gfx_attempt: Option<Result<bool, ()>>,
+) -> Result<(), ()> {
+    #[cfg(feature = "gfx")]
+    if let Some(result) = gfx_attempt {
+        match result {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(()) => return Err(()),
+        }
+    }
+    let _ = latest_full;
+    send_outbound_bitmap(bitmap, frame_sender, policy, frame_id).await
+}
+
+/// Returns `Ok(true)` when the GFX path handled (or intentionally skipped) the
+/// frame; `Ok(false)` to fall back to Planar/NSCodec.
+#[cfg(feature = "gfx")]
+fn try_send_gfx_frame(
+    gfx: Option<&GfxSession>,
+    dvc: Option<&DvcMux>,
+    last_gfx_data: &mut Option<std::sync::Arc<[u8]>>,
+    latest_full: Option<&BitmapUpdate>,
+    bitmap: &BitmapUpdate,
+    frame_sender: &FrameSender,
+) -> Result<bool, ()> {
+    let (Some(gfx), Some(mux)) = (gfx, dvc) else {
+        return Ok(false);
+    };
+    if !gfx.is_ready() {
+        return Ok(false);
+    }
+    let source = latest_full.unwrap_or(bitmap);
+    // Do not skip on Arc ptr equality: a frozen/black client needs periodic
+    // IDR refresh even when the captured buffer object is reused.
+    if let Some(payloads) = gfx.encode_frame(
+        source.width.get(),
+        source.height.get(),
+        source.stride.get(),
+        source.data.as_ref(),
+    ) {
+        *last_gfx_data = Some(std::sync::Arc::clone(&source.data));
+        send_gfx_payloads(mux, frame_sender, payloads)?;
+        return Ok(true);
+    }
+    // Soft encode skip (e.g. transient OpenH264 RC): keep the GFX path so we
+    // do not paint Planar over a black H.264 surface. Hard encoder init
+    // failures never register the GFX channel in the first place.
+    Ok(true)
+}
+
+#[cfg(feature = "gfx")]
+fn send_gfx_payloads(
+    mux: &DvcMux,
+    frame_sender: &FrameSender,
+    payloads: Vec<Vec<u8>>,
+) -> Result<(), ()> {
+    let Some(dyn_id) = mux.channel_id_for_name(rdpcore_rdpegfx::CHANNEL_NAME) else {
+        return Err(());
+    };
+    for bytes in mux.wrap_channel_payloads(dyn_id, payloads) {
+        if frame_sender
+            .send(Frame {
+                channel: ChannelKey::Static(mux.channel_id()),
+                priority: Priority::Bulk,
+                bytes,
+            })
+            .is_err()
+        {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gfx")]
+fn gfx_env_enabled() -> bool {
+    // Opt-in until the AVC420 path is stable with mstsc. A GFX protocol
+    // error otherwise drops the session and some clients refuse to reconnect
+    // until the server process is restarted. Set KMSRDP_GFX=1 to enable.
+    match std::env::var("KMSRDP_GFX") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("yes")
+        }
+        Err(_) => false,
+    }
 }
 
 /// Awaits the next message from an optional channel - never resolves if

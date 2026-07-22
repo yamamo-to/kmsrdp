@@ -1,6 +1,6 @@
 [package]
 name = "kmsrdp"
-version = "0.1.35"
+version = "0.1.36"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "DRM/KMS-based RDP remote desktop server in pure Rust"
@@ -22,7 +22,7 @@ rdpcore-cliprdr = { path = "../crates/rdpcore-cliprdr" }
 rdpcore-rdpdr = { path = "../crates/rdpcore-rdpdr" }
 rdpcore-rdpeai = { path = "../crates/rdpcore-rdpeai" }
 rdpcore-rdpsnd = { path = "../crates/rdpcore-rdpsnd" }
-rdpcore-server = { path = "../crates/rdpcore-server" }
+rdpcore-server = { path = "../crates/rdpcore-server", default-features = false }
 rcgen = "0.14.8"
 rustls = "0.23.42"
 futures-util = "0.3"
@@ -44,7 +44,12 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "fmt"] }
 
 [features]
-default = []
+default = ["gfx"]
+# MS-RDPEGFX + OpenH264 AVC420. Off by default at runtime; set KMSRDP_GFX=1.
+# Optional HW: gfx-vaapi / gfx-nvenc (NVENC→VAAPI→OpenH264).
+gfx = ["rdpcore-server/gfx"]
+gfx-vaapi = ["rdpcore-server/gfx-vaapi"]
+gfx-nvenc = ["rdpcore-server/gfx-nvenc"]
 # Pulls in the RDPDR directory-listing self-test consumer (env
 # KMSRDP_RDPDR_DIAGNOSTIC). Not needed for normal FUSE drive redirection.
 rdpdr-diagnostic = ["rdpcore-rdpdr/diagnostic"]

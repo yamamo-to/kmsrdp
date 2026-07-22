@@ -215,6 +215,22 @@ impl DvcMux {
             .flat_map(|dvc_pdu| wrap_indication(self.user_channel_id, self.channel_id, dvc_pdu))
             .collect()
     }
+
+    /// Look up a dynamic channel id by its ANSI name (e.g. GFX / AUDIO_INPUT).
+    pub fn channel_id_for_name(&self, name: &str) -> Option<u32> {
+        self.channels
+            .iter()
+            .find(|slot| slot.handler.channel_name() == name)
+            .map(|slot| slot.id)
+    }
+
+    /// Wrap already-assembled dynamic-channel payloads for a known channel id
+    /// into MCS Send Data Indication frames on the `"drdynvc"` static channel.
+    /// Used by producers that push unsolicited data (GFX frames) outside of
+    /// [`DvcHandler::on_data`].
+    pub fn wrap_channel_payloads(&self, channel_id: u32, payloads: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        self.encode_payloads(channel_id, payloads)
+    }
 }
 
 #[cfg(test)]

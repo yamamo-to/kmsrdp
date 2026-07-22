@@ -6,6 +6,7 @@ Build-Depends:
  debhelper-compat (= 13),
  cargo,
  rustc,
+ g++,
  pkg-config,
  libfuse3-dev,
  libpulse-dev,
@@ -28,8 +29,10 @@ Description: DRM/KMS-based RDP remote desktop server (pure Rust)
  supports screen capture, mouse/keyboard input, Japanese/CJK IME text
  injection (X11 sessions), bidirectional clipboard sync, audio output and
  microphone redirection, FUSE mounts for redirected client drives, TLS +
- username/password authentication (optional NLA), and priority-aware
- scheduling so video traffic cannot starve audio.
+ username/password authentication (optional NLA), priority-aware scheduling
+ so video traffic cannot starve audio, and optional MS-RDPEGFX AVC420
+ (OpenH264) when the client negotiates the Graphics Pipeline.
  .
- Known limitations: Linear (non-tiled) framebuffers only, single monitor,
- and no printer redirection (CUPS) yet. See the upstream README for details.
+ Known limitations: XRGB8888/ARGB8888 framebuffers only (tiled modifiers are
+ detiled via GBM/EGL when needed), multi-head is one composited canvas, and
+ no printer redirection (CUPS) yet. See the upstream README for details.

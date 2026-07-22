@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.35
+Version:        0.1.36
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -25,6 +25,7 @@ Source1:        %{name}-%{version}-vendor.tar.xz
 BuildRequires:  cargo
 BuildRequires:  rust
 BuildRequires:  gcc
+BuildRequires:  gcc-c++
 BuildRequires:  fuse3-devel
 BuildRequires:  pulseaudio-libs-devel
 BuildRequires:  systemd-rpm-macros
@@ -98,6 +99,10 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Thu Jul 23 2026 kmsrdp contributors <noreply@example.com> - 0.1.36-1
+- Add experimental MS-RDPEGFX AVC420 path (OpenH264; optional VAAPI/NVENC)
+- Opt-in at runtime with KMSRDP_GFX=1; Annex B bitstream per MS-RDPEGFX
+
 * Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.35-1
 - Ignore rsa Marvin Attack advisory (no upstream fix; CredSSP/NTLM only)
 - Fix fuzz CI musl/ASAN; reject hostile Monitor Layout counts (OOM)

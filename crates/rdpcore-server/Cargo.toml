@@ -15,6 +15,7 @@ rdpcore-rdpeai = { path = "../rdpcore-rdpeai" }
 rdpcore-rdpdr = { path = "../rdpcore-rdpdr" }
 rdpcore-pdu = { path = "../rdpcore-pdu" }
 rdpcore-rdpsnd = { path = "../rdpcore-rdpsnd" }
+rdpcore-rdpegfx = { path = "../rdpcore-rdpegfx", optional = true }
 rdpcore-transport = { path = "../rdpcore-transport" }
 sspi = { version = "0.21.3", default-features = false, features = ["aws-lc-rs"] }
 tokio = { version = "1.52.3", features = ["rt", "net", "io-util", "macros", "sync", "time"] }
@@ -23,5 +24,10 @@ tracing = "0.1.44"
 
 [features]
 default = []
+# MS-RDPEGFX + OpenH264 AVC420 path. Enabled by the kmsrdp binary's
+# default `gfx` feature; opt-in at runtime with KMSRDP_GFX=1.
+gfx = ["dep:rdpcore-rdpegfx", "rdpcore-rdpegfx/openh264"]
+gfx-vaapi = ["gfx", "rdpcore-rdpegfx/vaapi"]
+gfx-nvenc = ["gfx", "rdpcore-rdpegfx/nvenc"]
 dvc-echo = ["rdpcore-dvc/echo"]
 

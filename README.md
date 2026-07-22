@@ -19,10 +19,12 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
 
 - **Display:** DRM/KMS capture (Linear mmap or GBM/EGL detile); NVIDIA NvFBC
   fallback when no CRTC is bound; dirty 64×64 tiles; RDP 6.0 planar (typical
-  clients) or NSCodec SurfaceCommands (macOS Windows App); composite all
-  connected CRTCs by default (`KMSRDP_DISPLAY=all` / unset) or one connector
-  (`KMSRDP_DISPLAY=DP-1` / `card1:DP-1`); Save Session Info (PLAINNOTIFY) on
-  connect; Monitor Layout when two or more CRTCs are composited
+  clients) or NSCodec SurfaceCommands (macOS Windows App); optional experimental
+  **GFX AVC420** via `KMSRDP_GFX=1` (OpenH264; optional VAAPI/NVENC via
+  `gfx-vaapi` / `gfx-nvenc`); composite all connected CRTCs by default
+  (`KMSRDP_DISPLAY=all` / unset) or one connector (`KMSRDP_DISPLAY=DP-1` /
+  `card1:DP-1`); Save Session Info (PLAINNOTIFY) on connect; Monitor Layout
+  when two or more CRTCs are composited
 - **Input:** `uinput` mouse/keyboard; CJK IME text on X11 (XTest)
 - **Clipboard:** text-only CLIPRDR; one process-wide local poller shared by
   all sessions
@@ -76,6 +78,10 @@ to choose where the identity is stored; `KMSRDP_TLS_EPHEMERAL=1` to skip
 persistence; `KMSRDP_LOG=debug` / `KMSRDP_LOG_FORMAT=json` for structured
 logs; `KMSRDP_DISPLAY=all` (default) to composite every CRTC, or
 `DP-1` / `card1:DP-1` for a single connector (disables NvFBC fallback).
+Experimental: `KMSRDP_GFX=1` enables MS-RDPEGFX / OpenH264 AVC420 (off by
+default — mstsc can disconnect on GFX protocol errors). Optional HW:
+`--features gfx-vaapi` / `gfx-nvenc` (NVENC → VAAPI → OpenH264).
+Debug: `KMSRDP_LOG=rdpcore_rdpegfx=debug`.
 
 **Redirected drives:** while an RDP client has shared a local drive, it
 appears on the Linux host at `$XDG_RUNTIME_DIR/kmsrdp/drives/<DosName>/`

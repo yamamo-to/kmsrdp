@@ -1,3 +1,10 @@
+kmsrdp (0.1.36) unstable; urgency=medium
+
+  * Add experimental MS-RDPEGFX AVC420 (OpenH264; optional VAAPI/NVENC).
+  * Opt-in with KMSRDP_GFX=1; Annex B bitstream per MS-RDPEGFX.
+
+ -- kmsrdp contributors <noreply@example.com>  Thu, 23 Jul 2026 02:10:00 +0900
+
 kmsrdp (0.1.35) unstable; urgency=medium
 
   * Ignore rsa Marvin Attack advisory until an upstream fix exists.

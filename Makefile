@@ -31,12 +31,12 @@ help:
 	@echo "  make clean"
 
 install-build-deps:
-	sudo dnf -y install rpm-build rpmdevtools cargo rust gcc libcap rpmlint fuse3-devel pulseaudio-libs-devel
+	sudo dnf -y install rpm-build rpmdevtools cargo rust gcc gcc-c++ libcap rpmlint fuse3-devel pulseaudio-libs-devel
 
 install-deb-build-deps:
 	sudo apt-get update
 	sudo apt-get install -y \
-		build-essential debhelper devscripts \
+		build-essential g++ debhelper devscripts \
 		pkg-config libfuse3-dev libcap2-bin libpulse-dev
 
 # Copy the checkout into $(1) and vendor crates there (needs network once).
