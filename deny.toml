@@ -7,6 +7,10 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
 # Fail only on unmaintained direct workspace deps; transitive noise is ignored.
 unmaintained = "workspace"
+ignore = [
+    # rsa (sspi → picky): Marvin Attack; no upstream fix yet. CredSSP/NTLM only.
+    { id = "RUSTSEC-2023-0071", reason = "no patched rsa; CredSSP/NTLM timing oracle not practically exploitable in our deployment model" },
+]
 
 [licenses]
 version = 2

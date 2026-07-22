@@ -1,0 +1,9 @@
+# Project-local cargo-audit config (used by CI `cargo audit`).
+# https://docs.rs/cargo-audit/latest/cargo_audit/
+
+[advisories]
+# rsa (via sspi → picky): Marvin Attack timing sidechannel.
+# No patched rsa release exists yet. Used only for CredSSP/NTLMv2 in
+# rdpcore-server; practical remote key recovery via this path is not
+# realistic for our threat model (trusted/VPN networks; see README).
+ignore = ["RUSTSEC-2023-0071"]
