@@ -255,16 +255,33 @@ pub enum ClientMessage {
 
 fn decode_device_list_announce(body: &[u8]) -> Result<Vec<DeviceAnnounce>, DecodeError> {
     let mut cursor = ReadCursor::new(body);
-    let device_count = cursor.read_u32_le()?;
-    let mut devices = Vec::with_capacity(device_count as usize);
+    let device_count = cursor.read_u32_le()? as usize;
+    // Each announce entry is at least 20 bytes (type, id, dos name, data len)
+    // before variable deviceData; reject impossible counts so a hostile
+    // DeviceCount cannot `Vec::with_capacity` to OOM under fuzz/ASAN.
+    const MIN_ANNOUNCE_BYTES: usize = 4 + 4 + 8 + 4;
+    let needed = device_count
+        .checked_mul(MIN_ANNOUNCE_BYTES)
+        .ok_or(DecodeError::InvalidValue {
+            field: "rdpdr.deviceCount",
+            reason: "count overflow",
+        })?;
+    if cursor.remaining() < needed {
+        return Err(rdpcore_pdu::cursor::NotEnoughBytes {
+            needed,
+            remaining: cursor.remaining(),
+        }
+        .into());
+    }
+    let mut devices = Vec::with_capacity(device_count);
     for _ in 0..device_count {
         let device_type = cursor.read_u32_le()?;
         let device_id = cursor.read_u32_le()?;
         let dos_name_raw = cursor.read_slice(8)?;
         let end = dos_name_raw.iter().position(|&b| b == 0).unwrap_or(8);
         let preferred_dos_name = String::from_utf8_lossy(&dos_name_raw[..end]).into_owned();
-        let device_data_length = cursor.read_u32_le()?;
-        let device_data = cursor.read_slice(device_data_length as usize)?.to_vec();
+        let device_data_length = cursor.read_u32_le()? as usize;
+        let device_data = cursor.read_slice(device_data_length)?.to_vec();
         devices.push(DeviceAnnounce {
             device_type,
             device_id,
@@ -444,6 +461,16 @@ mod tests {
                 device_data: Vec::new(),
             }])
         );
+    }
+
+    #[test]
+    fn device_list_announce_rejects_hostile_device_count() {
+        // Component + packet id + DeviceCount=u32::MAX would previously
+        // Vec::with_capacity to OOM under ASAN fuzz.
+        let mut wire = Vec::new();
+        write_header(&mut wire, PAKID_CORE_DEVICELIST_ANNOUNCE);
+        wire.write_u32_le(u32::MAX);
+        assert!(decode_client_message(&wire).is_err());
     }
 
     #[test]

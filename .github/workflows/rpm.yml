@@ -22,7 +22,7 @@ jobs:
         run: |
           dnf -y install \
             rpm-build rpmdevtools \
-            gcc libcap \
+            gcc gcc-c++ libcap \
             fuse3-devel pulseaudio-libs-devel pkgconf-pkg-config \
             tar
 
