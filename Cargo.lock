@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "kmsrdp"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1295,6 +1295,8 @@ dependencies = [
  "rand",
  "rcgen",
  "rdpcore-cliprdr",
+ "rdpcore-dvc",
+ "rdpcore-pdu",
  "rdpcore-rdpdr",
  "rdpcore-rdpeai",
  "rdpcore-rdpsnd",

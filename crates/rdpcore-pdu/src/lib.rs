@@ -1,7 +1,7 @@
 //! From-scratch RDP wire-format codecs: no I/O, no async, no other
 //! `rdpcore-*` crate or third-party protocol library involved. This is the
-//! layer meant to be exhaustively unit-tested (and, eventually, fuzzed)
-//! against real captured client/server bytes.
+//! layer meant to be exhaustively unit-tested and fuzzed (`cargo fuzz run
+//! decode_wire` in `fuzz/`) against arbitrary wire bytes.
 //!
 //! Covers TPKT/X.224, MCS, GCC, capabilities, FastPath, static-channel
 //! SVC framing, and related codecs used by the rest of the stack.

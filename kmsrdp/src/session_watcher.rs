@@ -268,3 +268,93 @@ async fn run_watcher(conn: Connection, tx: watch::Sender<Option<Session>>) -> Re
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn sample_session(display: Option<&str>) -> Session {
+        Session {
+            uid: 1000,
+            username: "alice".to_string(),
+            display: display.map(str::to_owned),
+            xauthority: Some(PathBuf::from("/home/alice/.Xauthority")),
+            xdg_runtime_dir: PathBuf::from("/run/user/1000"),
+        }
+    }
+
+    #[test]
+    fn apply_session_env_sets_x11_and_pulse_vars() {
+        let _guard = env_lock();
+        let saved_display = std::env::var("DISPLAY").ok();
+        let saved_xauthority = std::env::var("XAUTHORITY").ok();
+        let saved_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
+        let saved_dbus = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+        let saved_pulse = std::env::var("PULSE_SERVER").ok();
+
+        apply_session_env(&Some(sample_session(Some(":1"))));
+        assert_eq!(std::env::var("DISPLAY").unwrap(), ":1");
+        assert_eq!(
+            std::env::var("XAUTHORITY").unwrap(),
+            "/home/alice/.Xauthority"
+        );
+        assert_eq!(std::env::var("XDG_RUNTIME_DIR").unwrap(), "/run/user/1000");
+        assert_eq!(
+            std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap(),
+            "unix:path=/run/user/1000/bus"
+        );
+        assert_eq!(
+            std::env::var("PULSE_SERVER").unwrap(),
+            "unix:/run/user/1000/pulse/native"
+        );
+
+        apply_session_env(&None);
+        assert!(std::env::var("XDG_RUNTIME_DIR").is_err());
+        assert!(std::env::var("PULSE_SERVER").is_err());
+
+        unsafe {
+            match saved_display {
+                Some(v) => std::env::set_var("DISPLAY", v),
+                None => std::env::remove_var("DISPLAY"),
+            }
+            match saved_xauthority {
+                Some(v) => std::env::set_var("XAUTHORITY", v),
+                None => std::env::remove_var("XAUTHORITY"),
+            }
+            match saved_runtime {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+            match saved_dbus {
+                Some(v) => std::env::set_var("DBUS_SESSION_BUS_ADDRESS", v),
+                None => std::env::remove_var("DBUS_SESSION_BUS_ADDRESS"),
+            }
+            match saved_pulse {
+                Some(v) => std::env::set_var("PULSE_SERVER", v),
+                None => std::env::remove_var("PULSE_SERVER"),
+            }
+        }
+    }
+
+    #[test]
+    fn apply_session_env_clears_display_for_wayland_session() {
+        let _guard = env_lock();
+        let saved_display = std::env::var("DISPLAY").ok();
+
+        apply_session_env(&Some(sample_session(None)));
+        assert!(std::env::var("DISPLAY").is_err());
+
+        unsafe {
+            match saved_display {
+                Some(v) => std::env::set_var("DISPLAY", v),
+                None => std::env::remove_var("DISPLAY"),
+            }
+        }
+    }
+}

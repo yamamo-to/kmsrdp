@@ -4,3 +4,5 @@
 /.debbuild
 /.claude/
 /.cursor/
+**/fuzz/corpus/
+**/fuzz/artifacts/

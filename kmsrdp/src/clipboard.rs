@@ -175,3 +175,82 @@ impl CliprdrBackend for LocalClipboardBackend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tokio::sync::mpsc;
+
+    fn session_rx() -> watch::Receiver<Option<Session>> {
+        let (_, rx) = watch::channel(None);
+        rx
+    }
+
+    fn test_session(display: Option<&str>) -> Session {
+        Session {
+            uid: 1000,
+            username: "alice".to_string(),
+            display: display.map(str::to_owned),
+            xauthority: None,
+            xdg_runtime_dir: PathBuf::from("/run/user/1000"),
+        }
+    }
+
+    #[tokio::test]
+    async fn factory_builds_distinct_backends() {
+        let factory = LocalClipboardFactory::new(session_rx());
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let mut b1 = factory.build_cliprdr_backend(tx1);
+        let mut b2 = factory.build_cliprdr_backend(tx2);
+        b1.on_ready();
+        b2.on_ready();
+    }
+
+    #[tokio::test]
+    async fn unknown_format_request_returns_error_response() {
+        let factory = LocalClipboardFactory::new(session_rx());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut backend = factory.build_cliprdr_backend(tx);
+        backend.on_format_data_request(FormatDataRequest {
+            format: 0xDEAD_BEEF,
+        });
+        match rx.try_recv().expect("expected format data response") {
+            ClipboardMessage::SendFormatData(resp) => assert!(resp.is_error()),
+            _ => panic!("expected SendFormatData"),
+        }
+    }
+
+    #[tokio::test]
+    async fn format_data_error_response_is_ignored() {
+        let factory = LocalClipboardFactory::new(session_rx());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut backend = factory.build_cliprdr_backend(tx);
+        backend.on_format_data_response(FormatDataResponse::new_error());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_copy_without_unicode_skips_paste() {
+        let factory = LocalClipboardFactory::new(session_rx());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut backend = factory.build_cliprdr_backend(tx);
+        backend.on_remote_copy(&[ClipboardFormat { id: 1 }]);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn session_change_resets_watcher_state() {
+        let (session_tx, session_rx) = watch::channel(None);
+        let subscribers = Arc::new(Mutex::new(Vec::<UnboundedSender<ClipboardMessage>>::new()));
+        spawn_shared_clipboard_watcher(Arc::clone(&subscribers), session_rx);
+        session_tx
+            .send(Some(test_session(Some(":0"))))
+            .expect("send session");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        session_tx.send(None).expect("clear session");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

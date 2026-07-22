@@ -162,3 +162,53 @@ impl X11UnicodeTyper {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tokio::sync::watch;
+
+    fn session_rx(session: Option<Session>) -> watch::Receiver<Option<Session>> {
+        let (_, rx) = watch::channel(session);
+        rx
+    }
+
+    fn sample_session(display: Option<&str>) -> Session {
+        Session {
+            uid: 1000,
+            username: "alice".to_string(),
+            display: display.map(str::to_owned),
+            xauthority: None,
+            xdg_runtime_dir: PathBuf::from("/run/user/1000"),
+        }
+    }
+
+    #[test]
+    fn type_char_without_session_is_noop() {
+        let mut typer = X11UnicodeTyper::new(session_rx(None));
+        typer.type_char('あ' as u32);
+    }
+
+    #[test]
+    fn type_char_wayland_session_without_display_is_noop() {
+        let mut typer = X11UnicodeTyper::new(session_rx(Some(sample_session(None))));
+        typer.type_char('あ' as u32);
+    }
+
+    #[test]
+    fn type_char_invalid_display_does_not_panic() {
+        let mut typer = X11UnicodeTyper::new(session_rx(Some(sample_session(Some(":254")))));
+        typer.type_char('A' as u32);
+    }
+
+    #[test]
+    fn session_change_clears_cached_connection() {
+        let (tx, rx) = watch::channel(Some(sample_session(Some(":0"))));
+        let mut typer = X11UnicodeTyper::new(rx);
+        typer.type_char('x' as u32);
+        tx.send(Some(sample_session(Some(":1"))))
+            .expect("session switch");
+        typer.type_char('y' as u32);
+    }
+}

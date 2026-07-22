@@ -60,3 +60,39 @@ pub fn init() {
 fn stderr_is_tty() -> bool {
     unsafe { libc::isatty(libc::STDERR_FILENO) == 1 }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn init_handles_invalid_kmsrdp_log() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("KMSRDP_LOG", "[[[not a valid filter");
+            std::env::remove_var("KMSRDP_LOG_FORMAT");
+        }
+        init();
+    }
+
+    #[test]
+    fn init_accepts_json_format_flag() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("KMSRDP_LOG", "warn");
+            std::env::set_var("KMSRDP_LOG_FORMAT", "json");
+        }
+        init();
+    }
+
+    #[test]
+    fn stderr_is_tty_smoke() {
+        let _ = stderr_is_tty();
+    }
+}

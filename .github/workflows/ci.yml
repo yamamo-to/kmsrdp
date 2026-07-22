@@ -32,3 +32,69 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      - name: Release build
+        run: cargo build --release --workspace
+
+  security:
+    name: Audit and deny
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: Audit dependencies
+        run: cargo audit
+
+      - name: Deny check
+        run: cargo deny check
+
+  coverage:
+    name: Test coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev pkg-config
+
+      - name: Install Rust components
+        run: rustup component add llvm-tools-preview
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Generate coverage summary
+        run: cargo llvm-cov --workspace --summary-only
+
+  fuzz:
+    name: Fuzz smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Fuzz rdpcore-pdu decoders
+        run: |
+          cd crates/rdpcore-pdu
+          cargo +nightly fuzz run decode_wire -- -max_total_time=20 -max_len=8192
+
+      - name: Fuzz rdpcore-rdpdr decoders
+        run: |
+          cd crates/rdpcore-rdpdr
+          cargo +nightly fuzz run decode_rdpdr -- -max_total_time=20 -max_len=8192

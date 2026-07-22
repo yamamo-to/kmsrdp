@@ -161,3 +161,54 @@ impl RdpsndServerHandler for LocalAudioHandler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn chunk_byte_size_matches_twenty_ms_pcm() {
+        // 48000 Hz * 4 bytes/frame / 1000 ms * 20 ms
+        assert_eq!(CHUNK_BYTES, 3840);
+    }
+
+    #[test]
+    fn handler_advertises_stereo_pcm_48khz() {
+        let factory = LocalAudioFactory::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let handler = factory.build_backend(tx);
+        let formats = handler.get_formats();
+        assert_eq!(formats.len(), 1);
+        assert_eq!(formats[0].n_samples_per_sec, SAMPLE_RATE);
+        assert_eq!(formats[0].n_channels, CHANNELS);
+        assert_eq!(formats[0].bits_per_sample, BITS_PER_SAMPLE);
+    }
+
+    #[test]
+    fn choose_format_prefers_first_common_format() {
+        let factory = LocalAudioFactory::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut handler = factory.build_backend(tx);
+        let common = vec![
+            NegotiatedFormat {
+                format: AudioFormat::pcm(1, 44100, 16),
+                format_no: 0,
+            },
+            NegotiatedFormat {
+                format: pcm_format(),
+                format_no: 1,
+            },
+        ];
+        let chosen = handler.choose_format(&common).expect("format");
+        assert_eq!(chosen.format_no, 0);
+    }
+
+    #[test]
+    fn drop_without_capture_does_not_panic() {
+        let factory = LocalAudioFactory::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let handler = factory.build_backend(tx);
+        drop(handler);
+    }
+}

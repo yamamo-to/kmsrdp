@@ -174,3 +174,55 @@ impl Drop for VirtualMicBackend {
         self.tx = None;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn current_session_uid_parses_xdg_runtime_dir() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", "/run/user/4242");
+        }
+        assert_eq!(current_session_uid(), Some(4242));
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        assert_eq!(current_session_uid(), None);
+    }
+
+    #[test]
+    fn current_session_uid_rejects_non_user_runtime_paths() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", "/tmp/not-a-user-dir");
+        }
+        assert_eq!(current_session_uid(), None);
+    }
+
+    #[test]
+    fn backend_accepts_pcm_without_panicking() {
+        let factory = VirtualMicFactory::new();
+        let mut backend = factory.build_backend();
+        let format = AudioFormat::pcm(1, 48_000, 16);
+        backend.on_audio_data(&format, &[0u8; 4]);
+        backend.on_audio_data(&format, &[0u8; 8]);
+    }
+
+    #[test]
+    fn ensure_null_sink_marks_uid_initialized() {
+        let _guard = env_lock();
+        let uid = 9_999_999u32;
+        INITIALIZED_UIDS.lock().unwrap().remove(&uid);
+        ensure_null_sink_loaded(uid);
+        assert!(INITIALIZED_UIDS.lock().unwrap().contains(&uid));
+        INITIALIZED_UIDS.lock().unwrap().remove(&uid);
+    }
+}

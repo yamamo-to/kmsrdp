@@ -169,18 +169,12 @@ mod tests {
             xauthority: None,
             xdg_runtime_dir: PathBuf::from("/run/user/1000"),
         };
-        assert_eq!(
-            session.pulse_server(),
-            "unix:/run/user/1000/pulse/native"
-        );
+        assert_eq!(session.pulse_server(), "unix:/run/user/1000/pulse/native");
     }
 
     #[test]
     fn find_xauthority_falls_back_to_gdm_cookie() {
-        let dir = std::env::temp_dir().join(format!(
-            "kmsrdp-xauth-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("kmsrdp-xauth-test-{}", std::process::id()));
         let gdm_dir = dir.join("gdm");
         std::fs::create_dir_all(&gdm_dir).unwrap();
         let cookie = gdm_dir.join("Xauthority");

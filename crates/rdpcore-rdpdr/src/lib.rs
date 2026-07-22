@@ -489,6 +489,8 @@ mod tests {
     use rdpcore_pdu::cursor::WriteBuf;
     use std::sync::{Arc, Mutex};
 
+    type SetInfoReplies = Arc<Mutex<Vec<(u64, Result<(), u32>)>>>;
+
     #[derive(Default)]
     struct RecordingConsumer {
         ready_devices: Vec<(u32, String)>,
@@ -798,7 +800,7 @@ mod tests {
         let replies_cb = Arc::clone(&replies);
 
         struct SetInfoConsumer {
-            replies: Arc<Mutex<Vec<(u64, Result<(), u32>)>>>,
+            replies: SetInfoReplies,
         }
         impl DriveConsumer for SetInfoConsumer {
             fn on_device_ready(
@@ -871,7 +873,8 @@ mod tests {
         assert_eq!(out.len(), 1);
         let wire = out.into_iter().flatten().collect::<Vec<_>>();
         assert!(
-            wire.windows(4).any(|w| w == irp::IRP_MJ_SET_INFORMATION.to_le_bytes()),
+            wire.windows(4)
+                .any(|w| w == irp::IRP_MJ_SET_INFORMATION.to_le_bytes()),
             "expected SET_INFORMATION major function in wire bytes"
         );
 
@@ -891,7 +894,7 @@ mod tests {
         let replies_cb = Arc::clone(&replies);
 
         struct SetInfoConsumer {
-            replies: Arc<Mutex<Vec<(u64, Result<(), u32>)>>>,
+            replies: SetInfoReplies,
         }
         impl DriveConsumer for SetInfoConsumer {
             fn on_device_ready(

@@ -1,3 +1,4 @@
 [workspace]
 resolver = "2"
 members = ["kmsrdp", "crates/*"]
+exclude = ["crates/rdpcore-pdu/fuzz", "crates/rdpcore-rdpdr/fuzz"]

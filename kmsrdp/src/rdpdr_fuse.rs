@@ -2014,7 +2014,9 @@ mod tests {
                     let _ = tx.send(Ok(()));
                 }
             }
-            DriveCommand::QueryDirectory { request_tag, path, .. } => {
+            DriveCommand::QueryDirectory {
+                request_tag, path, ..
+            } => {
                 if let Some(Pending::QueryDir(tx)) =
                     bridge.pending.lock().unwrap().remove(&request_tag)
                 {
@@ -2036,8 +2038,7 @@ mod tests {
                 }
             }
             DriveCommand::Read { request_tag, .. } => {
-                if let Some(Pending::Read(tx)) =
-                    bridge.pending.lock().unwrap().remove(&request_tag)
+                if let Some(Pending::Read(tx)) = bridge.pending.lock().unwrap().remove(&request_tag)
                 {
                     let _ = tx.send(Ok(Vec::new()));
                 }
@@ -2091,18 +2092,39 @@ mod tests {
         let ft = systemtime_to_filetime(t);
         assert_eq!(ft, 116444736000000000 + 1_704_067_200 * 10_000_000);
         let back = filetime_to_systemtime(ft);
-        assert_eq!(back.duration_since(UNIX_EPOCH).unwrap().as_secs(), 1_704_067_200);
+        assert_eq!(
+            back.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            1_704_067_200
+        );
         assert_eq!(filetime_to_systemtime(0), UNIX_EPOCH);
     }
 
     #[test]
     fn ntstatus_maps_common_drive_errors() {
-        assert_eq!(i32::from(ntstatus_to_errno(0xC000_003A)), i32::from(Errno::ENOENT));
-        assert_eq!(i32::from(ntstatus_to_errno(0xC000_0022)), i32::from(Errno::EACCES));
-        assert_eq!(i32::from(ntstatus_to_errno(0xC000_0101)), i32::from(Errno::ENOTEMPTY));
-        assert_eq!(i32::from(ntstatus_to_errno(0xC000_0035)), i32::from(Errno::EEXIST));
-        assert_eq!(i32::from(ntstatus_to_errno(0xC000_0121)), i32::from(Errno::EPERM));
-        assert_eq!(i32::from(ntstatus_to_errno(0xDEAD_BEEF)), i32::from(Errno::EIO));
+        assert_eq!(
+            i32::from(ntstatus_to_errno(0xC000_003A)),
+            i32::from(Errno::ENOENT)
+        );
+        assert_eq!(
+            i32::from(ntstatus_to_errno(0xC000_0022)),
+            i32::from(Errno::EACCES)
+        );
+        assert_eq!(
+            i32::from(ntstatus_to_errno(0xC000_0101)),
+            i32::from(Errno::ENOTEMPTY)
+        );
+        assert_eq!(
+            i32::from(ntstatus_to_errno(0xC000_0035)),
+            i32::from(Errno::EEXIST)
+        );
+        assert_eq!(
+            i32::from(ntstatus_to_errno(0xC000_0121)),
+            i32::from(Errno::EPERM)
+        );
+        assert_eq!(
+            i32::from(ntstatus_to_errno(0xDEAD_BEEF)),
+            i32::from(Errno::EIO)
+        );
     }
 
     #[test]
@@ -2149,8 +2171,7 @@ mod tests {
         let bridge = test_bridge();
         seed_path(&bridge, 1, "\\old.txt", false);
         let bridge2 = Arc::clone(&bridge);
-        let handle =
-            thread::spawn(move || bridge2.rename_path(1, "\\old.txt", "\\new.txt", true));
+        let handle = thread::spawn(move || bridge2.rename_path(1, "\\old.txt", "\\new.txt", true));
 
         drain_bridge_until(&bridge, || handle.is_finished());
         handle.join().unwrap().unwrap();

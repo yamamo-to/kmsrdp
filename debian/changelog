@@ -1,3 +1,11 @@
+kmsrdp (0.1.32) unstable; urgency=medium
+
+  * CI: cargo audit/deny, llvm-cov coverage, release build, fuzz smoke.
+  * Add deny.toml; PDU/RDPDR fuzz targets and wire-stack integration tests.
+  * Unit tests: clipboard, audio, session_watcher, logging, x11_unicode.
+
+ -- kmsrdp contributors <noreply@example.com>  Wed, 22 Jul 2026 18:20:00 +0900
+
 kmsrdp (0.1.31) unstable; urgency=medium
 
   * Drive FUSE: rename flags, empty rmdir check, local chmod/chown attrs.

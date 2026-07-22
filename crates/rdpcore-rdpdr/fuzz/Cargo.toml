@@ -1,0 +1,21 @@
+[package]
+name = "rdpcore-rdpdr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rdpcore-rdpdr = { path = ".." }
+
+[[bin]]
+name = "decode_rdpdr"
+path = "fuzz_targets/decode_rdpdr.rs"
+test = false
+doc = false
+bench = false

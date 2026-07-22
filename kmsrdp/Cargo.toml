@@ -1,6 +1,6 @@
 [package]
 name = "kmsrdp"
-version = "0.1.31"
+version = "0.1.32"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "DRM/KMS-based RDP remote desktop server in pure Rust"
@@ -48,4 +48,8 @@ default = []
 rdpdr-diagnostic = ["rdpcore-rdpdr/diagnostic"]
 # Compiles the DVC echo smoke-test handler and RdpServer::with_echo_smoke_test.
 dvc-echo = ["rdpcore-server/dvc-echo"]
+
+[dev-dependencies]
+rdpcore-dvc = { path = "../crates/rdpcore-dvc" }
+rdpcore-pdu = { path = "../crates/rdpcore-pdu" }
 

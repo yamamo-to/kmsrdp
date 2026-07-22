@@ -97,6 +97,11 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.32-1
+- CI: cargo audit/deny, llvm-cov coverage, release build, fuzz smoke (nightly)
+- Add deny.toml dependency policy; PDU/RDPDR fuzz targets and wire-stack tests
+- Unit tests: clipboard, audio, session_watcher, logging, x11_unicode
+
 * Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.31-1
 - Drive FUSE polish: rename flags, empty rmdir check, local chmod/chown attrs
 - Expand unit tests across rdpcore-pdu, rdpcore-rdpdr, and kmsrdp
