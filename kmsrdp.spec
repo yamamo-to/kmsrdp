@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.33
+Version:        0.1.34
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -98,6 +98,9 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.34-1
+- Cut Pulse/PipeWire audio buffer defaults (~2s) to ~20ms for RDPSND/RDPEAI
+
 * Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.33-1
 - Replace parec/paplay/pactl with in-process libpulse for RDPSND and RDPEAI
 - Load virtual mic null-sink via libpulse; add pulse_util unit tests

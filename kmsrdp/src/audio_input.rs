@@ -19,6 +19,7 @@ use std::sync::{LazyLock, Mutex};
 
 use libpulse_binding as pulse;
 use libpulse_simple_binding as psimple;
+use pulse::def::BufferAttr;
 use pulse::sample::{Format, Spec};
 use pulse::stream::Direction;
 use rdpcore_rdpeai::pdu::AudioFormat;
@@ -83,12 +84,26 @@ fn playback_spec(format: &AudioFormat) -> Option<Spec> {
     spec.is_valid().then_some(spec)
 }
 
+/// Keep virtual-mic playback latency low; Pulse defaults `tlength` ≈ 2s.
+fn playback_buffer_attr(spec: &Spec) -> BufferAttr {
+    let frame = u32::from(spec.channels) * 2; // S16NE
+    let target = spec.rate.saturating_mul(frame) / 50; // ~20 ms
+    BufferAttr {
+        maxlength: target.saturating_mul(4).max(frame),
+        tlength: target.max(frame),
+        prebuf: target.max(frame),
+        minreq: (target / 2).max(frame),
+        fragsize: u32::MAX,
+    }
+}
+
 fn spawn_writer(format: &AudioFormat) -> Option<Sender<Vec<u8>>> {
     if let Some(uid) = current_session_uid() {
         ensure_null_sink_loaded(uid);
     }
 
     let spec = playback_spec(format)?;
+    let attr = playback_buffer_attr(&spec);
     let simple = psimple::Simple::new(
         None,
         "kmsrdp",
@@ -97,7 +112,7 @@ fn spawn_writer(format: &AudioFormat) -> Option<Sender<Vec<u8>>> {
         "RDP microphone",
         &spec,
         None,
-        None,
+        Some(&attr),
     )
     .inspect_err(|e| {
         tracing::warn!("kmsrdp: PulseAudio playback connect failed for virtual mic: {e}");
@@ -172,6 +187,16 @@ mod tests {
         let spec = playback_spec(&format).expect("valid pcm");
         assert_eq!(spec.channels, 2);
         assert_eq!(spec.rate, 48_000);
+    }
+
+    #[test]
+    fn playback_buffer_attr_targets_about_twenty_ms() {
+        let format = AudioFormat::pcm(2, 48_000, 16);
+        let spec = playback_spec(&format).expect("valid pcm");
+        let attr = playback_buffer_attr(&spec);
+        // 48000 * 4 / 50 = 3840 bytes (~20 ms stereo S16)
+        assert_eq!(attr.tlength, 3840);
+        assert_eq!(attr.maxlength, 3840 * 4);
     }
 
     #[test]

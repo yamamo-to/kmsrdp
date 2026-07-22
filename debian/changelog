@@ -1,3 +1,9 @@
+kmsrdp (0.1.34) unstable; urgency=medium
+
+  * Cut Pulse/PipeWire audio buffer defaults (~2s) to ~20ms for RDPSND/RDPEAI.
+
+ -- kmsrdp contributors <noreply@example.com>  Wed, 22 Jul 2026 19:31:00 +0900
+
 kmsrdp (0.1.33) unstable; urgency=medium
 
   * Replace parec/paplay/pactl with in-process libpulse for RDPSND and RDPEAI.

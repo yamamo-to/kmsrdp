@@ -18,6 +18,7 @@ use std::thread::JoinHandle;
 
 use libpulse_binding as pulse;
 use libpulse_simple_binding as psimple;
+use pulse::def::BufferAttr;
 use pulse::sample::{Format, Spec};
 use pulse::stream::Direction;
 use rdpcore_rdpsnd::pdu::{AudioFormat, NegotiatedFormat};
@@ -43,6 +44,22 @@ fn capture_spec() -> Spec {
         format: Format::S16NE,
         channels: CHANNELS as u8,
         rate: SAMPLE_RATE,
+    }
+}
+
+/// Low-latency record attributes for monitor capture.
+///
+/// Passing `None` to `Simple::new` leaves PulseAudio/PipeWire defaults, and
+/// `fragsize` defaults to roughly **2 seconds** of audio — which shows up as
+/// multi-second A/V lag on clients such as macOS Windows App. Match the
+/// fragment size to our 20 ms wave chunks and cap the buffer to a few chunks.
+fn capture_buffer_attr() -> BufferAttr {
+    BufferAttr {
+        maxlength: (CHUNK_BYTES * 4) as u32,
+        tlength: u32::MAX,
+        prebuf: u32::MAX,
+        minreq: u32::MAX,
+        fragsize: CHUNK_BYTES as u32,
     }
 }
 
@@ -98,6 +115,7 @@ fn run_capture(sender: UnboundedSender<RdpsndServerMessage>, stop: Arc<AtomicBoo
         return;
     }
 
+    let attr = capture_buffer_attr();
     let simple = match psimple::Simple::new(
         None,
         "kmsrdp",
@@ -106,7 +124,7 @@ fn run_capture(sender: UnboundedSender<RdpsndServerMessage>, stop: Arc<AtomicBoo
         "RDP audio capture",
         &spec,
         None,
-        None,
+        Some(&attr),
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -185,6 +203,13 @@ mod tests {
         assert_eq!(spec.format, Format::S16NE);
         assert_eq!(spec.channels, CHANNELS as u8);
         assert_eq!(spec.rate, SAMPLE_RATE);
+    }
+
+    #[test]
+    fn capture_buffer_attr_targets_twenty_ms_fragments() {
+        let attr = capture_buffer_attr();
+        assert_eq!(attr.fragsize, CHUNK_BYTES as u32);
+        assert_eq!(attr.maxlength, (CHUNK_BYTES * 4) as u32);
     }
 
     #[test]
