@@ -28,7 +28,9 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
   all sessions
 - **Audio:** output (RDPSND / `parec`) and mic input (MS-RDPEAI); per connection
 - **Drives:** RDPDR → FUSE at `$XDG_RUNTIME_DIR/kmsrdp/drives/<DosName>`
-  (list/read/write/create/mkdir; shared until the last session leaves)
+  (list/read/write/create/mkdir/unlink/rmdir/rename/setattr size & times;
+  shared until the last session leaves; `chmod`/`chown` update the local FUSE
+  view only — not the client filesystem)
 - **Auth / transport:** TLS + password; NLA (CredSSP/NTLMv2) when the client
   requests it; persisted self-signed cert by default (`StateDirectory` or
   `KMSRDP_TLS_*`); configurable listen address (`KMSRDP_BIND` /
@@ -45,7 +47,7 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
 - Startup fails hard if the first frame cannot be captured (no CRTC / NvFBC);
   later capture drops are logged with hints (rate-limited) instead of a silent
   black client
-- Drive FUSE: no printer/CUPS yet
+- Drive FUSE: no printer/CUPS yet; `chmod`/`chown` are local FUSE metadata only
 - CJK IME needs X11 (XTest); not available on Wayland-only sessions. `startx`
   on a tty session is detected automatically (`DISPLAY` / `XAUTHORITY` from
   logind, the session leader, or a sole `/tmp/.X11-unix/X*` socket)
@@ -75,10 +77,19 @@ persistence; `KMSRDP_LOG=debug` / `KMSRDP_LOG_FORMAT=json` for structured
 logs; `KMSRDP_DISPLAY=all` (default) to composite every CRTC, or
 `DP-1` / `card1:DP-1` for a single connector (disables NvFBC fallback).
 
-Audio needs `parec` / `paplay` / `pactl` on `$PATH`. Root FUSE mounts need
-`user_allow_other` in `/etc/fuse.conf`. On startup kmsrdp validates listen
-port privileges, `KMSRDP_*` env, `/dev/uinput`, and helper binaries — hard
-errors refuse to start; missing audio/FUSE tools are warnings only.
+**Redirected drives:** while an RDP client has shared a local drive, it
+appears on the Linux host at `$XDG_RUNTIME_DIR/kmsrdp/drives/<DosName>/`
+(e.g. `/run/user/1000/kmsrdp/drives/C`). Use `ls`, `cp`, `rm`, and `mv`
+there like a normal directory; the mount goes away when the last session
+using that drive disconnects.
+
+Audio needs `parec` / `paplay` / `pactl` on `$PATH`. Root-owned FUSE mounts
+need `user_allow_other` uncommented in `/etc/fuse.conf` so the logged-in
+session user can access redirected drives (kmsrdp sets file ownership via
+FUSE attrs, but the mount itself must allow other UIDs). On startup kmsrdp
+validates listen port privileges, `KMSRDP_*` env, `/dev/uinput`, and helper
+binaries — hard errors refuse to start; missing audio/FUSE tools are warnings
+only.
 
 ## Packages
 

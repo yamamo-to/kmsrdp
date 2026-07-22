@@ -52,6 +52,45 @@ struct CachedMeta {
     atime: SystemTime,
     ctime: SystemTime,
     crtime: SystemTime,
+    /// Local FUSE metadata only — not sent to the RDP client.
+    perm: u16,
+    uid: u32,
+    gid: u32,
+}
+
+fn default_perm(is_dir: bool) -> u16 {
+    if is_dir { 0o755 } else { 0o644 }
+}
+
+impl CachedMeta {
+    fn new(is_dir: bool, uid: u32, gid: u32) -> Self {
+        Self {
+            size: 0,
+            is_dir,
+            mtime: UNIX_EPOCH,
+            atime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH,
+            perm: default_perm(is_dir),
+            uid,
+            gid,
+        }
+    }
+
+    fn fresh(is_dir: bool, uid: u32, gid: u32, mode: u32) -> Self {
+        let now = SystemTime::now();
+        Self {
+            size: 0,
+            is_dir,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            crtime: now,
+            perm: (mode & 0o7777) as u16,
+            uid,
+            gid,
+        }
+    }
 }
 
 struct OpenHandle {
@@ -358,7 +397,13 @@ impl Bridge {
         }
     }
 
-    fn rename_path(&self, device_id: u32, old_path: &str, new_path: &str) -> Result<(), Errno> {
+    fn rename_path(
+        &self,
+        device_id: u32,
+        old_path: &str,
+        new_path: &str,
+        replace_if_exists: bool,
+    ) -> Result<(), Errno> {
         let create = self.submit_create(
             device_id,
             old_path.to_owned(),
@@ -370,12 +415,68 @@ impl Bridge {
             device_id,
             create.file_id,
             FILE_RENAME_INFORMATION,
-            rename_information_buffer(new_path, false),
+            rename_information_buffer(new_path, replace_if_exists),
         );
         let _ = self.submit_close(device_id, create.file_id);
         result?;
         self.remap_path(device_id, old_path, new_path);
         Ok(())
+    }
+
+    /// Best-effort atomic swap via a temporary name (RDPDR has no exchange IRP).
+    fn exchange_paths(&self, device_id: u32, path_a: &str, path_b: &str) -> Result<(), Errno> {
+        let tag = self.alloc_tag();
+        let temp = format!("{}\\.__kmsrdp_xchg_{tag}", parent_of(path_a));
+        self.rename_path(device_id, path_a, &temp, false)?;
+        match self.rename_path(device_id, path_b, path_a, false) {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = self.rename_path(device_id, &temp, path_a, false);
+                return Err(e);
+            }
+        }
+        self.rename_path(device_id, &temp, path_b, false)
+    }
+
+    fn path_exists(&self, device_id: u32, win_path: &str) -> bool {
+        self.attr_for(device_id, win_path).is_some()
+    }
+
+    /// Fail fast with `ENOTEMPTY` before sending a doomed directory delete IRP.
+    fn ensure_dir_empty(&self, device_id: u32, dir_path: &str) -> Result<(), Errno> {
+        let children = self.refresh_dir(device_id, dir_path)?;
+        if children.is_empty() {
+            Ok(())
+        } else {
+            tracing::debug!(
+                "kmsrdp: rdpdr FUSE: rmdir {dir_path:?} refused: {} entr(y/ies)",
+                children.len()
+            );
+            Err(Errno::ENOTEMPTY)
+        }
+    }
+
+    fn apply_local_attrs(
+        &self,
+        device_id: u32,
+        path: &str,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) {
+        let mut meta = self.meta.lock().unwrap();
+        let Some(meta) = meta.get_mut(&(device_id, path.to_owned())) else {
+            return;
+        };
+        if let Some(m) = mode {
+            meta.perm = (m & 0o7777) as u16;
+        }
+        if let Some(u) = uid {
+            meta.uid = u;
+        }
+        if let Some(g) = gid {
+            meta.gid = g;
+        }
     }
 
     fn ensure_root_ino(&self, device_id: u32) {
@@ -389,14 +490,7 @@ impl Bridge {
         ino_to_path.insert((device_id, ROOT_INO), "\\".to_owned());
         self.meta.lock().unwrap().insert(
             (device_id, "\\".to_owned()),
-            CachedMeta {
-                size: 0,
-                is_dir: true,
-                mtime: UNIX_EPOCH,
-                atime: UNIX_EPOCH,
-                ctime: UNIX_EPOCH,
-                crtime: UNIX_EPOCH,
-            },
+            CachedMeta::new(true, self.uid, self.gid),
         );
     }
 
@@ -441,6 +535,9 @@ impl Bridge {
             atime: filetime_to_systemtime(entry.last_access_time),
             ctime: filetime_to_systemtime(entry.change_time),
             crtime: filetime_to_systemtime(entry.creation_time),
+            perm: default_perm(is_dir),
+            uid: self.uid,
+            gid: self.gid,
         };
         let _ = self.inode_for(device_id, &path);
         self.meta.lock().unwrap().insert((device_id, path), meta);
@@ -467,10 +564,10 @@ impl Bridge {
             } else {
                 FileType::RegularFile
             },
-            perm: if meta.is_dir { 0o755 } else { 0o644 },
+            perm: meta.perm,
             nlink: if meta.is_dir { 2 } else { 1 },
-            uid: self.uid,
-            gid: self.gid,
+            uid: meta.uid,
+            gid: meta.gid,
             rdev: 0,
             blksize: 4096,
             flags: 0,
@@ -923,16 +1020,10 @@ impl Filesystem for FuseFs {
             FILE_SYNCHRONOUS_IO_NONALERT,
         ) {
             Ok(create) => {
+                let mode = (_mode & !_umask) & 0o7777;
                 bridge.meta.lock().unwrap().insert(
                     (device_id, path.clone()),
-                    CachedMeta {
-                        size: 0,
-                        is_dir: false,
-                        mtime: SystemTime::now(),
-                        atime: SystemTime::now(),
-                        ctime: SystemTime::now(),
-                        crtime: SystemTime::now(),
-                    },
+                    CachedMeta::fresh(false, bridge.uid, bridge.gid, mode),
                 );
                 let attr = bridge
                     .attr_for(device_id, &path)
@@ -962,8 +1053,8 @@ impl Filesystem for FuseFs {
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
         let (bridge, device_id) = self.active();
@@ -985,16 +1076,10 @@ impl Filesystem for FuseFs {
         ) {
             Ok(create) => {
                 let _ = bridge.submit_close(device_id, create.file_id);
+                let dir_mode = (mode & !umask) & 0o7777;
                 bridge.meta.lock().unwrap().insert(
                     (device_id, path.clone()),
-                    CachedMeta {
-                        size: 0,
-                        is_dir: true,
-                        mtime: SystemTime::now(),
-                        atime: SystemTime::now(),
-                        ctime: SystemTime::now(),
-                        crtime: SystemTime::now(),
-                    },
+                    CachedMeta::fresh(true, bridge.uid, bridge.gid, dir_mode),
                 );
                 match bridge.attr_for(device_id, &path) {
                     Some(attr) => reply.entry(&TTL, &attr, Generation(0)),
@@ -1033,6 +1118,10 @@ impl Filesystem for FuseFs {
             return;
         };
         let path = join_win(&parent_path, name);
+        if let Err(e) = bridge.ensure_dir_empty(device_id, &path) {
+            reply.error(e);
+            return;
+        }
         match bridge.delete_path(device_id, &path, true) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -1046,7 +1135,7 @@ impl Filesystem for FuseFs {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: fuser::RenameFlags,
+        flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
         let (bridge, device_id) = self.active();
@@ -1064,7 +1153,31 @@ impl Filesystem for FuseFs {
         };
         let old_path = join_win(&parent_path, name);
         let new_path = join_win(&new_parent_path, newname);
-        match bridge.rename_path(device_id, &old_path, &new_path) {
+
+        #[cfg(target_os = "linux")]
+        if flags.contains(fuser::RenameFlags::RENAME_WHITEOUT) {
+            reply.error(Errno::ENOTSUP);
+            return;
+        }
+
+        #[cfg(target_os = "linux")]
+        if flags.contains(fuser::RenameFlags::RENAME_EXCHANGE) {
+            match bridge.exchange_paths(device_id, &old_path, &new_path) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            }
+            return;
+        }
+
+        let dest_exists = bridge.path_exists(device_id, &new_path);
+        #[cfg(target_os = "linux")]
+        if flags.contains(fuser::RenameFlags::RENAME_NOREPLACE) && dest_exists {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+
+        let replace = dest_exists;
+        match bridge.rename_path(device_id, &old_path, &new_path, replace) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
@@ -1074,9 +1187,9 @@ impl Filesystem for FuseFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
         atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
@@ -1094,6 +1207,9 @@ impl Filesystem for FuseFs {
             return;
         };
 
+        let need_mode = mode.is_some();
+        let need_uid = uid.is_some();
+        let need_gid = gid.is_some();
         let need_size = size.is_some();
         let need_times = atime.is_some()
             || mtime.is_some()
@@ -1101,8 +1217,12 @@ impl Filesystem for FuseFs {
             || crtime.is_some()
             || chgtime.is_some();
 
+        if need_mode || need_uid || need_gid {
+            // Local FUSE view only — RDPDR has no Unix owner/mode IRP.
+            bridge.apply_local_attrs(device_id, &path, mode, uid, gid);
+        }
+
         if !need_size && !need_times {
-            // mode/uid/gid alone: no RDP equivalent; return current attrs.
             match bridge.attr_for(device_id, &path) {
                 Some(attr) => reply.attr(&TTL, &attr),
                 None => reply.error(Errno::ENOENT),
@@ -1815,7 +1935,9 @@ fn ntstatus_to_errno(status: u32) -> Errno {
         0xC000_000D => Errno::EINVAL,               // STATUS_INVALID_PARAMETER
         0xC000_00BB | 0xC000_00A3 => Errno::ENOSYS, // NOT_SUPPORTED / NOT_IMPLEMENTED
         0xC000_0010 => Errno::EIO,
+        0xC000_0035 => Errno::EEXIST,    // STATUS_OBJECT_NAME_COLLISION
         0xC000_0101 => Errno::ENOTEMPTY, // STATUS_DIRECTORY_NOT_EMPTY
+        0xC000_0121 => Errno::EPERM,     // STATUS_CANNOT_DELETE
         _ => {
             tracing::debug!("kmsrdp: rdpdr FUSE: unmapped NTSTATUS {status:#010x} → EIO");
             Errno::EIO
