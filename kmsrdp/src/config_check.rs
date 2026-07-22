@@ -37,6 +37,7 @@ pub fn validate(listen_port: u16) -> StartupReport {
     check_tls_env(&mut report);
     check_capabilities(listen_port, &mut report);
     check_devices(&mut report);
+    check_pulse_capture(&mut report);
     check_helper_binaries(&mut report);
     check_fuse_conf(&mut report);
 
@@ -187,18 +188,35 @@ fn check_devices(report: &mut StartupReport) {
     }
 }
 
-fn check_helper_binaries(report: &mut StartupReport) {
-    for (bin, feature) in [
-        ("parec", "audio output (RDPSND)"),
-        ("paplay", "microphone input (RDPEAI)"),
-        ("pactl", "virtual microphone sink setup"),
-    ] {
-        if !command_on_path(bin) {
+fn pulse_socket_path() -> Option<PathBuf> {
+    if let Ok(server) = std::env::var("PULSE_SERVER")
+        && let Some(path) = server.strip_prefix("unix:")
+    {
+        return Some(PathBuf::from(path));
+    }
+    std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .map(|runtime| PathBuf::from(runtime).join("pulse/native"))
+}
+
+fn check_pulse_capture(report: &mut StartupReport) {
+    match pulse_socket_path() {
+        Some(path) if path.exists() => {}
+        Some(path) => {
             report.warnings.push(format!(
-                "`{bin}` not found on PATH — {feature} will not work"
+                "PulseAudio/PipeWire socket not found at {} — RDPSND/RDPEAI audio will not work",
+                path.display()
             ));
         }
+        None => report.warnings.push(
+            "PULSE_SERVER / XDG_RUNTIME_DIR unset — RDPSND output and RDPEAI microphone \
+             may not work until a graphical session is active"
+                .to_string(),
+        ),
     }
+}
+
+fn check_helper_binaries(report: &mut StartupReport) {
     if !command_on_path("fusermount3") && !command_on_path("fusermount") {
         report.warnings.push(
             "`fusermount3`/`fusermount` not found on PATH — client drive redirection \
@@ -388,5 +406,38 @@ mod tests {
         assert!(fuse_user_allow_other_enabled(conf));
         assert!(!fuse_user_allow_other_enabled("# user_allow_other\n"));
         assert!(!fuse_user_allow_other_enabled(""));
+    }
+
+    #[test]
+    fn pulse_socket_path_prefers_pulse_server() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("PULSE_SERVER", "unix:/run/user/42/pulse/native");
+            std::env::set_var("XDG_RUNTIME_DIR", "/run/user/99");
+        }
+        assert_eq!(
+            pulse_socket_path(),
+            Some(PathBuf::from("/run/user/42/pulse/native"))
+        );
+        unsafe {
+            std::env::remove_var("PULSE_SERVER");
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+    }
+
+    #[test]
+    fn pulse_socket_path_falls_back_to_runtime_dir() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var("PULSE_SERVER");
+            std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+        }
+        assert_eq!(
+            pulse_socket_path(),
+            Some(PathBuf::from("/run/user/1000/pulse/native"))
+        );
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
     }
 }

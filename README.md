@@ -26,7 +26,7 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
 - **Input:** `uinput` mouse/keyboard; CJK IME text on X11 (XTest)
 - **Clipboard:** text-only CLIPRDR; one process-wide local poller shared by
   all sessions
-- **Audio:** output (RDPSND / `parec`) and mic input (MS-RDPEAI); per connection
+- **Audio:** output (RDPSND) and mic input (RDPEAI) via libpulse; per connection
 - **Drives:** RDPDR → FUSE at `$XDG_RUNTIME_DIR/kmsrdp/drives/<DosName>`
   (list/read/write/create/mkdir/unlink/rmdir/rename/setattr size & times;
   shared until the last session leaves; `chmod`/`chown` update the local FUSE
@@ -83,7 +83,8 @@ appears on the Linux host at `$XDG_RUNTIME_DIR/kmsrdp/drives/<DosName>/`
 there like a normal directory; the mount goes away when the last session
 using that drive disconnects.
 
-Audio needs `parec` / `paplay` / `pactl` on `$PATH`. Root-owned FUSE mounts
+Audio uses libpulse (PipeWire/PulseAudio) for both playback capture and the virtual
+microphone sink. Root-owned FUSE mounts
 need `user_allow_other` uncommented in `/etc/fuse.conf` so the logged-in
 session user can access redirected drives (kmsrdp sets file ownership via
 FUSE attrs, but the mount itself must allow other UIDs). On startup kmsrdp

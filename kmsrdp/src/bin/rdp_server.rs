@@ -125,7 +125,7 @@ async fn main() -> Result<()> {
 
     // Session watcher must start first: it sets DISPLAY/XAUTHORITY/
     // XDG_RUNTIME_DIR in the process environment so that all subsequent
-    // component initializations (arboard, pactl) see the right session.
+    // component initializations (arboard, libpulse) see the right session.
     let session_rx = kmsrdp::session_watcher::start().await?;
 
     let mut capturer = capture::Capturer::new().context(

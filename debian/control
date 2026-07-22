@@ -8,6 +8,7 @@ Build-Depends:
  rustc,
  pkg-config,
  libfuse3-dev,
+ libpulse-dev,
 Standards-Version: 4.7.0
 Homepage: https://github.com/yamamo-to/kmsrdp
 Rules-Requires-Root: no

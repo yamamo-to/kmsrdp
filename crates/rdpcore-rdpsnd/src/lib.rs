@@ -2,7 +2,7 @@
 //! connection-scoped state machine (`RdpsndChannel`) and backend trait
 //! (`RdpsndServerHandler`) a server plugs an audio source into. Shaped
 //! close to a real implementation's own trait so an existing backend
-//! (e.g. kmsrdp's `parec`-based one) ports with import-path changes only.
+//! (e.g. kmsrdp's libpulse-based monitor capture) ports with import-path changes only.
 
 pub mod pdu;
 

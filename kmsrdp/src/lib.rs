@@ -7,6 +7,7 @@ pub mod display_hub;
 pub mod gpu_detile;
 pub mod logging;
 pub mod nvfbc;
+pub mod pulse_util;
 #[cfg(feature = "rdpdr-diagnostic")]
 pub mod rdpdr_diagnostic;
 pub mod rdpdr_fuse;

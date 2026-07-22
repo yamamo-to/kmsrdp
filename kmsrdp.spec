@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.31
+Version:        0.1.33
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -26,6 +26,7 @@ BuildRequires:  cargo
 BuildRequires:  rust
 BuildRequires:  gcc
 BuildRequires:  fuse3-devel
+BuildRequires:  pulseaudio-libs-devel
 BuildRequires:  systemd-rpm-macros
 
 Requires:       libcap
@@ -97,6 +98,10 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.33-1
+- Replace parec/paplay/pactl with in-process libpulse for RDPSND and RDPEAI
+- Load virtual mic null-sink via libpulse; add pulse_util unit tests
+
 * Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.32-1
 - CI: cargo audit/deny, llvm-cov coverage, release build, fuzz smoke (nightly)
 - Add deny.toml dependency policy; PDU/RDPDR fuzz targets and wire-stack tests

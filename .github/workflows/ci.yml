@@ -19,7 +19,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libfuse3-dev pkg-config
+          sudo apt-get install -y libfuse3-dev pkg-config libpulse-dev
 
       - name: Install Rust components
         run: rustup component add rustfmt clippy
@@ -63,7 +63,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libfuse3-dev pkg-config
+          sudo apt-get install -y libfuse3-dev pkg-config libpulse-dev
 
       - name: Install Rust components
         run: rustup component add llvm-tools-preview

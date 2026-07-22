@@ -1,3 +1,11 @@
+kmsrdp (0.1.33) unstable; urgency=medium
+
+  * Replace parec/paplay/pactl with in-process libpulse for RDPSND and RDPEAI.
+  * Load virtual mic null-sink via libpulse; add pulse_util unit tests.
+  * Build deps: libpulse-dev / pulseaudio-libs-devel.
+
+ -- kmsrdp contributors <noreply@example.com>  Wed, 22 Jul 2026 19:21:00 +0900
+
 kmsrdp (0.1.32) unstable; urgency=medium
 
   * CI: cargo audit/deny, llvm-cov coverage, release build, fuzz smoke.

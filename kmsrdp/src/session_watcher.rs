@@ -4,7 +4,7 @@
 //! When the active session changes (login, logout, VT switch) the watcher
 //! also updates the process-level `DISPLAY`, `XAUTHORITY`,
 //! `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, and `PULSE_SERVER`
-//! environment variables so that child processes (parec, pactl, paplay) and
+//! environment variables so that arboard inherits the right X11/Pulse session.
 //! arboard automatically inherit the new session without needing to be
 //! passed explicit paths.
 
@@ -147,7 +147,7 @@ async fn find_active_session(conn: &Connection) -> Option<Session> {
 
 /// Update process-level environment variables to reflect `session`.
 ///
-/// Child processes (parec, pactl, paplay) and arboard inherit these so they
+/// Process environment variables are updated so arboard and libpulse clients
 /// automatically connect to the right PulseAudio/X11 instance.
 ///
 /// `PULSE_SERVER` matters even though `XDG_RUNTIME_DIR` is also set: when

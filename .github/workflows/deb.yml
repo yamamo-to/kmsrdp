@@ -25,7 +25,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates curl build-essential debhelper \
-            pkg-config libfuse3-dev libcap2-bin \
+            pkg-config libfuse3-dev libcap2-bin libpulse-dev \
             xz-utils
 
       - name: Install Rust toolchain

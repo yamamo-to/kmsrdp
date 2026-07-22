@@ -23,7 +23,7 @@ jobs:
           dnf -y install \
             rpm-build rpmdevtools \
             gcc libcap \
-            fuse3-devel pkgconf-pkg-config \
+            fuse3-devel pulseaudio-libs-devel pkgconf-pkg-config \
             tar
 
       - name: Install Rust toolchain
