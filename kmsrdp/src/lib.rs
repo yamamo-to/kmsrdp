@@ -2,6 +2,7 @@ pub mod audio;
 pub mod audio_input;
 pub mod capture;
 pub mod clipboard;
+pub mod config_check;
 pub mod display_hub;
 pub mod gpu_detile;
 pub mod logging;

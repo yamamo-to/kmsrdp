@@ -76,7 +76,9 @@ logs; `KMSRDP_DISPLAY=all` (default) to composite every CRTC, or
 `DP-1` / `card1:DP-1` for a single connector (disables NvFBC fallback).
 
 Audio needs `parec` / `paplay` / `pactl` on `$PATH`. Root FUSE mounts need
-`user_allow_other` in `/etc/fuse.conf`.
+`user_allow_other` in `/etc/fuse.conf`. On startup kmsrdp validates listen
+port privileges, `KMSRDP_*` env, `/dev/uinput`, and helper binaries — hard
+errors refuse to start; missing audio/FUSE tools are warnings only.
 
 ## Packages
 

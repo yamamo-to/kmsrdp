@@ -118,6 +118,11 @@ impl RdpServerInputHandler for Input {
 async fn main() -> Result<()> {
     kmsrdp::logging::init();
 
+    // Fail fast on bad env / missing privileges before touching DRM or uinput.
+    let addr = listen_addr()?;
+    kmsrdp::config_check::log_report(&kmsrdp::config_check::validate(addr.port()))
+        .context("startup configuration check failed")?;
+
     // Session watcher must start first: it sets DISPLAY/XAUTHORITY/
     // XDG_RUNTIME_DIR in the process environment so that all subsequent
     // component initializations (arboard, pactl) see the right session.
@@ -200,10 +205,8 @@ async fn main() -> Result<()> {
 
     let tls_identity = tls::build_acceptor()?;
 
-    // Bind before creating the uinput device so a missing CAP_NET_BIND_SERVICE
-    // (or a busy port) fails without spamming `input: kmsrdp as ...` on every
-    // systemd restart. Override with KMSRDP_BIND / KMSRDP_PORT.
-    let addr = listen_addr()?;
+    // Bind before creating the uinput device so a busy port fails without
+    // spamming `input: kmsrdp as ...` on every systemd restart.
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;

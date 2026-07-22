@@ -113,6 +113,11 @@ fn display_mode() -> io::Result<&'static DisplayMode> {
     }
 }
 
+/// Parse `KMSRDP_DISPLAY` early so startup checks can fail before opening DRM.
+pub fn validate_display_env() -> io::Result<()> {
+    display_mode().map(|_| ())
+}
+
 fn plane_type(card: &Card, handle: plane::Handle) -> io::Result<String> {
     let props = card.get_properties(handle)?;
     for (prop_handle, value) in &props {

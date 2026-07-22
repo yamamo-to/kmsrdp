@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.28
+Version:        0.1.29
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -97,6 +97,9 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.29-1
+- Validate config, capabilities, and helper binaries at startup
+
 * Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.28-1
 - Persist self-signed TLS identity across restarts
 - Surface capture failures with actionable hints at startup

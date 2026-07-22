@@ -1,3 +1,9 @@
+kmsrdp (0.1.29) unstable; urgency=medium
+
+  * Validate config, capabilities, and helper binaries at startup.
+
+ -- kmsrdp contributors <noreply@example.com>  Wed, 22 Jul 2026 14:41:00 +0900
+
 kmsrdp (0.1.28) unstable; urgency=medium
 
   * Persist self-signed TLS identity across restarts.
