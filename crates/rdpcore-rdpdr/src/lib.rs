@@ -487,6 +487,7 @@ impl RdpdrChannel {
 mod tests {
     use super::*;
     use rdpcore_pdu::cursor::WriteBuf;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
     struct RecordingConsumer {
@@ -789,5 +790,188 @@ mod tests {
         let out = channel.flush_pending_commands();
         assert_eq!(out.len(), 1);
         assert!(channel.flush_pending_commands().is_empty());
+    }
+
+    #[test]
+    fn set_information_command_encodes_and_completes() {
+        let replies = Arc::new(Mutex::new(Vec::<(u64, Result<(), u32>)>::new()));
+        let replies_cb = Arc::clone(&replies);
+
+        struct SetInfoConsumer {
+            replies: Arc<Mutex<Vec<(u64, Result<(), u32>)>>>,
+        }
+        impl DriveConsumer for SetInfoConsumer {
+            fn on_device_ready(
+                &mut self,
+                _device_id: u32,
+                _device_type: u32,
+                _dos_name: &str,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_create_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<irp::CreateReply, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_close_reply(&mut self, _request_tag: u64, _status: u32) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_read_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<Vec<u8>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_write_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<u32, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_query_directory_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<Option<irp::DirectoryEntry>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_set_information_reply(
+                &mut self,
+                request_tag: u64,
+                result: Result<(), u32>,
+            ) -> Vec<DriveCommand> {
+                self.replies.lock().unwrap().push((request_tag, result));
+                Vec::new()
+            }
+            fn poll_commands(&mut self) -> Vec<DriveCommand> {
+                vec![DriveCommand::SetInformation {
+                    device_id: 1,
+                    file_id: 9,
+                    fs_information_class: irp::FILE_DISPOSITION_INFORMATION,
+                    set_buffer: irp::disposition_information_buffer(true),
+                    request_tag: 77,
+                }]
+            }
+        }
+
+        let (mut channel, _initial) = RdpdrChannel::new(
+            1004,
+            1002,
+            pdu::RDPDR_DTYP_FILESYSTEM,
+            Box::new(SetInfoConsumer {
+                replies: replies_cb,
+            }),
+        );
+        let out = channel.flush_pending_commands();
+        assert_eq!(out.len(), 1);
+        let wire = out.into_iter().flatten().collect::<Vec<_>>();
+        assert!(
+            wire.windows(4).any(|w| w == irp::IRP_MJ_SET_INFORMATION.to_le_bytes()),
+            "expected SET_INFORMATION major function in wire bytes"
+        );
+
+        let mut completion = Vec::new();
+        completion.write_u16_le(pdu::RDPDR_CTYP_CORE);
+        completion.write_u16_le(pdu::PAKID_CORE_DEVICE_IOCOMPLETION);
+        completion.write_u32_le(1);
+        completion.write_u32_le(0);
+        completion.write_u32_le(pdu::STATUS_SUCCESS);
+        assert!(send_message(&mut channel, completion).is_empty());
+        assert_eq!(replies.lock().unwrap().as_slice(), &[(77, Ok(()))]);
+    }
+
+    #[test]
+    fn set_information_failure_surfaces_to_consumer() {
+        let replies = Arc::new(Mutex::new(Vec::<(u64, Result<(), u32>)>::new()));
+        let replies_cb = Arc::clone(&replies);
+
+        struct SetInfoConsumer {
+            replies: Arc<Mutex<Vec<(u64, Result<(), u32>)>>>,
+        }
+        impl DriveConsumer for SetInfoConsumer {
+            fn on_device_ready(
+                &mut self,
+                _device_id: u32,
+                _device_type: u32,
+                _dos_name: &str,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_create_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<irp::CreateReply, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_close_reply(&mut self, _request_tag: u64, _status: u32) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_read_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<Vec<u8>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_write_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<u32, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_query_directory_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<Option<irp::DirectoryEntry>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_set_information_reply(
+                &mut self,
+                request_tag: u64,
+                result: Result<(), u32>,
+            ) -> Vec<DriveCommand> {
+                self.replies.lock().unwrap().push((request_tag, result));
+                Vec::new()
+            }
+            fn poll_commands(&mut self) -> Vec<DriveCommand> {
+                vec![DriveCommand::SetInformation {
+                    device_id: 1,
+                    file_id: 2,
+                    fs_information_class: irp::FILE_RENAME_INFORMATION,
+                    set_buffer: irp::rename_information_buffer("\\new.txt", false),
+                    request_tag: 5,
+                }]
+            }
+        }
+
+        let (mut channel, _initial) = RdpdrChannel::new(
+            1004,
+            1002,
+            pdu::RDPDR_DTYP_FILESYSTEM,
+            Box::new(SetInfoConsumer {
+                replies: replies_cb,
+            }),
+        );
+        let _ = channel.flush_pending_commands();
+
+        let mut completion = Vec::new();
+        completion.write_u16_le(pdu::RDPDR_CTYP_CORE);
+        completion.write_u16_le(pdu::PAKID_CORE_DEVICE_IOCOMPLETION);
+        completion.write_u32_le(1);
+        completion.write_u32_le(0);
+        completion.write_u32_le(0xC000_0022);
+        assert!(send_message(&mut channel, completion).is_empty());
+        let got = replies.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, 5);
+        assert_eq!(got[0].1, Err(0xC000_0022));
     }
 }

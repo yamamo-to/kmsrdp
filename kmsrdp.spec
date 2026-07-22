@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.30
+Version:        0.1.31
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -97,8 +97,13 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.31-1
+- Drive FUSE polish: rename flags, empty rmdir check, local chmod/chown attrs
+- Expand unit tests across rdpcore-pdu, rdpcore-rdpdr, and kmsrdp
+
 * Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.30-1
-- Drive FUSE: delete/rename/setattr; quiet unused flush/xattr FUSE ops
+- Drive FUSE: delete, rename, and setattr (size/times)
+- Silence unused FUSE flush/fsync/xattr warnings
 
 * Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.29-1
 - Validate config, capabilities, and helper binaries at startup

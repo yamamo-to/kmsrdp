@@ -604,4 +604,33 @@ mod tests {
         assert_eq!(u32::from_le_bytes(encoded[28..32].try_into().unwrap()), 36);
         assert_eq!(encoded.len(), 32 + 24 + 36);
     }
+
+    #[test]
+    fn create_request_advertises_read_write_delete_share() {
+        let encoded = encode_create_request(1, 1, "\\x", GENERIC_READ, FILE_OPEN, 0);
+        assert_eq!(
+            u32::from_le_bytes(encoded[40..44].try_into().unwrap()),
+            FILE_SHARE_ALL
+        );
+    }
+
+    #[test]
+    fn disposition_buffer_is_single_delete_byte() {
+        assert_eq!(disposition_information_buffer(true), vec![1]);
+        assert_eq!(disposition_information_buffer(false), vec![0]);
+        let encoded = encode_set_disposition_request(1, 2, 3, true);
+        assert_eq!(
+            &encoded[24..28],
+            &FILE_DISPOSITION_INFORMATION.to_le_bytes()
+        );
+        assert_eq!(encoded[encoded.len() - 1], 1);
+    }
+
+    #[test]
+    fn rename_replace_if_exists_sets_leading_byte() {
+        let buf = rename_information_buffer("\\new.txt", true);
+        assert_eq!(buf[0], 1);
+        let buf = rename_information_buffer("\\new.txt", false);
+        assert_eq!(buf[0], 0);
+    }
 }

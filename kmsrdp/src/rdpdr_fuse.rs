@@ -1965,3 +1965,226 @@ fn chown_path(path: &Path, uid: u32, gid: u32) {
         let _ = libc::chown(c_path.as_ptr(), uid, gid);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rdpcore_rdpdr::irp::FILE_OPENED;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    fn test_bridge() -> Arc<Bridge> {
+        let (wake, _rx) = tokio::sync::mpsc::unbounded_channel();
+        Bridge::new(wake, 1000, 1001)
+    }
+
+    fn seed_path(bridge: &Bridge, device_id: u32, path: &str, is_dir: bool) {
+        bridge.ensure_root_ino(device_id);
+        let _ = bridge.inode_for(device_id, path);
+        bridge.meta.lock().unwrap().insert(
+            (device_id, path.to_owned()),
+            CachedMeta::new(is_dir, bridge.uid, bridge.gid),
+        );
+    }
+
+    fn complete_command(bridge: &Bridge, cmd: DriveCommand) {
+        match cmd {
+            DriveCommand::Create { request_tag, .. } => {
+                if let Some(Pending::Create(tx)) =
+                    bridge.pending.lock().unwrap().remove(&request_tag)
+                {
+                    let _ = tx.send(Ok(CreateReply {
+                        file_id: 42,
+                        information: FILE_OPENED,
+                    }));
+                }
+            }
+            DriveCommand::Close { request_tag, .. } => {
+                if let Some(Pending::Close(tx)) =
+                    bridge.pending.lock().unwrap().remove(&request_tag)
+                {
+                    let _ = tx.send(0);
+                }
+            }
+            DriveCommand::SetInformation { request_tag, .. } => {
+                if let Some(Pending::SetInfo(tx)) =
+                    bridge.pending.lock().unwrap().remove(&request_tag)
+                {
+                    let _ = tx.send(Ok(()));
+                }
+            }
+            DriveCommand::QueryDirectory { request_tag, path, .. } => {
+                if let Some(Pending::QueryDir(tx)) =
+                    bridge.pending.lock().unwrap().remove(&request_tag)
+                {
+                    let _ = tx.send(Ok(if path.is_some() {
+                        Some(DirectoryEntry {
+                            file_index: 0,
+                            file_name: "child.txt".to_owned(),
+                            creation_time: 0,
+                            last_access_time: 0,
+                            last_write_time: 0,
+                            change_time: 0,
+                            end_of_file: 0,
+                            allocation_size: 0,
+                            file_attributes: 0,
+                        })
+                    } else {
+                        None
+                    }));
+                }
+            }
+            DriveCommand::Read { request_tag, .. } => {
+                if let Some(Pending::Read(tx)) =
+                    bridge.pending.lock().unwrap().remove(&request_tag)
+                {
+                    let _ = tx.send(Ok(Vec::new()));
+                }
+            }
+            DriveCommand::Write { request_tag, .. } => {
+                if let Some(Pending::Write(tx)) =
+                    bridge.pending.lock().unwrap().remove(&request_tag)
+                {
+                    let _ = tx.send(Ok(0));
+                }
+            }
+        }
+    }
+
+    fn drain_bridge_until<F>(bridge: &Arc<Bridge>, mut done: F)
+    where
+        F: FnMut() -> bool,
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for bridge operation"
+            );
+            for cmd in bridge.poll_commands() {
+                complete_command(bridge, cmd);
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn join_win_and_parent_of() {
+        assert_eq!(join_win("\\", "foo"), "\\foo");
+        assert_eq!(join_win("\\dir", "bar"), "\\dir\\bar");
+        assert_eq!(parent_of("\\"), "\\");
+        assert_eq!(parent_of("\\foo"), "\\");
+        assert_eq!(parent_of("\\dir\\file"), "\\dir");
+    }
+
+    #[test]
+    fn sanitize_dos_name_strips_and_replaces() {
+        assert_eq!(sanitize_dos_name("  C  "), "C");
+        assert_eq!(sanitize_dos_name(" my-drive "), "my-drive");
+        assert_eq!(sanitize_dos_name("foo/bar"), "foo_bar");
+    }
+
+    #[test]
+    fn filetime_roundtrip() {
+        let t = UNIX_EPOCH + Duration::from_secs(1_704_067_200);
+        let ft = systemtime_to_filetime(t);
+        assert_eq!(ft, 116444736000000000 + 1_704_067_200 * 10_000_000);
+        let back = filetime_to_systemtime(ft);
+        assert_eq!(back.duration_since(UNIX_EPOCH).unwrap().as_secs(), 1_704_067_200);
+        assert_eq!(filetime_to_systemtime(0), UNIX_EPOCH);
+    }
+
+    #[test]
+    fn ntstatus_maps_common_drive_errors() {
+        assert_eq!(i32::from(ntstatus_to_errno(0xC000_003A)), i32::from(Errno::ENOENT));
+        assert_eq!(i32::from(ntstatus_to_errno(0xC000_0022)), i32::from(Errno::EACCES));
+        assert_eq!(i32::from(ntstatus_to_errno(0xC000_0101)), i32::from(Errno::ENOTEMPTY));
+        assert_eq!(i32::from(ntstatus_to_errno(0xC000_0035)), i32::from(Errno::EEXIST));
+        assert_eq!(i32::from(ntstatus_to_errno(0xC000_0121)), i32::from(Errno::EPERM));
+        assert_eq!(i32::from(ntstatus_to_errno(0xDEAD_BEEF)), i32::from(Errno::EIO));
+    }
+
+    #[test]
+    fn bridge_forget_and_remap_paths() {
+        let bridge = test_bridge();
+        seed_path(&bridge, 1, "\\a", true);
+        seed_path(&bridge, 1, "\\a\\b", false);
+        seed_path(&bridge, 1, "\\a\\c", false);
+
+        bridge.remap_path(1, "\\a", "\\x");
+        assert!(bridge.path_exists(1, "\\x"));
+        assert!(bridge.path_exists(1, "\\x\\b"));
+        assert!(!bridge.path_exists(1, "\\a\\c"));
+
+        bridge.forget_path(1, "\\x\\b");
+        assert!(!bridge.path_exists(1, "\\x\\b"));
+    }
+
+    #[test]
+    fn bridge_apply_local_attrs_updates_cached_view() {
+        let bridge = test_bridge();
+        seed_path(&bridge, 1, "\\f", false);
+        bridge.apply_local_attrs(1, "\\f", Some(0o600), Some(2000), Some(2001));
+        let attr = bridge.attr_for(1, "\\f").unwrap();
+        assert_eq!(attr.perm, 0o600);
+        assert_eq!(attr.uid, 2000);
+        assert_eq!(attr.gid, 2001);
+    }
+
+    #[test]
+    fn bridge_delete_path_issues_create_setinfo_close() {
+        let bridge = test_bridge();
+        seed_path(&bridge, 1, "\\gone.txt", false);
+        let bridge2 = Arc::clone(&bridge);
+        let handle = thread::spawn(move || bridge2.delete_path(1, "\\gone.txt", false));
+
+        drain_bridge_until(&bridge, || handle.is_finished());
+        handle.join().unwrap().unwrap();
+        assert!(!bridge.path_exists(1, "\\gone.txt"));
+    }
+
+    #[test]
+    fn bridge_rename_path_with_replace() {
+        let bridge = test_bridge();
+        seed_path(&bridge, 1, "\\old.txt", false);
+        let bridge2 = Arc::clone(&bridge);
+        let handle =
+            thread::spawn(move || bridge2.rename_path(1, "\\old.txt", "\\new.txt", true));
+
+        drain_bridge_until(&bridge, || handle.is_finished());
+        handle.join().unwrap().unwrap();
+        assert!(!bridge.path_exists(1, "\\old.txt"));
+        assert!(bridge.path_exists(1, "\\new.txt"));
+    }
+
+    #[test]
+    fn bridge_ensure_dir_empty_rejects_nonempty() {
+        let bridge = test_bridge();
+        seed_path(&bridge, 1, "\\dir", true);
+        let bridge2 = Arc::clone(&bridge);
+        let handle = thread::spawn(move || bridge2.ensure_dir_empty(1, "\\dir"));
+
+        drain_bridge_until(&bridge, || handle.is_finished());
+        let err = handle.join().unwrap().unwrap_err();
+        assert_eq!(i32::from(err), i32::from(Errno::ENOTEMPTY));
+    }
+
+    #[test]
+    fn bridge_exchange_paths_swaps_two_files() {
+        let bridge = test_bridge();
+        seed_path(&bridge, 1, "\\a.txt", false);
+        seed_path(&bridge, 1, "\\b.txt", false);
+        let ino_a = bridge.inode_for(1, "\\a.txt");
+        let ino_b = bridge.inode_for(1, "\\b.txt");
+
+        let bridge2 = Arc::clone(&bridge);
+        let handle = thread::spawn(move || bridge2.exchange_paths(1, "\\a.txt", "\\b.txt"));
+
+        drain_bridge_until(&bridge, || handle.is_finished());
+        handle.join().unwrap().unwrap();
+
+        assert_eq!(bridge.path_for(1, ino_a), Some("\\b.txt".to_owned()));
+        assert_eq!(bridge.path_for(1, ino_b), Some("\\a.txt".to_owned()));
+    }
+}

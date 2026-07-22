@@ -159,4 +159,34 @@ mod tests {
             assert_eq!(resolve_x11_display("", 0).as_deref(), Some(":0"));
         }
     }
+
+    #[test]
+    fn pulse_server_uses_runtime_dir() {
+        let session = Session {
+            uid: 1000,
+            username: "alice".to_string(),
+            display: Some(":0".to_string()),
+            xauthority: None,
+            xdg_runtime_dir: PathBuf::from("/run/user/1000"),
+        };
+        assert_eq!(
+            session.pulse_server(),
+            "unix:/run/user/1000/pulse/native"
+        );
+    }
+
+    #[test]
+    fn find_xauthority_falls_back_to_gdm_cookie() {
+        let dir = std::env::temp_dir().join(format!(
+            "kmsrdp-xauth-test-{}",
+            std::process::id()
+        ));
+        let gdm_dir = dir.join("gdm");
+        std::fs::create_dir_all(&gdm_dir).unwrap();
+        let cookie = gdm_dir.join("Xauthority");
+        std::fs::write(&cookie, b"").unwrap();
+        let found = find_xauthority("alice", &dir, 9_999_999);
+        assert_eq!(found, Some(cookie));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

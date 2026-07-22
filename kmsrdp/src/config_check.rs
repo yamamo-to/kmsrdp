@@ -221,10 +221,7 @@ fn check_fuse_conf(report: &mut StartupReport) {
         );
         return;
     };
-    let enabled = text.lines().any(|line| {
-        let trimmed = line.trim();
-        trimmed == "user_allow_other" || trimmed.starts_with("user_allow_other ")
-    });
+    let enabled = fuse_user_allow_other_enabled(&text);
     if !enabled {
         report.warnings.push(
             "/etc/fuse.conf has no active `user_allow_other` — root FUSE drive mounts \
@@ -232,6 +229,14 @@ fn check_fuse_conf(report: &mut StartupReport) {
                 .to_string(),
         );
     }
+}
+
+/// Whether `/etc/fuse.conf` enables `user_allow_other` (comments ignored).
+fn fuse_user_allow_other_enabled(conf_text: &str) -> bool {
+    conf_text.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == "user_allow_other" || trimmed.starts_with("user_allow_other ")
+    })
 }
 
 fn is_writable(path: &Path) -> bool {
@@ -335,5 +340,53 @@ mod tests {
     fn command_on_path_finds_sh() {
         assert!(command_on_path("sh"));
         assert!(!command_on_path("kmsrdp-definitely-missing-binary-xyz"));
+    }
+
+    #[test]
+    fn empty_user_is_hard_error() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("KMSRDP_USER", "   ");
+            std::env::remove_var("KMSRDP_PASSWORD");
+            std::env::remove_var("KMSRDP_DISPLAY");
+            std::env::remove_var("KMSRDP_TLS_CERT");
+            std::env::remove_var("KMSRDP_TLS_KEY");
+        }
+        let report = validate(3390);
+        assert!(
+            report.errors.iter().any(|e| e.contains("KMSRDP_USER")),
+            "{report:?}"
+        );
+        unsafe {
+            std::env::remove_var("KMSRDP_USER");
+        }
+    }
+
+    #[test]
+    fn log_report_ok_when_no_errors() {
+        let report = StartupReport {
+            warnings: vec!["warn".to_string()],
+            errors: Vec::new(),
+        };
+        assert!(log_report(&report).is_ok());
+    }
+
+    #[test]
+    fn log_report_err_when_errors_present() {
+        let report = StartupReport {
+            warnings: Vec::new(),
+            errors: vec!["bad".to_string()],
+        };
+        let err = log_report(&report).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("bad"));
+    }
+
+    #[test]
+    fn fuse_user_allow_other_parses_comments() {
+        let conf = "# comment\n#user_allow_other\nuser_allow_other\n";
+        assert!(fuse_user_allow_other_enabled(conf));
+        assert!(!fuse_user_allow_other_enabled("# user_allow_other\n"));
+        assert!(!fuse_user_allow_other_enabled(""));
     }
 }

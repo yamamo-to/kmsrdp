@@ -319,6 +319,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tls_hostnames_includes_localhost_and_env_hosts() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("KMSRDP_TLS_HOSTS", " 192.168.1.1 , host.example , ");
+        }
+        let hosts = tls_hostnames();
+        assert!(hosts.iter().any(|h| h == "localhost"));
+        assert!(hosts.iter().any(|h| h == "192.168.1.1"));
+        assert!(hosts.iter().any(|h| h == "host.example"));
+        unsafe {
+            std::env::remove_var("KMSRDP_TLS_HOSTS");
+        }
+    }
+
     fn tempfile_dir() -> PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!(

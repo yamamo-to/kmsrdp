@@ -974,4 +974,29 @@ mod tests {
         );
         assert!(msg.contains("hint:"), "{msg}");
     }
+
+    #[test]
+    fn blit_bgrx_copies_visible_region() {
+        let src = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut dst = vec![0u8; 16];
+        blit_bgrx(&mut dst, 8, 2, 2, &src, 8, 2, 1, 0, 0);
+        assert_eq!(&dst[0..4], &[1, 2, 3, 4]);
+        assert_eq!(&dst[4..8], &[5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn blit_bgrx_clips_negative_destination() {
+        let src = vec![9u8, 8, 7, 6, 1, 2, 3, 4];
+        let mut dst = vec![0u8; 8];
+        blit_bgrx(&mut dst, 8, 2, 1, &src, 8, 2, 1, -1, 0);
+        assert_eq!(&dst[0..4], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn blit_bgrx_skips_out_of_bounds_rows() {
+        let src = vec![1u8; 4];
+        let mut dst = vec![0u8; 8];
+        blit_bgrx(&mut dst, 4, 1, 1, &src, 4, 1, 1, 0, 5);
+        assert_eq!(dst, vec![0u8; 8]);
+    }
 }

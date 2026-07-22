@@ -1,3 +1,10 @@
+kmsrdp (0.1.31) unstable; urgency=medium
+
+  * Drive FUSE: rename flags, empty rmdir check, local chmod/chown attrs.
+  * Expand unit tests across rdpcore-pdu, rdpcore-rdpdr, and kmsrdp.
+
+ -- kmsrdp contributors <noreply@example.com>  Wed, 22 Jul 2026 17:28:00 +0900
+
 kmsrdp (0.1.30) unstable; urgency=medium
 
   * Drive FUSE: delete, rename, and setattr (size/times).

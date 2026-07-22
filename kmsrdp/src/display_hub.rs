@@ -361,8 +361,17 @@ impl RdpServerDisplay for Display {
 
 #[cfg(test)]
 mod tests {
-    use super::{coalesce_dirty_rects, dirty_area};
+    use super::{coalesce_dirty_rects, dirty_area, should_log_capture_failure};
     use rdpcore_server::diff::Rect;
+
+    #[test]
+    fn capture_failure_logging_rate_limits() {
+        assert!(should_log_capture_failure(1));
+        assert!(!should_log_capture_failure(2));
+        assert!(!should_log_capture_failure(19));
+        assert!(should_log_capture_failure(20));
+        assert!(should_log_capture_failure(40));
+    }
 
     #[test]
     fn light_dirty_frames_keep_individual_rects() {

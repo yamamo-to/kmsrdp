@@ -66,3 +66,29 @@ pub fn encode_set_surface_bits(
     out.write_slice(data);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_marker_encodes_action_and_id() {
+        let body = encode_frame_marker(FRAME_ACTION_BEGIN, 42);
+        assert_eq!(&body[0..2], &CMD_FRAME_MARKER.to_le_bytes());
+        assert_eq!(&body[2..4], &FRAME_ACTION_BEGIN.to_le_bytes());
+        assert_eq!(&body[4..8], &42u32.to_le_bytes());
+    }
+
+    #[test]
+    fn set_surface_bits_carries_exclusive_rect_and_payload() {
+        let payload = [1u8, 2, 3];
+        let body = encode_set_surface_bits(10, 20, 30, 40, 0x77, &payload);
+        assert_eq!(&body[0..2], &CMD_SET_SURFACE_BITS.to_le_bytes());
+        assert_eq!(&body[2..4], &10u16.to_le_bytes()); // left
+        assert_eq!(&body[4..6], &20u16.to_le_bytes()); // top
+        assert_eq!(&body[6..8], &40u16.to_le_bytes()); // right = left+width
+        assert_eq!(&body[8..10], &60u16.to_le_bytes()); // bottom = top+height
+        assert_eq!(body[13], 0x77); // codec_id
+        assert_eq!(body[body.len() - 3..], payload);
+    }
+}

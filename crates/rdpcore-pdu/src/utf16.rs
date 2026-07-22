@@ -49,3 +49,36 @@ pub fn decode_units(bytes: &[u8]) -> String {
         .collect();
     String::from_utf16_lossy(&units)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_fixed_pads_to_exact_byte_length() {
+        let mut out = Vec::new();
+        write_fixed(&mut out, "ab", 8);
+        assert_eq!(out.len(), 8);
+        assert_eq!(read_fixed(&out), "ab");
+    }
+
+    #[test]
+    fn read_fixed_stops_at_nul() {
+        let mut out = Vec::new();
+        write_fixed(&mut out, "hello", 12);
+        assert_eq!(read_fixed(&out), "hello");
+    }
+
+    #[test]
+    fn encode_decode_units_round_trip() {
+        let s = "日本語";
+        let bytes = encode_units(s);
+        assert_eq!(decode_units(&bytes), s);
+    }
+
+    #[test]
+    fn encode_units_is_utf16le() {
+        let bytes = encode_units("A");
+        assert_eq!(bytes, [b'A', 0]);
+    }
+}

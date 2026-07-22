@@ -228,3 +228,31 @@ impl Drop for VirtualInput {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_scancode_passes_through_unchanged() {
+        assert_eq!(linux_keycode_from_rdp_scancode(0x1e, false), Some(0x1e));
+    }
+
+    #[test]
+    fn extended_arrow_keys_map_to_linux_codes() {
+        assert_eq!(linux_keycode_from_rdp_scancode(0x48, true), Some(103)); // Up
+        assert_eq!(linux_keycode_from_rdp_scancode(0x50, true), Some(108)); // Down
+    }
+
+    #[test]
+    fn unknown_extended_scancode_returns_none() {
+        assert_eq!(linux_keycode_from_rdp_scancode(0x99, true), None);
+    }
+
+    #[test]
+    fn fractional_pointer_maps_to_axis_range() {
+        let mid = (POINTER_MAX as f64 * 0.5) as i32;
+        assert_eq!(mid, POINTER_MAX / 2);
+        assert_eq!((POINTER_MAX as f64 * 1.0) as i32, POINTER_MAX);
+    }
+}
