@@ -39,7 +39,9 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
 - Framebuffers: single-plane XRGB8888/ARGB8888 only (tiled modifiers are
   detiled via GBM/EGL when needed)
 - Drive FUSE: no delete/rename/setattr; no printer/CUPS yet
-- CJK IME needs X11 (XTest); not available on Wayland-only sessions
+- CJK IME needs X11 (XTest); not available on Wayland-only sessions. `startx`
+  on a tty session is detected automatically (`DISPLAY` / `XAUTHORITY` from
+  logind, the session leader, or a sole `/tmp/.X11-unix/X*` socket)
 - Needs `CAP_SYS_ADMIN`, `CAP_DAC_OVERRIDE`, `CAP_NET_BIND_SERVICE` on the binary
 
 **Tested:** Proxmox VM (VirtIO-GPU/QXL) via Guacamole and direct clients;

@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use zbus::Connection;
 use zbus::proxy;
 
-use crate::session::{Session, find_display_fallback, find_xauthority};
+use crate::session::{Session, find_xauthority, resolve_x11_display};
 
 type LogindSession = (String, u32, String, String, zbus::zvariant::OwnedObjectPath);
 
@@ -68,50 +68,81 @@ trait LoginSession {
     fn leader(&self) -> zbus::Result<u32>;
 }
 
+async fn session_from_proxy(
+    conn: &Connection,
+    uid: u32,
+    username: String,
+    path: zbus::zvariant::OwnedObjectPath,
+) -> Option<(String, Session)> {
+    let proxy = LoginSessionProxy::builder(conn)
+        .path(path)
+        .ok()?
+        .build()
+        .await
+        .ok()?;
+
+    if !proxy.active().await.unwrap_or(false) {
+        return None;
+    }
+
+    let session_type = proxy.session_type().await.unwrap_or_default();
+    let leader = proxy.leader().await.unwrap_or(0);
+    let xdg_runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
+
+    let display = match session_type.as_str() {
+        "x11" | "wayland" | "mir" => {
+            let logind_display = proxy.display().await.unwrap_or_default();
+            resolve_x11_display(&logind_display, leader)
+        }
+        "tty" => resolve_x11_display("", leader),
+        _ => None,
+    };
+
+    if !matches!(session_type.as_str(), "x11" | "wayland" | "mir" | "tty") {
+        return None;
+    }
+    if matches!(session_type.as_str(), "tty") && display.is_none() {
+        return None;
+    }
+
+    Some((
+        session_type,
+        Session {
+            uid,
+            username: username.clone(),
+            display,
+            xauthority: find_xauthority(&username, &xdg_runtime_dir, leader),
+            xdg_runtime_dir,
+        },
+    ))
+}
+
 async fn find_active_session(conn: &Connection) -> Option<Session> {
     let manager = LoginManagerProxy::new(conn).await.ok()?;
     let sessions = manager.list_sessions().await.ok()?;
 
+    let mut graphical = None;
+    let mut tty_x11 = None;
+
     for (_, uid, username, _, path) in sessions {
-        let proxy = LoginSessionProxy::builder(conn)
-            .path(path)
-            .ok()?
-            .build()
-            .await
-            .ok()?;
-
-        let session_type = proxy.session_type().await.unwrap_or_default();
-        if !matches!(session_type.as_str(), "x11" | "wayland" | "mir") {
+        let Some((session_type, session)) = session_from_proxy(conn, uid, username, path).await
+        else {
             continue;
-        }
-        if !proxy.active().await.unwrap_or(false) {
-            continue;
-        }
-
-        let display_str = proxy.display().await.unwrap_or_default();
-        let display = if display_str.is_empty() {
-            // logind frequently never learns the X11 display number for a
-            // session it otherwise correctly tracks as `Type=x11`/`Active`
-            // (observed on a plain GDM-started session) - fall back to
-            // scanning for the X server socket ourselves.
-            find_display_fallback()
-        } else {
-            Some(display_str)
         };
-        let leader = proxy.leader().await.unwrap_or(0);
-        let xdg_runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
-        let xauthority = find_xauthority(&username, &xdg_runtime_dir, leader);
 
-        return Some(Session {
-            uid,
-            username,
-            display,
-            xauthority,
-            xdg_runtime_dir,
-        });
+        match session_type.as_str() {
+            "x11" | "wayland" | "mir" => {
+                graphical = Some(session);
+                break;
+            }
+            "tty" => {
+                tty_x11 = Some(session);
+            }
+            _ => {}
+        }
     }
 
-    None
+    graphical.or(tty_x11)
 }
 
 /// Update process-level environment variables to reflect `session`.
@@ -151,8 +182,8 @@ fn apply_session_env(session: &Option<Session>) {
                 std::env::set_var("PULSE_SERVER", s.pulse_server());
             }
             None => {
-                std::env::remove_var("DISPLAY");
-                std::env::remove_var("XAUTHORITY");
+                // Keep DISPLAY/XAUTHORITY from the unit file when logind has
+                // no session (e.g. startx on tty before we learn the leader).
                 std::env::remove_var("XDG_RUNTIME_DIR");
                 std::env::remove_var("DBUS_SESSION_BUS_ADDRESS");
                 std::env::remove_var("PULSE_SERVER");

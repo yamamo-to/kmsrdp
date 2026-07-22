@@ -66,6 +66,49 @@ pub fn find_xauthority(username: &str, xdg_runtime_dir: &Path, leader_pid: u32) 
     xauth.exists().then_some(xauth)
 }
 
+/// Returns true when `display` looks like `:N` and `/tmp/.X11-unix/XN` exists.
+pub fn display_socket_exists(display: &str) -> bool {
+    let Some(n) = display.strip_prefix(':').and_then(|s| s.parse::<u32>().ok()) else {
+        return false;
+    };
+    PathBuf::from(format!("/tmp/.X11-unix/X{n}")).exists()
+}
+
+/// Read `DISPLAY` from a process environment when its socket is live.
+pub fn display_from_leader_environ(leader_pid: u32) -> Option<String> {
+    if leader_pid == 0 {
+        return None;
+    }
+    let environ = std::fs::read(format!("/proc/{leader_pid}/environ")).ok()?;
+    for entry in environ.split(|&b| b == 0) {
+        let s = std::str::from_utf8(entry).ok()?;
+        if let Some(display) = s.strip_prefix("DISPLAY=")
+            && display_socket_exists(display)
+        {
+            return Some(display.to_string());
+        }
+    }
+    None
+}
+
+/// Best-effort X11 `DISPLAY` for a logind session.
+///
+/// Order: logind `Display` property → session leader `DISPLAY` → sole
+/// `/tmp/.X11-unix/X*` socket (startx/tty setups where logind still says
+/// `Type=tty` and never sets `Display=`).
+pub fn resolve_x11_display(logind_display: &str, leader_pid: u32) -> Option<String> {
+    if !logind_display.is_empty() {
+        let display = logind_display.to_string();
+        if display_socket_exists(&display) {
+            return Some(display);
+        }
+    }
+    if let Some(display) = display_from_leader_environ(leader_pid) {
+        return Some(display);
+    }
+    find_display_fallback()
+}
+
 /// Fallback DISPLAY detection for when logind's own `Display` session
 /// property comes back empty - which it does for plenty of real, active
 /// X11 sessions (confirmed against a GDM-started `Type=x11` session: it
@@ -88,5 +131,26 @@ pub fn find_display_fallback() -> Option<String> {
     match displays.as_slice() {
         [n] => Some(format!(":{n}")),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_socket_exists_requires_colon_prefix() {
+        assert!(!display_socket_exists("0"));
+        assert!(!display_socket_exists(""));
+    }
+
+    #[test]
+    fn resolve_x11_display_uses_logind_when_socket_live() {
+        // :0 is present on most dev machines running Cursor; skip if not.
+        if !display_socket_exists(":0") {
+            return;
+        }
+        assert_eq!(resolve_x11_display(":0", 0).as_deref(), Some(":0"));
+        assert_eq!(resolve_x11_display("", 0).as_deref(), Some(":0"));
     }
 }

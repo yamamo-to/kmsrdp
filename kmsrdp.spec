@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.26
+Version:        0.1.27
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -97,6 +97,9 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Wed Jul 22 2026 kmsrdp contributors <noreply@example.com> - 0.1.27-1
+- Auto-detect X11 DISPLAY on tty/startx sessions for CJK Unicode injection
+
 * Tue Jul 21 2026 kmsrdp contributors <noreply@example.com> - 0.1.26-1
 - Faster stop on shutdown (TimeoutStopSec=5, SIGTERM/SIGINT immediate exit)
 
