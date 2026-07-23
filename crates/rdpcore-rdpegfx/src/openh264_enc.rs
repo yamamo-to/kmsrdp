@@ -150,3 +150,42 @@ impl H264Encoder for OpenH264Encoder {
         self.next_ts_ms = 0;
     }
 }
+
+#[cfg(all(test, feature = "openh264"))]
+mod tests {
+    use super::*;
+    use crate::encoder::H264Encoder;
+
+    #[test]
+    fn openh264_emits_annex_b_with_start_code() {
+        let mut enc = OpenH264Encoder::new().expect("openh264");
+        let w = 64u16;
+        let h = 64u16;
+        let mut pixels = vec![0u8; usize::from(w) * usize::from(h) * 4];
+        // Non-black so RC is less likely to emit a tiny/empty AU.
+        for (i, b) in pixels.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let au = enc
+            .encode_bgrx(w, h, usize::from(w) * 4, &pixels, true)
+            .expect("encode");
+        assert!(!au.annex_b.is_empty());
+        assert!(
+            au.annex_b.windows(4).any(|w| w == [0, 0, 0, 1])
+                || au.annex_b.windows(3).any(|w| w == [0, 0, 1]),
+            "expected Annex B start code, got {} bytes",
+            au.annex_b.len()
+        );
+    }
+
+    #[test]
+    fn openh264_reset_allows_new_resolution() {
+        let mut enc = OpenH264Encoder::new().expect("openh264");
+        let a = vec![40u8; 32 * 32 * 4];
+        let _ = enc.encode_bgrx(32, 32, 32 * 4, &a, true).unwrap();
+        enc.reset();
+        let b = vec![80u8; 48 * 48 * 4];
+        let au = enc.encode_bgrx(48, 48, 48 * 4, &b, true).unwrap();
+        assert!(!au.annex_b.is_empty());
+    }
+}

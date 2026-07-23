@@ -469,4 +469,143 @@ mod tests {
         assert_eq!(&pdu[8..10], &1u16.to_le_bytes()); // surfaceId
         assert_eq!(&pdu[10..12], &CODEC_AVC420.to_le_bytes());
     }
+
+    #[test]
+    fn avc420_preserves_annex_b_start_codes_on_wire() {
+        let annex_b = [
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x00, 0x00, 0x01, 0x65,
+        ];
+        let stream = encode_avc420_bitmap_stream(32, 24, 22, 100, &annex_b);
+        // metablock = 4 + 8 + 2; bitstream follows verbatim (Annex B, not AVCC).
+        assert_eq!(&stream[14..], &annex_b);
+        assert_eq!(&stream[14..18], &[0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn create_delete_map_start_end_layouts() {
+        let create = encode_create_surface(7, 1280, 800);
+        assert_eq!(&create[0..2], &CMD_CREATE_SURFACE.to_le_bytes());
+        assert_eq!(&create[8..10], &7u16.to_le_bytes());
+        assert_eq!(&create[10..12], &1280u16.to_le_bytes());
+        assert_eq!(&create[12..14], &800u16.to_le_bytes());
+        assert_eq!(create[14], PIXEL_FORMAT_XRGB);
+
+        let delete = encode_delete_surface(7);
+        assert_eq!(&delete[0..2], &CMD_DELETE_SURFACE.to_le_bytes());
+        assert_eq!(&delete[8..10], &7u16.to_le_bytes());
+
+        let map = encode_map_surface_to_output(7, 10, 20);
+        assert_eq!(&map[0..2], &CMD_MAP_SURFACE_TO_OUTPUT.to_le_bytes());
+        assert_eq!(&map[8..10], &7u16.to_le_bytes());
+        assert_eq!(&map[12..16], &10u32.to_le_bytes());
+        assert_eq!(&map[16..20], &20u32.to_le_bytes());
+
+        let start = encode_start_frame(1_000, 42);
+        assert_eq!(&start[0..2], &CMD_START_FRAME.to_le_bytes());
+        assert_eq!(&start[8..12], &1_000u32.to_le_bytes());
+        assert_eq!(&start[12..16], &42u32.to_le_bytes());
+
+        let end = encode_end_frame(42);
+        assert_eq!(&end[0..2], &CMD_END_FRAME.to_le_bytes());
+        assert_eq!(&end[8..12], &42u32.to_le_bytes());
+    }
+
+    #[test]
+    fn reset_graphics_monitor_coords_are_inclusive() {
+        let pdu = encode_reset_graphics(
+            100,
+            50,
+            &[MonitorDef {
+                left: 0,
+                top: 0,
+                right: 99,
+                bottom: 49,
+                primary: true,
+            }],
+        );
+        assert_eq!(pdu.len(), 340);
+        // width/height then monitorCount then first monitor left/top/right/bottom
+        assert_eq!(&pdu[8..12], &100u32.to_le_bytes());
+        assert_eq!(&pdu[12..16], &50u32.to_le_bytes());
+        assert_eq!(&pdu[16..20], &1u32.to_le_bytes());
+        assert_eq!(&pdu[20..24], &0i32.to_le_bytes());
+        assert_eq!(&pdu[28..32], &99i32.to_le_bytes());
+        assert_eq!(&pdu[32..36], &49i32.to_le_bytes());
+    }
+
+    #[test]
+    fn decode_frame_acknowledge() {
+        let mut body = Vec::new();
+        body.write_u32_le(3);
+        body.write_u32_le(9);
+        body.write_u32_le(100);
+        let mut pdu = Vec::new();
+        write_header(&mut pdu, CMD_FRAME_ACKNOWLEDGE, body.len());
+        pdu.extend_from_slice(&body);
+        match decode_client_message(&pdu).unwrap() {
+            ClientMessage::FrameAcknowledge {
+                queue_depth,
+                frame_id,
+                total_frames_decoded,
+            } => {
+                assert_eq!(queue_depth, 3);
+                assert_eq!(frame_id, 9);
+                assert_eq!(total_frames_decoded, 100);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_rejects_truncated_and_undersized_length() {
+        assert!(decode_client_message(&[0x12, 0x00, 0, 0, 4, 0, 0, 0]).is_err());
+        let mut pdu = Vec::new();
+        write_header(&mut pdu, CMD_FRAME_ACKNOWLEDGE, 12);
+        // claim 12 body bytes but provide none
+        assert!(decode_client_message(&pdu).is_err());
+    }
+
+    #[test]
+    fn decode_cache_import_offer_and_unknown() {
+        let mut offer = Vec::new();
+        write_header(&mut offer, CMD_CACHE_IMPORT_OFFER, 0);
+        assert!(matches!(
+            decode_client_message(&offer).unwrap(),
+            ClientMessage::CacheImportOffer
+        ));
+        let mut other = Vec::new();
+        write_header(&mut other, 0x00ff, 0);
+        assert!(matches!(
+            decode_client_message(&other).unwrap(),
+            ClientMessage::Other { cmd_id: 0x00ff }
+        ));
+    }
+
+    #[test]
+    fn select_rejects_version8_and_prefers_107() {
+        assert!(
+            !RawCapabilitySet::flags_only(CAP_VERSION_8, CAPS_FLAG_SMALL_CACHE).supports_avc420()
+        );
+        let sets = vec![
+            RawCapabilitySet::flags_only(CAP_VERSION_81, CAPS_FLAG_AVC420_ENABLED),
+            RawCapabilitySet::flags_only(CAP_VERSION_107, 0),
+        ];
+        assert_eq!(
+            select_avc420_capability(&sets).unwrap().version,
+            CAP_VERSION_107
+        );
+    }
+
+    #[test]
+    fn caps_advertise_rejects_oversize_capability_blob() {
+        let mut body = Vec::new();
+        body.write_u16_le(1);
+        body.write_u32_le(CAP_VERSION_81);
+        body.write_u32_le(1_000_000); // claims huge data
+        body.extend_from_slice(&0u32.to_le_bytes()); // only 4 bytes present
+        let mut pdu = Vec::new();
+        write_header(&mut pdu, CMD_CAPS_ADVERTISE, body.len());
+        pdu.extend_from_slice(&body);
+        assert!(decode_client_message(&pdu).is_err());
+    }
 }

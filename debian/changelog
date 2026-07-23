@@ -1,3 +1,9 @@
+kmsrdp (0.1.37) unstable; urgency=medium
+
+  * Expand MS-RDPEGFX unit tests (Annex B wire, Caps/session, OpenH264 smoke).
+
+ -- kmsrdp contributors <noreply@example.com>  Thu, 23 Jul 2026 09:56:00 +0900
+
 kmsrdp (0.1.36) unstable; urgency=medium
 
   * Add experimental MS-RDPEGFX AVC420 (OpenH264; optional VAAPI/NVENC).

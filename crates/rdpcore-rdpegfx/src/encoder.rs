@@ -181,4 +181,61 @@ mod tests {
         let i420 = bgrx_to_i420(w, h, usize::from(w) * 4, &pixels, 16, 16).unwrap();
         assert_eq!(i420.len(), 16 * 16 + 2 * (8 * 8));
     }
+
+    #[test]
+    fn bgrx_to_i420_rejects_bad_geometry() {
+        let pixels = vec![0u8; 4 * 4 * 4];
+        assert!(bgrx_to_i420(4, 4, 16, &pixels, 15, 16).is_err()); // odd width
+        assert!(bgrx_to_i420(8, 8, 32, &pixels, 16, 16).is_err()); // visible > padded
+        assert!(bgrx_to_i420(4, 4, 16, &[0u8; 8], 16, 16).is_err()); // short buffer
+    }
+
+    #[test]
+    fn bgrx_to_i420_black_and_white_luma() {
+        let mut black = vec![0u8; 2 * 2 * 4];
+        let i420 = bgrx_to_i420(2, 2, 8, &black, 2, 2).unwrap();
+        // BT.601 limited-range black ≈ 16
+        assert!(i420[0] <= 20);
+
+        // White BGRX
+        for px in black.chunks_exact_mut(4) {
+            px[0] = 255;
+            px[1] = 255;
+            px[2] = 255;
+        }
+        let i420 = bgrx_to_i420(2, 2, 8, &black, 2, 2).unwrap();
+        assert!(i420[0] >= 230);
+    }
+
+    #[test]
+    fn bgrx_to_nv12_interleaves_uv() {
+        let mut pixels = vec![0u8; 2 * 2 * 4];
+        // Pure red → distinctive U/V
+        for px in pixels.chunks_exact_mut(4) {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 255;
+        }
+        let nv12 = bgrx_to_nv12(2, 2, 8, &pixels, 2, 2).unwrap();
+        assert_eq!(nv12.len(), 6); // 2x2 Y + 1x1 UV interleaved (2 bytes)
+        let y_size = 4;
+        let u = nv12[y_size];
+        let v = nv12[y_size + 1];
+        // Red: U low, V high in BT.601
+        assert!(u < 128);
+        assert!(v > 128);
+    }
+
+    #[test]
+    fn mock_encoder_marks_idr_nal() {
+        let mut enc = MockH264Encoder::default();
+        let idr = enc
+            .encode_bgrx(16, 16, 64, &[0u8; 16 * 16 * 4], true)
+            .unwrap();
+        assert_eq!(idr.annex_b[4], 0x65);
+        let p = enc
+            .encode_bgrx(16, 16, 64, &[0u8; 16 * 16 * 4], false)
+            .unwrap();
+        assert_eq!(p.annex_b[4], 0x41);
+    }
 }

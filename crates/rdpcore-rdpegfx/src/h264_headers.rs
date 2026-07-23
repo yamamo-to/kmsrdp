@@ -130,4 +130,22 @@ mod tests {
         assert_eq!(&h[0..5], &[0, 0, 0, 1, 0x67]);
         assert!(h.windows(5).any(|w| w == [0, 0, 0, 1, 0x68]));
     }
+
+    #[test]
+    fn sps_pps_scales_with_resolution() {
+        let small = annex_b_sps_pps(64, 64);
+        let large = annex_b_sps_pps(1920, 1088);
+        assert_ne!(small, large);
+        assert!(large.len() >= small.len());
+        // Both remain Annex B with SPS then PPS
+        assert_eq!(&small[0..4], &[0, 0, 0, 1]);
+        assert_eq!(&large[0..4], &[0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn sps_pps_rejects_zero_by_clamping_macroblocks() {
+        // align callers normally avoid 0; API still must not panic.
+        let h = annex_b_sps_pps(0, 0);
+        assert_eq!(&h[0..5], &[0, 0, 0, 1, 0x67]);
+    }
 }

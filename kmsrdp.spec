@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.36
+Version:        0.1.37
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,9 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Thu Jul 23 2026 kmsrdp contributors <noreply@example.com> - 0.1.37-1
+- Expand MS-RDPEGFX unit tests (Annex B wire, Caps/session, OpenH264 smoke)
+
 * Thu Jul 23 2026 kmsrdp contributors <noreply@example.com> - 0.1.36-1
 - Add experimental MS-RDPEGFX AVC420 path (OpenH264; optional VAAPI/NVENC)
 - Opt-in at runtime with KMSRDP_GFX=1; Annex B bitstream per MS-RDPEGFX
