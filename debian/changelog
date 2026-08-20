@@ -1,3 +1,11 @@
+kmsrdp (0.1.42) unstable; urgency=medium
+
+  * Keep RDPSND live with a single latest-wins Wave slot.
+  * Drop late PCM instead of streaming Pulse/FIFO backlog to the client.
+  * Hint PipeWire/Pulse toward 20 ms before capture connects.
+
+ -- kmsrdp contributors <noreply@example.com>  Fri, 21 Aug 2026 04:23:00 +0900
+
 kmsrdp (0.1.41) unstable; urgency=medium
 
   * Keep RDPSND realtime with latest-wins Wave handoff.
