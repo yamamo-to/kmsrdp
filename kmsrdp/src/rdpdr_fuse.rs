@@ -1624,7 +1624,7 @@ fn spawn_shared_mount(
     let fs = FuseFs {
         active: Arc::clone(&active),
     };
-    let session = fuser::spawn_mount2(fs, mount_point, &config)?;
+    let session = fuser::spawn_mount(fs, mount_point, &config)?;
     Ok((session, active))
 }
 
