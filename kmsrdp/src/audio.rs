@@ -111,6 +111,10 @@ impl Drop for LocalAudioHandler {
     }
 }
 
+const MAX_LATENCY_US: u64 = 60_000; // 60 ms: queue backing up beyond 3 chunks
+const TARGET_LATENCY_US: u64 = 30_000; // Drain until latency is down to ~30 ms
+const MAX_DRAIN_CHUNKS: usize = 15; // Cap drain iterations per cycle to avoid starvation
+
 fn run_capture(publisher: WavePublisher, stop: Arc<AtomicBool>) {
     let spec = capture_spec();
     if !spec.is_valid() {
@@ -139,11 +143,11 @@ fn run_capture(publisher: WavePublisher, stop: Arc<AtomicBool>) {
     };
 
     if let Ok(lat) = simple.get_latency() {
-        tracing::info!("kmsrdp: RDPSND pulse record latency: {lat:?}");
+        tracing::info!("kmsrdp: RDPSND pulse record initial latency: {lat:?}");
     }
 
+    let start_instant = std::time::Instant::now();
     let mut buf = [0u8; CHUNK_BYTES];
-    let mut timestamp_ms: u32 = 0;
 
     while !stop.load(Ordering::Acquire) {
         match simple.read(&mut buf) {
@@ -151,10 +155,37 @@ fn run_capture(publisher: WavePublisher, stop: Arc<AtomicBool>) {
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
+
+                // If PulseAudio/PipeWire internal buffer has built up latency (e.g. from stalls),
+                // drain older audio chunks so we catch up to realtime rather than accumulating lag.
+                if let Ok(lat) = simple.get_latency()
+                    && lat.0 > MAX_LATENCY_US
+                {
+                    let mut drained = 0;
+                    while drained < MAX_DRAIN_CHUNKS {
+                        if simple.read(&mut buf).is_err() {
+                            break;
+                        }
+                        drained += 1;
+                        if let Ok(cur_lat) = simple.get_latency()
+                            && cur_lat.0 <= TARGET_LATENCY_US
+                        {
+                            break;
+                        }
+                    }
+                    if drained > 0 {
+                        tracing::debug!(
+                            "kmsrdp: RDPSND drained {} stale audio chunks (initial latency: {} ms)",
+                            drained,
+                            lat.0 / 1000
+                        );
+                    }
+                }
+
+                let timestamp_ms = start_instant.elapsed().as_millis() as u32;
                 if !publisher.publish(RdpsndServerMessage::Wave(buf.to_vec(), timestamp_ms)) {
                     break;
                 }
-                timestamp_ms = timestamp_ms.wrapping_add(CHUNK_MS);
             }
             Err(e) => {
                 tracing::warn!("kmsrdp: PulseAudio capture read failed: {e}");
