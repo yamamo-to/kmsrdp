@@ -3,6 +3,8 @@
 //! construction (`ExactMatchCredentialValidator::new(Credentials { .. })`)
 //! ports unchanged.
 
+use subtle::ConstantTimeEq as _;
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credentials {
     pub username: String,
@@ -37,9 +39,13 @@ impl ExactMatchCredentialValidator {
 impl CredentialValidator for ExactMatchCredentialValidator {
     fn validate(&self, username: &str, password: &str, domain: &str) -> bool {
         let (client_domain, client_user) = normalize_client_identity(username, domain);
-        if !client_user.eq_ignore_ascii_case(&self.expected.username)
-            || password != self.expected.password
-        {
+        let password_matches: bool = self
+            .expected
+            .password
+            .as_bytes()
+            .ct_eq(password.as_bytes())
+            .into();
+        if !client_user.eq_ignore_ascii_case(&self.expected.username) || !password_matches {
             return false;
         }
         match &self.expected.domain {
@@ -113,6 +119,19 @@ mod tests {
     fn rejects_wrong_password() {
         let v = validator("kmsrdp", "hunter2");
         assert!(!v.validate("kmsrdp", "wrong", ""));
+    }
+
+    #[test]
+    fn rejects_partial_password_or_wrong_case() {
+        let v = validator("kmsrdp", "Hunter2");
+        // Prefix mismatch
+        assert!(!v.validate("kmsrdp", "Hunter", ""));
+        // Suffix extra
+        assert!(!v.validate("kmsrdp", "Hunter22", ""));
+        // Case mismatch (password must be case sensitive)
+        assert!(!v.validate("kmsrdp", "hunter2", ""));
+        // Empty password
+        assert!(!v.validate("kmsrdp", "", ""));
     }
 
     #[test]

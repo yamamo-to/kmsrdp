@@ -1374,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "kmsrdp"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2355,6 +2355,7 @@ dependencies = [
  "rdpcore-rdpsnd",
  "rdpcore-transport",
  "sspi",
+ "subtle",
  "tokio",
  "tokio-rustls",
  "tracing",

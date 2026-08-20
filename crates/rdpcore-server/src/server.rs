@@ -47,6 +47,7 @@ pub struct RdpServerBuilder {
     cliprdr_factory: Option<Arc<dyn CliprdrBackendFactory>>,
     audio_input_factory: Option<Arc<dyn AudioInputBackendFactory>>,
     drive_factory: Option<Arc<dyn DriveConsumerFactory>>,
+    require_nla: bool,
     #[cfg(feature = "dvc-echo")]
     echo_smoke_test: bool,
 }
@@ -66,6 +67,7 @@ impl RdpServerBuilder {
             cliprdr_factory: None,
             audio_input_factory: None,
             drive_factory: None,
+            require_nla: false,
             #[cfg(feature = "dvc-echo")]
             echo_smoke_test: false,
         }
@@ -120,6 +122,12 @@ impl RdpServerBuilder {
         self
     }
 
+    /// Whether to require NLA (CredSSP / PROTOCOL_HYBRID), rejecting plain TLS.
+    pub fn with_require_nla(mut self, require_nla: bool) -> Self {
+        self.require_nla = require_nla;
+        self
+    }
+
     pub fn with_sound_factory(mut self, factory: Option<Box<dyn SoundServerFactory>>) -> Self {
         self.sound_factory = factory.map(Arc::from);
         self
@@ -171,6 +179,7 @@ impl RdpServerBuilder {
             cliprdr_factory: self.cliprdr_factory,
             audio_input_factory: self.audio_input_factory,
             drive_factory: self.drive_factory,
+            require_nla: self.require_nla,
             #[cfg(feature = "dvc-echo")]
             echo_smoke_test: self.echo_smoke_test,
         }
@@ -190,6 +199,7 @@ pub struct RdpServer {
     cliprdr_factory: Option<Arc<dyn CliprdrBackendFactory>>,
     audio_input_factory: Option<Arc<dyn AudioInputBackendFactory>>,
     drive_factory: Option<Arc<dyn DriveConsumerFactory>>,
+    require_nla: bool,
     #[cfg(feature = "dvc-echo")]
     echo_smoke_test: bool,
 }
@@ -208,6 +218,7 @@ struct Session {
     cliprdr_factory: Option<Arc<dyn CliprdrBackendFactory>>,
     audio_input_factory: Option<Arc<dyn AudioInputBackendFactory>>,
     drive_factory: Option<Arc<dyn DriveConsumerFactory>>,
+    require_nla: bool,
     #[cfg(feature = "dvc-echo")]
     echo_smoke_test: bool,
 }
@@ -229,6 +240,7 @@ impl RdpServer {
             cliprdr_factory: self.cliprdr_factory.clone(),
             audio_input_factory: self.audio_input_factory.clone(),
             drive_factory: self.drive_factory.clone(),
+            require_nla: self.require_nla,
             #[cfg(feature = "dvc-echo")]
             echo_smoke_test: self.echo_smoke_test,
         }
@@ -267,7 +279,8 @@ impl Session {
     async fn handle_connection(&self, mut tcp: TcpStream) -> anyhow::Result<()> {
         let peer = tcp.peer_addr()?;
         let desktop = self.display.size().await;
-        let mut acceptor = Acceptor::new(desktop.width, desktop.height);
+        let mut acceptor = Acceptor::new(desktop.width, desktop.height)
+            .with_require_nla(self.require_nla);
 
         // Connection Request/Confirm is always cleartext, even under
         // PROTOCOL_SSL / PROTOCOL_HYBRID - the TLS handshake only starts

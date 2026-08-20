@@ -174,18 +174,19 @@ fn persist_identity(
 }
 
 fn write_private_file(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    let rand_suffix: u64 = rand::random();
     let tmp = path.with_file_name(format!(
-        ".{}.tmp",
+        ".{}.tmp.{:016x}",
         path.file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("kmsrdp-tls")
+            .unwrap_or("kmsrdp-tls"),
+        rand_suffix
     ));
 
     {
         let mut file = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(mode)
             .open(&tmp)?;
         file.write_all(contents)?;
@@ -332,6 +333,17 @@ mod tests {
         unsafe {
             std::env::remove_var("KMSRDP_TLS_HOSTS");
         }
+    }
+
+    #[test]
+    fn write_private_file_sets_mode_and_creates_new_file() {
+        let dir = tempfile_dir();
+        let target = dir.join("secret.key");
+        write_private_file(&target, b"secret data", 0o600).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"secret data");
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn tempfile_dir() -> PathBuf {

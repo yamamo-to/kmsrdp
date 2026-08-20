@@ -154,6 +154,8 @@ pub struct Acceptor {
     /// `PROTOCOL_SSL`). Callers use this after TLS to decide whether CredSSP
     /// (NLA) must run before MCS Connect Initial.
     selected_protocol: SecurityProtocol,
+    /// Whether NLA (PROTOCOL_HYBRID) is strictly required.
+    require_nla: bool,
     /// MCS user-data reassembly for Confirm Active when mstsc fragments it.
     confirm_active_buf: Vec<u8>,
     nscodec: Option<NsCodecNegotiated>,
@@ -171,10 +173,17 @@ impl Acceptor {
             client_name: String::new(),
             client_requested_protocols: SecurityProtocol::SSL.0,
             selected_protocol: SecurityProtocol::SSL,
+            require_nla: false,
             confirm_active_buf: Vec::new(),
             nscodec: None,
             max_request_size: None,
         }
+    }
+
+    /// Enforce NLA (PROTOCOL_HYBRID) and reject non-NLA TLS-only connections.
+    pub fn with_require_nla(mut self, require_nla: bool) -> Self {
+        self.require_nla = require_nla;
+        self
     }
 
     /// Protocol chosen during X.224 negotiation (`PROTOCOL_HYBRID` when the
@@ -438,18 +447,20 @@ impl Acceptor {
     fn on_connection_request(&mut self, input: &[u8]) -> Result<StepResult, ConnectorError> {
         let request = ConnectionRequest::decode(input)?;
         // Prefer NLA (CredSSP / PROTOCOL_HYBRID) when the client offers it;
-        // otherwise fall back to TLS-only (PROTOCOL_SSL) + Client Info auth.
-        // Either path still needs SSL as the transport underneath CredSSP.
+        // otherwise fall back to TLS-only (PROTOCOL_SSL) + Client Info auth
+        // unless require_nla is set.
         let selected = if request.protocol.contains(SecurityProtocol::HYBRID) {
             SecurityProtocol::HYBRID
-        } else if request.protocol.contains(SecurityProtocol::SSL) {
+        } else if !self.require_nla && request.protocol.contains(SecurityProtocol::SSL) {
             SecurityProtocol::SSL
         } else {
             self.state = State::Rejected;
-            let response = ConnectionConfirm::Failure {
-                code: FailureCode::SSL_REQUIRED_BY_SERVER,
-            }
-            .encode();
+            let code = if self.require_nla {
+                FailureCode::HYBRID_REQUIRED_BY_SERVER
+            } else {
+                FailureCode::SSL_REQUIRED_BY_SERVER
+            };
+            let response = ConnectionConfirm::Failure { code }.encode();
             return Ok(StepResult::with_event(response, AcceptorEvent::Rejected));
         };
 
@@ -1458,5 +1469,45 @@ mod tests {
             }
         }
         panic!("finalization did not reach Accepted");
+    }
+
+    #[test]
+    fn require_nla_rejects_ssl_and_accepts_hybrid() {
+        let mut acceptor = Acceptor::new(1024, 768).with_require_nla(true);
+        // Client requests SSL only (no HYBRID)
+        let ssl_only_req = ConnectionRequest {
+            cookie: None,
+            flags: x224::RequestFlags(0),
+            protocol: SecurityProtocol::SSL,
+        }
+        .encode();
+        let result = acceptor.step(&ssl_only_req).unwrap();
+        assert_eq!(result.event, AcceptorEvent::Rejected);
+        let confirm = ConnectionConfirm::decode(&result.response).unwrap();
+        assert_eq!(
+            confirm,
+            ConnectionConfirm::Failure {
+                code: FailureCode::HYBRID_REQUIRED_BY_SERVER
+            }
+        );
+
+        // Client requests HYBRID + SSL
+        let mut acceptor = Acceptor::new(1024, 768).with_require_nla(true);
+        let hybrid_req = ConnectionRequest {
+            cookie: None,
+            flags: x224::RequestFlags(0),
+            protocol: SecurityProtocol::HYBRID | SecurityProtocol::SSL,
+        }
+        .encode();
+        let result = acceptor.step(&hybrid_req).unwrap();
+        assert_eq!(result.event, AcceptorEvent::TlsUpgrade);
+        let confirm = ConnectionConfirm::decode(&result.response).unwrap();
+        assert_eq!(
+            confirm,
+            ConnectionConfirm::Response {
+                flags: x224::ResponseFlags(0),
+                protocol: SecurityProtocol::HYBRID
+            }
+        );
     }
 }

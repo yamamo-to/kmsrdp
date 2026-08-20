@@ -242,23 +242,63 @@ async fn main() -> Result<()> {
         }
     };
 
+    let require_nla = std::env::var("KMSRDP_REQUIRE_NLA")
+        .or_else(|_| std::env::var("KMSRDP_FORCE_NLA"))
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if require_nla {
+        tracing::info!("NLA (Network Level Authentication) is required for all connections");
+    }
+
+    let clipboard_mode_str =
+        std::env::var("KMSRDP_CLIPBOARD").unwrap_or_else(|_| "bidirectional".to_string());
+    let cliprdr_factory: Option<Box<dyn rdpcore_cliprdr::CliprdrBackendFactory>> =
+        match clipboard_mode_str.trim().to_ascii_lowercase().as_str() {
+            "disabled" | "off" | "0" | "false" => {
+                tracing::info!("clipboard redirection disabled (KMSRDP_CLIPBOARD=disabled)");
+                None
+            }
+            "host-to-client" | "read-only" | "readonly" => {
+                tracing::info!("clipboard redirection set to host-to-client (read-only)");
+                Some(Box::new(LocalClipboardFactory::new(
+                    session_rx.clone(),
+                    kmsrdp::clipboard::ClipboardMode::HostToClient,
+                )))
+            }
+            "client-to-host" => {
+                tracing::info!("clipboard redirection set to client-to-host");
+                Some(Box::new(LocalClipboardFactory::new(
+                    session_rx.clone(),
+                    kmsrdp::clipboard::ClipboardMode::ClientToHost,
+                )))
+            }
+            _ => Some(Box::new(LocalClipboardFactory::new(
+                session_rx.clone(),
+                kmsrdp::clipboard::ClipboardMode::Bidirectional,
+            ))),
+        };
+
     let server: RdpServer = RdpServer::builder()
         .with_listener(listener)
         .with_tls(tls_identity.acceptor)
         .with_tls_public_key(tls_identity.public_key)
         .with_input_handler(input)
         .with_display_handler(display)
-        .with_cliprdr_factory(Some(Box::new(LocalClipboardFactory::new(
-            session_rx.clone(),
-        ))))
+        .with_cliprdr_factory(cliprdr_factory)
         .with_sound_factory(Some(Box::new(LocalAudioFactory::new())))
         .with_audio_input_factory(Some(Box::new(VirtualMicFactory::new())))
         .with_drive_factory(Some(drive_factory))
         .with_credential_validator(Some(Arc::new(validator)))
         .with_nla_credentials(Some(credentials))
+        .with_require_nla(require_nla)
         .build();
 
-    tracing::info!(%addr, "RDP server listening (TLS + optional NLA)");
+    let nla_desc = if require_nla {
+        "TLS + required NLA"
+    } else {
+        "TLS + optional NLA"
+    };
+    tracing::info!(%addr, "RDP server listening ({nla_desc})");
     // Exit immediately on stop signals. Tokio graceful shutdown would wait
     // for DRM `spawn_blocking` / FUSE threads and can hang host shutdown for
     // the default systemd TimeoutStopSec (~90s). `process::exit` skips that;

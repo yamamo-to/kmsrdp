@@ -89,17 +89,42 @@ fn spawn_shared_clipboard_watcher(
     });
 }
 
+/// Clipboard synchronization mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClipboardMode {
+    /// Bidirectional: host clipboard is shared to client, client clipboard is written to host.
+    #[default]
+    Bidirectional,
+    /// Host to client only (read-only): client receives host clipboard, but cannot write to host.
+    HostToClient,
+    /// Client to host only: client can write to host clipboard, but host clipboard is not advertised.
+    ClientToHost,
+}
+
+impl ClipboardMode {
+    pub fn allows_host_to_client(self) -> bool {
+        matches!(self, Self::Bidirectional | Self::HostToClient)
+    }
+
+    pub fn allows_client_to_host(self) -> bool {
+        matches!(self, Self::Bidirectional | Self::ClientToHost)
+    }
+}
+
 /// Builds per-connection backends that share one process-wide clipboard poller.
 #[derive(Clone)]
 pub struct LocalClipboardFactory {
     subscribers: Arc<Mutex<Vec<UnboundedSender<ClipboardMessage>>>>,
+    mode: ClipboardMode,
 }
 
 impl LocalClipboardFactory {
-    pub fn new(session_rx: watch::Receiver<Option<Session>>) -> Self {
+    pub fn new(session_rx: watch::Receiver<Option<Session>>, mode: ClipboardMode) -> Self {
         let subscribers = Arc::new(Mutex::new(Vec::new()));
-        spawn_shared_clipboard_watcher(Arc::clone(&subscribers), session_rx);
-        Self { subscribers }
+        if mode.allows_host_to_client() {
+            spawn_shared_clipboard_watcher(Arc::clone(&subscribers), session_rx);
+        }
+        Self { subscribers, mode }
     }
 }
 
@@ -108,9 +133,12 @@ impl CliprdrBackendFactory for LocalClipboardFactory {
         &self,
         sender: UnboundedSender<ClipboardMessage>,
     ) -> Box<dyn CliprdrBackend> {
-        self.subscribers.lock().unwrap().push(sender.clone());
+        if self.mode.allows_host_to_client() {
+            self.subscribers.lock().unwrap().push(sender.clone());
+        }
         Box::new(LocalClipboardBackend {
             sender,
+            mode: self.mode,
             remote_has_text: false,
             paste_requested: false,
         })
@@ -119,6 +147,7 @@ impl CliprdrBackendFactory for LocalClipboardFactory {
 
 struct LocalClipboardBackend {
     sender: UnboundedSender<ClipboardMessage>,
+    mode: ClipboardMode,
     remote_has_text: bool,
     /// Avoid duplicate remote paste requests when the client sends several
     /// Format List PDUs during startup (common on macOS Windows App).
@@ -128,6 +157,7 @@ struct LocalClipboardBackend {
 impl core::fmt::Debug for LocalClipboardBackend {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LocalClipboardBackend")
+            .field("mode", &self.mode)
             .field("remote_has_text", &self.remote_has_text)
             .finish()
     }
@@ -135,10 +165,15 @@ impl core::fmt::Debug for LocalClipboardBackend {
 
 impl CliprdrBackend for LocalClipboardBackend {
     fn on_ready(&mut self) {
-        let _ = advertise_local_text(&self.sender);
+        if self.mode.allows_host_to_client() {
+            let _ = advertise_local_text(&self.sender);
+        }
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
+        if !self.mode.allows_client_to_host() {
+            return;
+        }
         self.remote_has_text = available_formats.iter().any(|f| f.id == CF_UNICODETEXT);
         if !self.remote_has_text || self.paste_requested {
             return;
@@ -155,6 +190,12 @@ impl CliprdrBackend for LocalClipboardBackend {
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
+        if !self.mode.allows_host_to_client() {
+            let _ = self
+                .sender
+                .send(ClipboardMessage::SendFormatData(FormatDataResponse::new_error()));
+            return;
+        }
         let response = if request.format == CF_UNICODETEXT {
             match local_text() {
                 Some(text) => FormatDataResponse::new_unicode_string(&text),
@@ -167,7 +208,7 @@ impl CliprdrBackend for LocalClipboardBackend {
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse) {
-        if response.is_error() {
+        if !self.mode.allows_client_to_host() || response.is_error() {
             return;
         }
         if let Some(text) = response.to_unicode_string() {
@@ -199,7 +240,7 @@ mod tests {
 
     #[tokio::test]
     async fn factory_builds_distinct_backends() {
-        let factory = LocalClipboardFactory::new(session_rx());
+        let factory = LocalClipboardFactory::new(session_rx(), ClipboardMode::default());
         let (tx1, _rx1) = mpsc::unbounded_channel();
         let (tx2, _rx2) = mpsc::unbounded_channel();
         let mut b1 = factory.build_cliprdr_backend(tx1);
@@ -210,7 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_format_request_returns_error_response() {
-        let factory = LocalClipboardFactory::new(session_rx());
+        let factory = LocalClipboardFactory::new(session_rx(), ClipboardMode::default());
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut backend = factory.build_cliprdr_backend(tx);
         backend.on_format_data_request(FormatDataRequest {
@@ -224,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn format_data_error_response_is_ignored() {
-        let factory = LocalClipboardFactory::new(session_rx());
+        let factory = LocalClipboardFactory::new(session_rx(), ClipboardMode::default());
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut backend = factory.build_cliprdr_backend(tx);
         backend.on_format_data_response(FormatDataResponse::new_error());
@@ -233,12 +274,36 @@ mod tests {
 
     #[tokio::test]
     async fn remote_copy_without_unicode_skips_paste() {
-        let factory = LocalClipboardFactory::new(session_rx());
+        let factory = LocalClipboardFactory::new(session_rx(), ClipboardMode::default());
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut backend = factory.build_cliprdr_backend(tx);
         backend.on_remote_copy(&[ClipboardFormat { id: 1 }]);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn host_to_client_mode_ignores_remote_copy() {
+        let factory = LocalClipboardFactory::new(session_rx(), ClipboardMode::HostToClient);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut backend = factory.build_cliprdr_backend(tx);
+        backend.on_remote_copy(&[ClipboardFormat::unicode_text()]);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn client_to_host_mode_rejects_format_data_request() {
+        let factory = LocalClipboardFactory::new(session_rx(), ClipboardMode::ClientToHost);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut backend = factory.build_cliprdr_backend(tx);
+        backend.on_format_data_request(FormatDataRequest {
+            format: CF_UNICODETEXT,
+        });
+        match rx.try_recv().expect("expected response") {
+            ClipboardMessage::SendFormatData(resp) => assert!(resp.is_error()),
+            _ => panic!("expected SendFormatData"),
+        }
     }
 
     #[tokio::test]
