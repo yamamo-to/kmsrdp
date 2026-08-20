@@ -3,14 +3,11 @@
 //! (`libpulse-simple`) and pipes PCM to the connected client through
 //! `rdpcore_rdpsnd`.
 //!
-//! No stale-chunk-dropping hack here (an earlier, ironrdp-based version
-//! of this bridge needed one): that workaround existed because
-//! `ironrdp-server`'s shared write path had no real scheduling, so audio
-//! was throttled by throwing data away under contention.
-//! `rdpcore-transport`'s scheduler (see its crate docs) fixes the actual
-//! problem - a latency-priority frame always gets written within one bulk
-//! fragment's worth of delay - so this bridge just sends every chunk and
-//! trusts the scheduler.
+//! Capture publishes into a latest-wins slot ([`WavePublisher`]). When the
+//! session loop stalls (e.g. synchronous GFX encode during video), older
+//! PCM is overwritten instead of queued, so A/V lag cannot accumulate.
+//! Pulse/PipeWire `fragsize`/`maxlength` are still kept small (~20–80 ms)
+//! so the monitor source itself does not add multi-second buffering.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,8 +19,9 @@ use pulse::def::BufferAttr;
 use pulse::sample::{Format, Spec};
 use pulse::stream::Direction;
 use rdpcore_rdpsnd::pdu::{AudioFormat, NegotiatedFormat};
-use rdpcore_rdpsnd::{RdpsndError, RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
-use tokio::sync::mpsc::UnboundedSender;
+use rdpcore_rdpsnd::{
+    RdpsndError, RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory, WavePublisher,
+};
 
 const SAMPLE_RATE: u32 = 48000;
 const CHANNELS: u16 = 2;
@@ -32,6 +30,8 @@ const BLOCK_ALIGN: u16 = CHANNELS * (BITS_PER_SAMPLE / 8);
 // 20ms chunks: small enough to feel live, large enough not to spam the channel.
 const CHUNK_MS: u32 = 20;
 const CHUNK_BYTES: usize = (SAMPLE_RATE * BLOCK_ALIGN as u32 / 1000 * CHUNK_MS) as usize;
+/// Cap Pulse monitor buffering to a few chunks (matches former queue depth).
+const PULSE_MAX_CHUNKS: usize = 4;
 /// PulseAudio monitor source for the default playback sink.
 const MONITOR_SOURCE: &str = "@DEFAULT_MONITOR@";
 
@@ -55,7 +55,7 @@ fn capture_spec() -> Spec {
 /// fragment size to our 20 ms wave chunks and cap the buffer to a few chunks.
 fn capture_buffer_attr() -> BufferAttr {
     BufferAttr {
-        maxlength: (CHUNK_BYTES * 4) as u32,
+        maxlength: (CHUNK_BYTES * PULSE_MAX_CHUNKS) as u32,
         tlength: u32::MAX,
         prebuf: u32::MAX,
         minreq: u32::MAX,
@@ -63,7 +63,7 @@ fn capture_buffer_attr() -> BufferAttr {
     }
 }
 
-/// Stateless factory: each connection gets its own backend and sender.
+/// Stateless factory: each connection gets its own backend and publisher.
 #[derive(Clone, Default)]
 pub struct LocalAudioFactory;
 
@@ -74,12 +74,9 @@ impl LocalAudioFactory {
 }
 
 impl SoundServerFactory for LocalAudioFactory {
-    fn build_backend(
-        &self,
-        sender: UnboundedSender<RdpsndServerMessage>,
-    ) -> Box<dyn RdpsndServerHandler> {
+    fn build_backend(&self, publisher: WavePublisher) -> Box<dyn RdpsndServerHandler> {
         Box::new(LocalAudioHandler {
-            sender,
+            publisher,
             formats: vec![pcm_format()],
             stop: Arc::new(AtomicBool::new(false)),
             capture: None,
@@ -88,7 +85,7 @@ impl SoundServerFactory for LocalAudioFactory {
 }
 
 struct LocalAudioHandler {
-    sender: UnboundedSender<RdpsndServerMessage>,
+    publisher: WavePublisher,
     formats: Vec<AudioFormat>,
     stop: Arc<AtomicBool>,
     /// Joined in [`Self::stop`] so renegotiation / disconnect cannot leave
@@ -108,7 +105,7 @@ impl Drop for LocalAudioHandler {
     }
 }
 
-fn run_capture(sender: UnboundedSender<RdpsndServerMessage>, stop: Arc<AtomicBool>) {
+fn run_capture(publisher: WavePublisher, stop: Arc<AtomicBool>) {
     let spec = capture_spec();
     if !spec.is_valid() {
         tracing::warn!("kmsrdp: invalid PulseAudio capture spec");
@@ -141,10 +138,9 @@ fn run_capture(sender: UnboundedSender<RdpsndServerMessage>, stop: Arc<AtomicBoo
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
-                if sender
-                    .send(RdpsndServerMessage::Wave(buf.to_vec(), timestamp_ms))
-                    .is_err()
-                {
+                // Overwrite any unread Wave so the session always sees the
+                // newest PCM after a GFX stall (never a FIFO of late audio).
+                if !publisher.publish(RdpsndServerMessage::Wave(buf.to_vec(), timestamp_ms)) {
                     break;
                 }
                 timestamp_ms = timestamp_ms.wrapping_add(CHUNK_MS);
@@ -171,9 +167,9 @@ impl RdpsndServerHandler for LocalAudioHandler {
         // stream; never leave a previous capture thread running.
         self.stop();
         self.stop.store(false, Ordering::Release);
-        let sender = self.sender.clone();
+        let publisher = self.publisher.clone();
         let stop = Arc::clone(&self.stop);
-        self.capture = Some(std::thread::spawn(move || run_capture(sender, stop)));
+        self.capture = Some(std::thread::spawn(move || run_capture(publisher, stop)));
         Ok(())
     }
 
@@ -188,7 +184,7 @@ impl RdpsndServerHandler for LocalAudioHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
+    use rdpcore_rdpsnd::wave_channel;
 
     #[test]
     fn chunk_byte_size_matches_twenty_ms_pcm() {
@@ -209,13 +205,13 @@ mod tests {
     fn capture_buffer_attr_targets_twenty_ms_fragments() {
         let attr = capture_buffer_attr();
         assert_eq!(attr.fragsize, CHUNK_BYTES as u32);
-        assert_eq!(attr.maxlength, (CHUNK_BYTES * 4) as u32);
+        assert_eq!(attr.maxlength, (CHUNK_BYTES * PULSE_MAX_CHUNKS) as u32);
     }
 
     #[test]
     fn handler_advertises_stereo_pcm_48khz() {
         let factory = LocalAudioFactory::new();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = wave_channel();
         let handler = factory.build_backend(tx);
         let formats = handler.get_formats();
         assert_eq!(formats.len(), 1);
@@ -227,7 +223,7 @@ mod tests {
     #[test]
     fn choose_format_prefers_first_common_format() {
         let factory = LocalAudioFactory::new();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = wave_channel();
         let mut handler = factory.build_backend(tx);
         let common = vec![
             NegotiatedFormat {
@@ -246,8 +242,24 @@ mod tests {
     #[test]
     fn drop_without_capture_does_not_panic() {
         let factory = LocalAudioFactory::new();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = wave_channel();
         let handler = factory.build_backend(tx);
         drop(handler);
+    }
+
+    #[test]
+    fn publisher_keeps_only_newest_wave() {
+        let (tx, rx) = wave_channel();
+        assert!(tx.publish(RdpsndServerMessage::Wave(vec![1], 0)));
+        assert!(tx.publish(RdpsndServerMessage::Wave(vec![2], 20)));
+        assert!(tx.publish(RdpsndServerMessage::Wave(vec![3], 40)));
+        match rx.take_latest() {
+            Some(RdpsndServerMessage::Wave(pcm, ts)) => {
+                assert_eq!(pcm, vec![3]);
+                assert_eq!(ts, 40);
+            }
+            other => panic!("expected newest wave, got {other:?}"),
+        }
+        assert!(rx.take_latest().is_none());
     }
 }

@@ -6,6 +6,8 @@
 
 pub mod pdu;
 
+use std::sync::Arc;
+
 use rdpcore_pdu::DecodeError;
 use rdpcore_pdu::svc::wrap_indication;
 
@@ -21,8 +23,72 @@ impl<'a, E: RdpsndError + 'a> From<E> for Box<dyn RdpsndError + 'a> {
 /// A chunk of PCM (or whatever codec was negotiated) audio, plus a
 /// timestamp - produced by a backend once `start` is called, consumed by
 /// [`RdpsndChannel::encode_wave`].
+#[derive(Debug)]
 pub enum RdpsndServerMessage {
     Wave(Vec<u8>, u32),
+}
+
+/// Capture → session handoff that keeps only the newest Wave.
+///
+/// A FIFO queue (even a short one) replays audio that is already late after
+/// the session loop stalls on GFX encode. Publishers overwrite a single
+/// slot and coalesce wakeups so the consumer always encodes realtime PCM.
+#[derive(Clone)]
+pub struct WavePublisher {
+    latest: Arc<std::sync::Mutex<Option<RdpsndServerMessage>>>,
+    notify: tokio::sync::mpsc::Sender<()>,
+}
+
+/// Receiving end of [`WavePublisher`].
+pub struct WaveSubscriber {
+    latest: Arc<std::sync::Mutex<Option<RdpsndServerMessage>>>,
+    notify: tokio::sync::mpsc::Receiver<()>,
+}
+
+/// Creates a latest-wins Wave channel (notify depth 1).
+pub fn wave_channel() -> (WavePublisher, WaveSubscriber) {
+    let latest = Arc::new(std::sync::Mutex::new(None));
+    let (notify_tx, notify_rx) = tokio::sync::mpsc::channel(1);
+    (
+        WavePublisher {
+            latest: Arc::clone(&latest),
+            notify: notify_tx,
+        },
+        WaveSubscriber {
+            latest,
+            notify: notify_rx,
+        },
+    )
+}
+
+impl WavePublisher {
+    /// Stores `wave` as the newest sample and wakes the subscriber.
+    /// Returns `false` only when the subscriber has been dropped.
+    pub fn publish(&self, wave: RdpsndServerMessage) -> bool {
+        match self.latest.lock() {
+            Ok(mut slot) => *slot = Some(wave),
+            Err(_) => return false,
+        }
+        match self.notify.try_send(()) {
+            Ok(()) => true,
+            // Already pending: subscriber will see the overwritten slot.
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+}
+
+impl WaveSubscriber {
+    /// Waits until a Wave is published, then takes the newest one.
+    pub async fn recv(&mut self) -> Option<RdpsndServerMessage> {
+        self.notify.recv().await?;
+        self.take_latest()
+    }
+
+    /// Non-blocking take of the newest Wave, if any.
+    pub fn take_latest(&self) -> Option<RdpsndServerMessage> {
+        self.latest.lock().ok().and_then(|mut slot| slot.take())
+    }
 }
 
 pub trait RdpsndServerHandler: Send + core::fmt::Debug {
@@ -32,14 +98,11 @@ pub trait RdpsndServerHandler: Send + core::fmt::Debug {
     fn stop(&mut self);
 }
 
-/// Builds a per-connection audio backend. The outgoing-message `sender` is
+/// Builds a per-connection audio backend. The outgoing-message publisher is
 /// supplied by the server for that connection so concurrent sessions each
 /// get an independent channel.
 pub trait SoundServerFactory: Send + Sync {
-    fn build_backend(
-        &self,
-        sender: tokio::sync::mpsc::UnboundedSender<RdpsndServerMessage>,
-    ) -> Box<dyn RdpsndServerHandler>;
+    fn build_backend(&self, publisher: WavePublisher) -> Box<dyn RdpsndServerHandler>;
 }
 
 enum State {
@@ -316,5 +379,19 @@ mod tests {
             "expected multiple SVC chunks, got {}",
             wave_frames.len()
         );
+    }
+
+    #[test]
+    fn wave_channel_overwrites_unread_samples() {
+        let (tx, rx) = super::wave_channel();
+        assert!(tx.publish(RdpsndServerMessage::Wave(vec![1], 0)));
+        assert!(tx.publish(RdpsndServerMessage::Wave(vec![9], 99)));
+        match rx.take_latest() {
+            Some(RdpsndServerMessage::Wave(pcm, ts)) => {
+                assert_eq!(pcm, vec![9]);
+                assert_eq!(ts, 99);
+            }
+            other => panic!("expected overwritten wave, got {other:?}"),
+        }
     }
 }

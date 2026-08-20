@@ -17,7 +17,9 @@ use rdpcore_rdpdr::{DriveConsumerFactory, RdpdrChannel};
 use rdpcore_rdpeai::{AudioInputBackendFactory, AudioInputHandler};
 #[cfg(feature = "gfx")]
 use rdpcore_rdpegfx::{GfxSession, select_h264_encoder};
-use rdpcore_rdpsnd::{RdpsndChannel, RdpsndServerMessage, SoundServerFactory};
+use rdpcore_rdpsnd::{
+    RdpsndChannel, RdpsndServerMessage, SoundServerFactory, WaveSubscriber, wave_channel,
+};
 use rdpcore_transport::{ChannelKey, ConnectionWriter, Frame, FrameSender, Priority};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -479,7 +481,7 @@ impl Session {
         let mut rdpsnd_audio_rx = None;
         let mut rdpsnd = match (rdpsnd_channel_id, &self.sound_factory) {
             (Some(channel_id), Some(factory)) => {
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let (tx, rx) = wave_channel();
                 let (channel, initial) = RdpsndChannel::new(
                     channel_id,
                     accepted.user_channel_id,
@@ -939,6 +941,13 @@ impl Session {
                             {
                                 return Ok(());
                             }
+                            // GFX encode can stall this task; push the newest
+                            // Wave immediately so A/V lag cannot accumulate.
+                            flush_latest_wave(
+                                &mut rdpsnd_audio_rx,
+                                rdpsnd.as_mut(),
+                                &frame_sender,
+                            );
                         }
                         Ok(Some(DisplayUpdate::Resized(size))) if resizing => {
                             debug!("dropping resize to {}x{}: a previous resize is still in flight", size.width, size.height);
@@ -966,7 +975,7 @@ impl Session {
                         Ok(None) => return Ok(()),
                     }
                 }
-                wave = recv_optional(&mut rdpsnd_audio_rx) => {
+                wave = recv_optional_wave(&mut rdpsnd_audio_rx) => {
                     let Some(RdpsndServerMessage::Wave(pcm, timestamp_ms)) = wave else { continue };
                     if let Some(channel) = rdpsnd.as_mut() {
                         let channel_id = channel.channel_id();
@@ -1175,6 +1184,39 @@ async fn recv_optional<T>(rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<T
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+async fn recv_optional_wave(
+    rx: &mut Option<WaveSubscriber>,
+) -> Option<RdpsndServerMessage> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn flush_latest_wave(
+    rx: &mut Option<WaveSubscriber>,
+    rdpsnd: Option<&mut RdpsndChannel>,
+    frame_sender: &rdpcore_transport::FrameSender,
+) {
+    let Some(rx) = rx.as_mut() else {
+        return;
+    };
+    let Some(RdpsndServerMessage::Wave(pcm, timestamp_ms)) = rx.take_latest() else {
+        return;
+    };
+    let Some(channel) = rdpsnd else {
+        return;
+    };
+    let channel_id = channel.channel_id();
+    for bytes in channel.encode_wave(pcm, timestamp_ms) {
+        let _ = frame_sender.send(Frame {
+            channel: ChannelKey::Static(channel_id),
+            priority: Priority::Latency,
+            bytes,
+        });
     }
 }
 
