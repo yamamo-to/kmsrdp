@@ -52,7 +52,7 @@ impl<'a> ReadCursor<'a> {
     }
 
     pub fn advance(&mut self, n: usize) {
-        self.pos += n;
+        self.pos = self.pos.saturating_add(n).min(self.buf.len());
     }
 
     pub fn peek_u16_be(&self) -> Result<u16, NotEnoughBytes> {

@@ -107,6 +107,9 @@ pub struct CliprdrChannel {
     incoming_buffer: Vec<u8>,
 }
 
+/// Maximum allowed size for a cliprdr channel message (16 MB).
+pub const MAX_CLIPRDR_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
 impl CliprdrChannel {
     /// Returns the channel plus the initial Capabilities + Monitor Ready
     /// frames the caller should send immediately, in order - the server
@@ -144,6 +147,13 @@ impl CliprdrChannel {
         let (_total_length, flags, chunk_body) = svc::dechunkify(payload)?;
         if flags & svc::CHANNEL_FLAG_FIRST != 0 {
             self.incoming_buffer.clear();
+        }
+        if self.incoming_buffer.len().saturating_add(chunk_body.len()) > MAX_CLIPRDR_MESSAGE_SIZE {
+            self.incoming_buffer.clear();
+            return Err(DecodeError::InvalidValue {
+                field: "cliprdr.incoming_buffer",
+                reason: "clipboard payload exceeded maximum allowed size",
+            });
         }
         self.incoming_buffer.extend_from_slice(chunk_body);
         if flags & svc::CHANNEL_FLAG_LAST == 0 {
@@ -303,5 +313,18 @@ mod tests {
             FormatDataResponse::new_unicode_string("hello"),
         ));
         assert_eq!(response_wire.len(), 1);
+    }
+
+    #[test]
+    fn rejects_oversized_payload() {
+        let (mut channel, _) =
+            CliprdrChannel::new(1004, 1002, Box::new(FakeBackend::default()));
+        // Craft an SVC chunk declaring FLAG_FIRST with a payload exceeding 16 MB
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&(MAX_CLIPRDR_MESSAGE_SIZE as u32 + 10).to_le_bytes()); // total_length
+        raw.extend_from_slice(&svc::CHANNEL_FLAG_FIRST.to_le_bytes()); // flags
+        raw.resize(8 + MAX_CLIPRDR_MESSAGE_SIZE + 1, 0x41);
+        let result = channel.on_channel_data(&raw);
+        assert!(matches!(result, Err(DecodeError::InvalidValue { field, .. }) if field == "cliprdr.incoming_buffer"));
     }
 }

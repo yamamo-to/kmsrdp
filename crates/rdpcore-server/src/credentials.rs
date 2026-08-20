@@ -3,11 +3,21 @@
 //! construction (`ExactMatchCredentialValidator::new(Credentials { .. })`)
 //! ports unchanged.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Credentials {
     pub username: String,
     pub password: String,
     pub domain: Option<String>,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("domain", &self.domain)
+            .finish()
+    }
 }
 
 pub trait CredentialValidator: Send + Sync {
@@ -103,5 +113,17 @@ mod tests {
     fn rejects_wrong_password() {
         let v = validator("kmsrdp", "hunter2");
         assert!(!v.validate("kmsrdp", "wrong", ""));
+    }
+
+    #[test]
+    fn credentials_debug_redacts_password() {
+        let creds = Credentials {
+            username: "admin".to_string(),
+            password: "super_secret_password".to_string(),
+            domain: Some("DOMAIN".to_string()),
+        };
+        let formatted = format!("{creds:?}");
+        assert!(!formatted.contains("super_secret_password"));
+        assert!(formatted.contains("[REDACTED]"));
     }
 }

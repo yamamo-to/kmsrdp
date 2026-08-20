@@ -309,7 +309,7 @@ impl Session {
         };
 
         // NLA: CredSSP runs on the TLS stream before MCS Connect Initial.
-        let mut nla_authenticated = false;
+        let mut nla_authenticated_user: Option<String> = None;
         if acceptor.requires_credssp() {
             let Some(credentials) = self.nla_credentials.clone() else {
                 info!("client requested NLA but server has no NLA credentials configured");
@@ -330,7 +330,7 @@ impl Session {
             {
                 Ok(user) => {
                     info!("CredSSP succeeded for user {user:?}");
-                    nla_authenticated = true;
+                    nla_authenticated_user = Some(user);
                 }
                 Err(e) => {
                     warn!("CredSSP failed: {e}");
@@ -369,13 +369,28 @@ impl Session {
                 }
                 AcceptorEvent::ClientInfoReceived(credentials) => {
                     info!(
-                        "client info user={:?} domain={:?} (nla={nla_authenticated})",
-                        credentials.username, credentials.domain
+                        "client info user={:?} domain={:?} (nla={})",
+                        credentials.username,
+                        credentials.domain,
+                        nla_authenticated_user.is_some()
                     );
-                    let valid = if nla_authenticated {
+                    let valid = if let Some(nla_user) = &nla_authenticated_user {
                         // mstsc often sends an empty password after NLA; the
-                        // CredSSP exchange already proved the account.
-                        true
+                        // CredSSP exchange already proved the account. If the client
+                        // specifies a username, it must match the authenticated user.
+                        let (_, client_user) = crate::credentials::normalize_client_identity(
+                            &credentials.username,
+                            &credentials.domain,
+                        );
+                        if !client_user.is_empty() && !client_user.eq_ignore_ascii_case(nla_user) {
+                            warn!(
+                                "ClientInfo username {:?} does not match NLA authenticated user {:?}",
+                                credentials.username, nla_user
+                            );
+                            false
+                        } else {
+                            true
+                        }
                     } else {
                         match &self.credential_validator {
                             Some(validator) => validator.validate(

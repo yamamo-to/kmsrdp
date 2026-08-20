@@ -171,6 +171,9 @@ pub struct RdpdrChannel {
     incoming_buffer: Vec<u8>,
 }
 
+/// Maximum allowed size for an rdpdr channel message (16 MB).
+pub const MAX_RDPDR_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
 impl RdpdrChannel {
     /// `supported` is an OR of `pdu::RDPDR_DTYP_*` (e.g. just
     /// `RDPDR_DTYP_FILESYSTEM`, or also `| RDPDR_DTYP_PRINT`). Returns the
@@ -225,6 +228,13 @@ impl RdpdrChannel {
         let (_total_length, flags, chunk_body) = svc::dechunkify(payload)?;
         if flags & svc::CHANNEL_FLAG_FIRST != 0 {
             self.incoming_buffer.clear();
+        }
+        if self.incoming_buffer.len().saturating_add(chunk_body.len()) > MAX_RDPDR_MESSAGE_SIZE {
+            self.incoming_buffer.clear();
+            return Err(DecodeError::InvalidValue {
+                field: "rdpdr.incoming_buffer",
+                reason: "RDPDR payload exceeded maximum allowed size",
+            });
         }
         self.incoming_buffer.extend_from_slice(chunk_body);
         if flags & svc::CHANNEL_FLAG_LAST == 0 {
@@ -976,5 +986,22 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, 5);
         assert_eq!(got[0].1, Err(0xC000_0022));
+    }
+
+    #[test]
+    fn rejects_oversized_payload() {
+        let (mut channel, _) = RdpdrChannel::new(
+            1004,
+            1002,
+            pdu::RDPDR_DTYP_FILESYSTEM,
+            Box::new(RecordingConsumer::default()),
+        );
+        // Craft an SVC chunk declaring FLAG_FIRST with a payload exceeding 16 MB
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&(MAX_RDPDR_MESSAGE_SIZE as u32 + 10).to_le_bytes()); // total_length
+        raw.extend_from_slice(&svc::CHANNEL_FLAG_FIRST.to_le_bytes()); // flags
+        raw.resize(8 + MAX_RDPDR_MESSAGE_SIZE + 1, 0x41);
+        let result = channel.on_channel_data(&raw);
+        assert!(matches!(result, Err(DecodeError::InvalidValue { field, .. }) if field == "rdpdr.incoming_buffer"));
     }
 }

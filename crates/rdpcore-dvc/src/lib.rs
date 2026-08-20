@@ -53,6 +53,9 @@ pub struct DvcMux {
     channels: Vec<ChannelSlot>,
 }
 
+/// Maximum reassembled payload size for a dynamic virtual channel (16 MB).
+pub const MAX_DVC_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
 impl DvcMux {
     /// Returns the mux plus the initial Capability Request frame(s) the
     /// caller should send immediately - the server always speaks first on
@@ -117,6 +120,13 @@ impl DvcMux {
         if flags & svc::CHANNEL_FLAG_FIRST != 0 {
             self.svc_incoming.clear();
         }
+        if self.svc_incoming.len().saturating_add(chunk.len()) > MAX_DVC_MESSAGE_SIZE {
+            self.svc_incoming.clear();
+            return Err(DecodeError::InvalidValue {
+                field: "dvc.svc_incoming",
+                reason: "reassembled SVC message exceeded maximum allowed size",
+            });
+        }
         self.svc_incoming.extend_from_slice(chunk);
         if flags & svc::CHANNEL_FLAG_LAST == 0 {
             return Ok(Vec::new()); // wait for the rest of this drdynvc-level message
@@ -178,6 +188,12 @@ impl DvcMux {
             };
             let complete = match starts_new {
                 Some(total_length) => {
+                    if total_length as usize > MAX_DVC_MESSAGE_SIZE {
+                        return Err(DecodeError::InvalidValue {
+                            field: "dvc.data_first.total_length",
+                            reason: "DataFirst declared total length exceeds maximum allowed size",
+                        });
+                    }
                     if data.len() as u32 >= total_length {
                         Some(data)
                     } else {
@@ -187,6 +203,12 @@ impl DvcMux {
                 }
                 None => match slot.reassembly.take() {
                     Some((total_length, mut buffered)) => {
+                        if buffered.len().saturating_add(data.len()) > MAX_DVC_MESSAGE_SIZE {
+                            return Err(DecodeError::InvalidValue {
+                                field: "dvc.data.buffered",
+                                reason: "accumulated dynamic channel data exceeded maximum allowed size",
+                            });
+                        }
                         buffered.extend(data);
                         if buffered.len() as u32 >= total_length {
                             Some(buffered)
@@ -340,5 +362,22 @@ mod tests {
                 data: b"greetings".to_vec()
             }
         );
+    }
+
+    #[test]
+    fn rejects_oversized_data_first_total_length() {
+        let (mut mux, _) = DvcMux::new(1005, 1002);
+        mux.capability_negotiated = true;
+        let handler = Box::new(RecordingHandler {
+            name: "TEST",
+            ..Default::default()
+        });
+        mux.register_channel(handler);
+
+        // Client sends DataFirst with total_length = 32 MB (> MAX_DVC_MESSAGE_SIZE 16 MB)
+        let data_first_pdu = pdu::encode_data_first(1, 32 * 1024 * 1024, b"head");
+        let wire = svc::chunkify(&data_first_pdu);
+        let result = mux.on_channel_data(&wire[0]);
+        assert!(matches!(result, Err(DecodeError::InvalidValue { field, .. }) if field == "dvc.data_first.total_length"));
     }
 }

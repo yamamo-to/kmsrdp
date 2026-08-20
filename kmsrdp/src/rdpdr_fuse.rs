@@ -1961,8 +1961,9 @@ fn chown_path(path: &Path, uid: u32, gid: u32) {
         return;
     };
     // SAFETY: path is a valid C string we just constructed.
+    // Use lchown so symlinks are never followed (preventing symlink attacks).
     unsafe {
-        let _ = libc::chown(c_path.as_ptr(), uid, gid);
+        let _ = libc::lchown(c_path.as_ptr(), uid, gid);
     }
 }
 

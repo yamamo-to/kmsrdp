@@ -119,14 +119,29 @@ fn resolve_credssp_generator(
     }
 }
 
+/// Maximum allowed size for a CredSSP TSRequest PDU (64 KB).
+const MAX_TS_REQUEST_LEN: usize = 65_536;
+
 async fn read_ts_request<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Result<TsRequest> {
     let mut buf = Vec::with_capacity(256);
     let total = loop {
         let mut byte = [0u8; 1];
         stream.read_exact(&mut byte).await?;
         buf.push(byte[0]);
+        if buf.len() > MAX_TS_REQUEST_LEN {
+            anyhow::bail!(
+                "CredSSP TSRequest exceeded maximum allowed size ({MAX_TS_REQUEST_LEN} bytes)"
+            );
+        }
         match TsRequest::read_length(&buf[..]) {
-            Ok(len) => break len,
+            Ok(len) => {
+                if len > MAX_TS_REQUEST_LEN {
+                    anyhow::bail!(
+                        "CredSSP TSRequest declared length {len} exceeds maximum allowed size ({MAX_TS_REQUEST_LEN} bytes)"
+                    );
+                }
+                break len;
+            }
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => continue,
             Err(e) => {
                 return Err(anyhow::anyhow!("CredSSP TSRequest length: {e}"));

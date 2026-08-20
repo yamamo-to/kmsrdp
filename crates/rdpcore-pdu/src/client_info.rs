@@ -156,6 +156,7 @@ impl ClientInfo {
 /// the 2-byte NUL terminator that's still on the wire after it.
 fn read_string_body(cursor: &mut ReadCursor<'_>, len: usize) -> Result<String, DecodeError> {
     let s = decode_units(cursor.read_slice(len)?);
+    cursor.ensure(2).map_err(DecodeError::NotEnoughBytes)?;
     cursor.advance(2); // NUL terminator, not part of `len`
     Ok(s)
 }
@@ -297,5 +298,21 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn rejects_truncated_client_info_without_nul_terminator() {
+        let pdu = ClientInfoPdu {
+            info: ClientInfo {
+                flags: ClientInfoFlags::UNICODE,
+                username: "user".to_owned(),
+                ..Default::default()
+            },
+        };
+        let mut encoded = pdu.encode();
+        // Truncate the buffer so the trailing 2-byte NUL terminator of the string is cut off
+        encoded.truncate(encoded.len() - 10);
+        let result = ClientInfoPdu::decode(&encoded);
+        assert!(result.is_err());
     }
 }
