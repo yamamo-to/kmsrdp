@@ -1,3 +1,11 @@
+kmsrdp (0.1.41) unstable; urgency=medium
+
+  * Keep RDPSND realtime with latest-wins Wave handoff.
+  * Overwrite unread PCM when GFX encode stalls the session loop.
+  * Flush newest audio immediately after each display frame.
+
+ -- kmsrdp contributors <noreply@example.com>  Fri, 21 Aug 2026 02:28:00 +0900
+
 kmsrdp (0.1.40) unstable; urgency=medium
 
   * Security and privacy hardening release.

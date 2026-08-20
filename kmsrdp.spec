@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.40
+Version:        0.1.41
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,11 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Fri Aug 21 2026 kmsrdp contributors <noreply@example.com> - 0.1.41-1
+- Keep RDPSND realtime with latest-wins Wave handoff
+- Overwrite unread PCM when GFX encode stalls the session loop
+- Flush newest audio immediately after each display frame
+
 * Thu Aug 20 2026 kmsrdp contributors <noreply@example.com> - 0.1.40-1
 - Security and privacy hardening release
 - Constant-time password validation using subtle::ConstantTimeEq
