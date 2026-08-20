@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.39
+Version:        0.1.40
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,13 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Thu Aug 20 2026 kmsrdp contributors <noreply@example.com> - 0.1.40-1
+- Security and privacy hardening release
+- Constant-time password validation using subtle::ConstantTimeEq
+- Add configurable NLA enforcement (KMSRDP_REQUIRE_NLA / KMSRDP_FORCE_NLA)
+- Add granular clipboard synchronization policies (KMSRDP_CLIPBOARD)
+- Harden TLS private key creation with random nonce and O_EXCL
+
 * Thu Aug 20 2026 kmsrdp contributors <noreply@example.com> - 0.1.39-1
 - Constant-time password validation using subtle::ConstantTimeEq
 - Add configurable NLA enforcement (KMSRDP_REQUIRE_NLA / KMSRDP_FORCE_NLA)

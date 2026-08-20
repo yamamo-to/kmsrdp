@@ -1,3 +1,13 @@
+kmsrdp (0.1.40) unstable; urgency=medium
+
+  * Security and privacy hardening release.
+  * Constant-time password validation using subtle::ConstantTimeEq.
+  * Add configurable NLA enforcement (KMSRDP_REQUIRE_NLA / KMSRDP_FORCE_NLA).
+  * Add granular clipboard synchronization policies (KMSRDP_CLIPBOARD).
+  * Harden TLS private key creation with random nonce and O_EXCL.
+
+ -- kmsrdp contributors <noreply@example.com>  Thu, 20 Aug 2026 21:55:00 +0900
+
 kmsrdp (0.1.39) unstable; urgency=medium
 
   * Constant-time password validation using subtle::ConstantTimeEq.
