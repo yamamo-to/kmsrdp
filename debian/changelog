@@ -1,3 +1,10 @@
+kmsrdp (0.1.43) unstable; urgency=medium
+
+  * Drain stale PulseAudio/PipeWire capture buffer to prevent audio lag accumulation.
+  * Use monotonic real-time timestamps in RDPSND Wave2 frames.
+
+ -- kmsrdp contributors <noreply@example.com>  Fri, 21 Aug 2026 04:40:00 +0900
+
 kmsrdp (0.1.42) unstable; urgency=medium
 
   * Keep RDPSND live with a single latest-wins Wave slot.

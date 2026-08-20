@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.42"
+Version:        0.1.43
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,10 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Fri Aug 21 2026 kmsrdp contributors <noreply@example.com> - 0.1.43-1
+- Drain stale PulseAudio/PipeWire capture buffer to prevent audio lag accumulation
+- Use monotonic real-time timestamps in RDPSND Wave2 frames
+
 * Fri Aug 21 2026 kmsrdp contributors <noreply@example.com> - 0.1.42-1
 - Keep RDPSND live with a single latest-wins Wave slot
 - Drop late PCM instead of streaming Pulse/FIFO backlog to the client

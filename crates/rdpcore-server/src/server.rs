@@ -1184,9 +1184,7 @@ async fn recv_optional<T>(rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<T
     }
 }
 
-async fn recv_optional_wave(
-    rx: &mut Option<WaveSubscriber>,
-) -> Option<RdpsndServerMessage> {
+async fn recv_optional_wave(rx: &mut Option<WaveSubscriber>) -> Option<RdpsndServerMessage> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
