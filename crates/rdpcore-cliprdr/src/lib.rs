@@ -317,14 +317,15 @@ mod tests {
 
     #[test]
     fn rejects_oversized_payload() {
-        let (mut channel, _) =
-            CliprdrChannel::new(1004, 1002, Box::new(FakeBackend::default()));
+        let (mut channel, _) = CliprdrChannel::new(1004, 1002, Box::new(FakeBackend::default()));
         // Craft an SVC chunk declaring FLAG_FIRST with a payload exceeding 16 MB
         let mut raw = Vec::new();
         raw.extend_from_slice(&(MAX_CLIPRDR_MESSAGE_SIZE as u32 + 10).to_le_bytes()); // total_length
         raw.extend_from_slice(&svc::CHANNEL_FLAG_FIRST.to_le_bytes()); // flags
         raw.resize(8 + MAX_CLIPRDR_MESSAGE_SIZE + 1, 0x41);
         let result = channel.on_channel_data(&raw);
-        assert!(matches!(result, Err(DecodeError::InvalidValue { field, .. }) if field == "cliprdr.incoming_buffer"));
+        assert!(
+            matches!(result, Err(DecodeError::InvalidValue { field, .. }) if field == "cliprdr.incoming_buffer")
+        );
     }
 }

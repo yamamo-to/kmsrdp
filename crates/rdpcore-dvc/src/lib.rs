@@ -378,6 +378,8 @@ mod tests {
         let data_first_pdu = pdu::encode_data_first(1, 32 * 1024 * 1024, b"head");
         let wire = svc::chunkify(&data_first_pdu);
         let result = mux.on_channel_data(&wire[0]);
-        assert!(matches!(result, Err(DecodeError::InvalidValue { field, .. }) if field == "dvc.data_first.total_length"));
+        assert!(
+            matches!(result, Err(DecodeError::InvalidValue { field, .. }) if field == "dvc.data_first.total_length")
+        );
     }
 }

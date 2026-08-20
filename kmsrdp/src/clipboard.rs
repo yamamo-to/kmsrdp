@@ -191,9 +191,9 @@ impl CliprdrBackend for LocalClipboardBackend {
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
         if !self.mode.allows_host_to_client() {
-            let _ = self
-                .sender
-                .send(ClipboardMessage::SendFormatData(FormatDataResponse::new_error()));
+            let _ = self.sender.send(ClipboardMessage::SendFormatData(
+                FormatDataResponse::new_error(),
+            ));
             return;
         }
         let response = if request.format == CF_UNICODETEXT {

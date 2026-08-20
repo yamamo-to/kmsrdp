@@ -279,8 +279,8 @@ impl Session {
     async fn handle_connection(&self, mut tcp: TcpStream) -> anyhow::Result<()> {
         let peer = tcp.peer_addr()?;
         let desktop = self.display.size().await;
-        let mut acceptor = Acceptor::new(desktop.width, desktop.height)
-            .with_require_nla(self.require_nla);
+        let mut acceptor =
+            Acceptor::new(desktop.width, desktop.height).with_require_nla(self.require_nla);
 
         // Connection Request/Confirm is always cleartext, even under
         // PROTOCOL_SSL / PROTOCOL_HYBRID - the TLS handshake only starts

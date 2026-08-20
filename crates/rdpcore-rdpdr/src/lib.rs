@@ -1002,6 +1002,8 @@ mod tests {
         raw.extend_from_slice(&svc::CHANNEL_FLAG_FIRST.to_le_bytes()); // flags
         raw.resize(8 + MAX_RDPDR_MESSAGE_SIZE + 1, 0x41);
         let result = channel.on_channel_data(&raw);
-        assert!(matches!(result, Err(DecodeError::InvalidValue { field, .. }) if field == "rdpdr.incoming_buffer"));
+        assert!(
+            matches!(result, Err(DecodeError::InvalidValue { field, .. }) if field == "rdpdr.incoming_buffer")
+        );
     }
 }
