@@ -40,15 +40,33 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
   `KMSRDP_LOG_FORMAT=json`); priority-aware writes so audio is not starved
   by graphics
 
+## Requirements
+
+kmsrdp captures an **already active DRM/KMS scanout** (a bound CRTC with a
+framebuffer). It does **not** create a virtual desktop.
+
+- **Needed:** a connected display (physical monitor, HDMI/DP dongle, or a
+  virtual GPU head such as VirtIO-GPU/QXL) that the kernel has modeset.
+  A text console (fbcon) is enough; a full GUI session is **not** required
+  for capture itself.
+- **Not enough:** SSH-only / headless with no active connector — startup
+  fails with “no usable card/connector/CRTC”.
+- **After unplug:** the service usually keeps running, but capture stops
+  (clients freeze or go black) until a display is modeset again.
+- **Optional for extras:** a logind graphical or `startx` session supplies
+  `DISPLAY` / `XDG_RUNTIME_DIR` for clipboard, Pulse audio, drive mounts,
+  and X11 CJK IME. Without it, remote view/input of the console still work;
+  those extras do not.
+
 ## Limitations
 
 - Concurrent clients share one (possibly composited) desktop and one input device
 - Not true per-monitor RDP windows — multi-head is one virtual desktop canvas
 - Framebuffers: single-plane XRGB8888/ARGB8888 only (tiled modifiers are
   detiled via GBM/EGL when needed)
-- Startup fails hard if the first frame cannot be captured (no CRTC / NvFBC);
-  later capture drops are logged with hints (rate-limited) instead of a silent
-  black client
+- Startup fails hard if the first frame cannot be captured (no active CRTC /
+  connected display, and NvFBC unavailable); later capture drops are logged
+  with hints (rate-limited) instead of exiting
 - Drive FUSE: no printer/CUPS yet; `chmod`/`chown` are local FUSE metadata only
 - CJK IME needs X11 (XTest); not available on Wayland-only sessions. `startx`
   on a tty session is detected automatically (`DISPLAY` / `XAUTHORITY` from
