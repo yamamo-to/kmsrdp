@@ -175,7 +175,7 @@ pub fn encode_wave2(format_no: u16, block_no: u8, timestamp_ms: u32, data: &[u8]
     let body_len = 12 + data.len();
     let mut out = Vec::with_capacity(body_len + 4);
     write_header(&mut out, SNDC_WAVE2, body_len);
-    out.write_u16_le(0); // wTimeStamp (legacy, unused)
+    out.write_u16_le(0); // wTimeStamp (legacy, unused in Wave2)
     out.write_u16_le(format_no);
     out.write_u8(block_no);
     out.write_slice(&[0u8; 3]); // padding

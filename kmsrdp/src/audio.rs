@@ -6,8 +6,7 @@
 //! Capture publishes into a latest-wins slot ([`WavePublisher`]). When the
 //! session loop stalls (e.g. synchronous GFX encode during video), older
 //! PCM is overwritten instead of queued, so A/V lag cannot accumulate.
-//! Pulse/PipeWire `fragsize`/`maxlength` are still kept small (~20–80 ms)
-//! so the monitor source itself does not add multi-second buffering.
+//! Dropouts under load are the intended trade for live remote-desktop audio.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,12 +26,8 @@ const SAMPLE_RATE: u32 = 48000;
 const CHANNELS: u16 = 2;
 const BITS_PER_SAMPLE: u16 = 16;
 const BLOCK_ALIGN: u16 = CHANNELS * (BITS_PER_SAMPLE / 8);
-// 20ms chunks: small enough to feel live, large enough not to spam the channel.
 const CHUNK_MS: u32 = 20;
 const CHUNK_BYTES: usize = (SAMPLE_RATE * BLOCK_ALIGN as u32 / 1000 * CHUNK_MS) as usize;
-/// Cap Pulse monitor buffering to a few chunks (matches former queue depth).
-const PULSE_MAX_CHUNKS: usize = 4;
-/// PulseAudio monitor source for the default playback sink.
 const MONITOR_SOURCE: &str = "@DEFAULT_MONITOR@";
 
 fn pcm_format() -> AudioFormat {
@@ -49,13 +44,12 @@ fn capture_spec() -> Spec {
 
 /// Low-latency record attributes for monitor capture.
 ///
-/// Passing `None` to `Simple::new` leaves PulseAudio/PipeWire defaults, and
-/// `fragsize` defaults to roughly **2 seconds** of audio — which shows up as
-/// multi-second A/V lag on clients such as macOS Windows App. Match the
-/// fragment size to our 20 ms wave chunks and cap the buffer to a few chunks.
+/// `fragsize` is the target latency (~20 ms). Other fields stay at
+/// `u32::MAX` ("server default") so they do not fight Pulse's
+/// `ADJUST_LATENCY`, which `pa_simple` enables on its own.
 fn capture_buffer_attr() -> BufferAttr {
     BufferAttr {
-        maxlength: (CHUNK_BYTES * PULSE_MAX_CHUNKS) as u32,
+        maxlength: u32::MAX,
         tlength: u32::MAX,
         prebuf: u32::MAX,
         minreq: u32::MAX,
@@ -63,7 +57,21 @@ fn capture_buffer_attr() -> BufferAttr {
     }
 }
 
-/// Stateless factory: each connection gets its own backend and publisher.
+/// Hint PipeWire/Pulse toward ~20 ms before any client library connects.
+/// Safe to call more than once; does not override an explicit user value.
+pub fn hint_low_latency_audio() {
+    if std::env::var_os("PIPEWIRE_LATENCY").is_none() {
+        unsafe {
+            std::env::set_var("PIPEWIRE_LATENCY", "960/48000");
+        }
+    }
+    if std::env::var_os("PULSE_LATENCY_MSEC").is_none() {
+        unsafe {
+            std::env::set_var("PULSE_LATENCY_MSEC", "20");
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct LocalAudioFactory;
 
@@ -88,8 +96,6 @@ struct LocalAudioHandler {
     publisher: WavePublisher,
     formats: Vec<AudioFormat>,
     stop: Arc<AtomicBool>,
-    /// Joined in [`Self::stop`] so renegotiation / disconnect cannot leave
-    /// orphaned capture threads (visible as growing `Threads:` in `/proc`).
     capture: Option<JoinHandle<()>>,
 }
 
@@ -108,9 +114,11 @@ impl Drop for LocalAudioHandler {
 fn run_capture(publisher: WavePublisher, stop: Arc<AtomicBool>) {
     let spec = capture_spec();
     if !spec.is_valid() {
-        tracing::warn!("kmsrdp: invalid PulseAudio capture spec");
+        tracing::warn!("kmsrdp: invalid PulseAudio capture spec: {spec:?}");
         return;
     }
+
+    hint_low_latency_audio();
 
     let attr = capture_buffer_attr();
     let simple = match psimple::Simple::new(
@@ -130,16 +138,19 @@ fn run_capture(publisher: WavePublisher, stop: Arc<AtomicBool>) {
         }
     };
 
+    if let Ok(lat) = simple.get_latency() {
+        tracing::info!("kmsrdp: RDPSND pulse record latency: {lat:?}");
+    }
+
     let mut buf = [0u8; CHUNK_BYTES];
     let mut timestamp_ms: u32 = 0;
+
     while !stop.load(Ordering::Acquire) {
         match simple.read(&mut buf) {
             Ok(()) => {
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
-                // Overwrite any unread Wave so the session always sees the
-                // newest PCM after a GFX stall (never a FIFO of late audio).
                 if !publisher.publish(RdpsndServerMessage::Wave(buf.to_vec(), timestamp_ms)) {
                     break;
                 }
@@ -163,8 +174,6 @@ impl RdpsndServerHandler for LocalAudioHandler {
     }
 
     fn start(&mut self, _format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
-        // Guacamole (and some clients) can renegotiate / restart the wave
-        // stream; never leave a previous capture thread running.
         self.stop();
         self.stop.store(false, Ordering::Release);
         let publisher = self.publisher.clone();
@@ -188,12 +197,7 @@ mod tests {
 
     #[test]
     fn chunk_byte_size_matches_twenty_ms_pcm() {
-        // 48000 Hz * 4 bytes/frame / 1000 ms * 20 ms
         assert_eq!(CHUNK_BYTES, 3840);
-    }
-
-    #[test]
-    fn capture_spec_is_valid_pcm() {
         let spec = capture_spec();
         assert!(spec.is_valid());
         assert_eq!(spec.format, Format::S16NE);
@@ -202,22 +206,22 @@ mod tests {
     }
 
     #[test]
-    fn capture_buffer_attr_targets_twenty_ms_fragments() {
+    fn capture_buffer_attr_sets_fragsize_to_one_chunk() {
         let attr = capture_buffer_attr();
         assert_eq!(attr.fragsize, CHUNK_BYTES as u32);
-        assert_eq!(attr.maxlength, (CHUNK_BYTES * PULSE_MAX_CHUNKS) as u32);
+        assert_eq!(attr.maxlength, u32::MAX);
     }
 
     #[test]
-    fn handler_advertises_stereo_pcm_48khz() {
+    fn handler_advertises_stereo_pcm_formats() {
         let factory = LocalAudioFactory::new();
         let (tx, _rx) = wave_channel();
         let handler = factory.build_backend(tx);
         let formats = handler.get_formats();
         assert_eq!(formats.len(), 1);
-        assert_eq!(formats[0].n_samples_per_sec, SAMPLE_RATE);
-        assert_eq!(formats[0].n_channels, CHANNELS);
-        assert_eq!(formats[0].bits_per_sample, BITS_PER_SAMPLE);
+        assert_eq!(formats[0].n_samples_per_sec, 48000);
+        assert_eq!(formats[0].n_channels, 2);
+        assert_eq!(formats[0].bits_per_sample, 16);
     }
 
     #[test]
@@ -225,16 +229,10 @@ mod tests {
         let factory = LocalAudioFactory::new();
         let (tx, _rx) = wave_channel();
         let mut handler = factory.build_backend(tx);
-        let common = vec![
-            NegotiatedFormat {
-                format: AudioFormat::pcm(1, 44100, 16),
-                format_no: 0,
-            },
-            NegotiatedFormat {
-                format: pcm_format(),
-                format_no: 1,
-            },
-        ];
+        let common = vec![NegotiatedFormat {
+            format: AudioFormat::pcm(2, 48000, 16),
+            format_no: 0,
+        }];
         let chosen = handler.choose_format(&common).expect("format");
         assert_eq!(chosen.format_no, 0);
     }

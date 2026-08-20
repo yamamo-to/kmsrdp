@@ -978,10 +978,7 @@ impl Session {
                 wave = recv_optional_wave(&mut rdpsnd_audio_rx) => {
                     let Some(RdpsndServerMessage::Wave(pcm, timestamp_ms)) = wave else { continue };
                     if let Some(channel) = rdpsnd.as_mut() {
-                        let channel_id = channel.channel_id();
-                        for bytes in channel.encode_wave(pcm, timestamp_ms) {
-                            let _ = frame_sender.send(Frame { channel: ChannelKey::Static(channel_id), priority: Priority::Latency, bytes });
-                        }
+                        send_wave_frames(channel, &frame_sender, pcm, timestamp_ms);
                     }
                 }
                 clipboard_event = recv_optional(&mut cliprdr_event_rx) => {
@@ -1196,6 +1193,22 @@ async fn recv_optional_wave(
     }
 }
 
+fn send_wave_frames(
+    channel: &mut RdpsndChannel,
+    frame_sender: &rdpcore_transport::FrameSender,
+    pcm: Vec<u8>,
+    timestamp_ms: u32,
+) {
+    let channel_id = channel.channel_id();
+    for bytes in channel.encode_wave(pcm, timestamp_ms) {
+        let _ = frame_sender.send(Frame {
+            channel: ChannelKey::Static(channel_id),
+            priority: Priority::Latency,
+            bytes,
+        });
+    }
+}
+
 fn flush_latest_wave(
     rx: &mut Option<WaveSubscriber>,
     rdpsnd: Option<&mut RdpsndChannel>,
@@ -1210,14 +1223,7 @@ fn flush_latest_wave(
     let Some(channel) = rdpsnd else {
         return;
     };
-    let channel_id = channel.channel_id();
-    for bytes in channel.encode_wave(pcm, timestamp_ms) {
-        let _ = frame_sender.send(Frame {
-            channel: ChannelKey::Static(channel_id),
-            priority: Priority::Latency,
-            bytes,
-        });
-    }
+    send_wave_frames(channel, frame_sender, pcm, timestamp_ms);
 }
 
 /// Slow-path traffic at steady state: static channels plus IO-channel

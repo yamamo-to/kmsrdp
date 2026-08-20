@@ -117,6 +117,8 @@ impl RdpServerInputHandler for Input {
 #[tokio::main]
 async fn main() -> Result<()> {
     kmsrdp::logging::init();
+    // Before any Pulse/PipeWire client is created (session watcher, capture, …).
+    kmsrdp::audio::hint_low_latency_audio();
 
     // Fail fast on bad env / missing privileges before touching DRM or uinput.
     let addr = listen_addr()?;

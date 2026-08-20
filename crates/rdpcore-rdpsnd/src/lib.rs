@@ -30,9 +30,11 @@ pub enum RdpsndServerMessage {
 
 /// Capture → session handoff that keeps only the newest Wave.
 ///
-/// A FIFO queue (even a short one) replays audio that is already late after
-/// the session loop stalls on GFX encode. Publishers overwrite a single
-/// slot and coalesce wakeups so the consumer always encodes realtime PCM.
+/// A FIFO (even a short one) replays audio that is already late after the
+/// session loop stalls on GFX encode, and will dump a Pulse backlog into
+/// the RDP client's playout buffer. Publishers overwrite a single slot and
+/// coalesce wakeups so the consumer always encodes realtime PCM. Dropouts
+/// under load are the intended trade for live A/V.
 #[derive(Clone)]
 pub struct WavePublisher {
     latest: Arc<std::sync::Mutex<Option<RdpsndServerMessage>>>,
@@ -71,7 +73,6 @@ impl WavePublisher {
         }
         match self.notify.try_send(()) {
             Ok(()) => true,
-            // Already pending: subscriber will see the overwritten slot.
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => true,
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
         }
@@ -81,8 +82,12 @@ impl WavePublisher {
 impl WaveSubscriber {
     /// Waits until a Wave is published, then takes the newest one.
     pub async fn recv(&mut self) -> Option<RdpsndServerMessage> {
-        self.notify.recv().await?;
-        self.take_latest()
+        loop {
+            if let Some(wave) = self.take_latest() {
+                return Some(wave);
+            }
+            self.notify.recv().await?;
+        }
     }
 
     /// Non-blocking take of the newest Wave, if any.
@@ -393,5 +398,6 @@ mod tests {
             }
             other => panic!("expected overwritten wave, got {other:?}"),
         }
+        assert!(rx.take_latest().is_none());
     }
 }
