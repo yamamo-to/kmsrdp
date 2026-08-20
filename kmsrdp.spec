@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.37
+Version:        0.1.38
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,12 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Thu Aug 20 2026 kmsrdp contributors <noreply@example.com> - 0.1.38-1
+- Security fixes: PDU string decoding bounds check, lchown for FUSE mounts
+- Enforce maximum payload limits (CredSSP 64KB, DVC/Cliprdr/RDPDR 16MB)
+- Validate ClientInfo username against NLA CredSSP authenticated identity
+- Mask Credentials passwords in Debug output
+
 * Thu Jul 23 2026 kmsrdp contributors <noreply@example.com> - 0.1.37-1
 - Expand MS-RDPEGFX unit tests (Annex B wire, Caps/session, OpenH264 smoke)
 
