@@ -115,6 +115,29 @@ impl FastPathInputEvent {
     }
 }
 
+/// Frames already-encoded `inner` bytes (input events, or output updates)
+/// behind a single header byte and a PER length - the common tail shared
+/// by `FastPathInput::encode` and `FastPathOutput::encode`. `extra_prefix`
+/// is whatever goes between the length and `inner` (Input's optional
+/// numEvents byte when the low nibble can't hold the count; Output has
+/// none) - only the header byte's value and that prefix differ between
+/// the two callers.
+fn encode_fastpath_frame(header_byte: u8, extra_prefix: &[u8], inner: &[u8]) -> Vec<u8> {
+    let fixed_prefix = 1 + extra_prefix.len() + inner.len();
+    let total = if fixed_prefix < 0x7F {
+        fixed_prefix + 1
+    } else {
+        fixed_prefix + 2
+    };
+
+    let mut out = Vec::with_capacity(total);
+    out.write_u8(header_byte);
+    per::write_length(&mut out, total);
+    out.write_slice(extra_prefix);
+    out.write_slice(inner);
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FastPathInput {
     pub events: Vec<FastPathInputEvent>,
@@ -133,22 +156,10 @@ impl FastPathInput {
         } else {
             (0, true)
         };
+        let count_byte = [count as u8];
+        let extra_prefix: &[u8] = if extra_count_byte { &count_byte } else { &[] };
 
-        let fixed_prefix = 1 + usize::from(extra_count_byte) + events_bytes.len();
-        let total = if fixed_prefix < 0x7F {
-            fixed_prefix + 1
-        } else {
-            fixed_prefix + 2
-        };
-
-        let mut out = Vec::with_capacity(total);
-        out.write_u8(num_events_nibble << 2); // action=0, flags=0
-        per::write_length(&mut out, total);
-        if extra_count_byte {
-            out.write_u8(count as u8);
-        }
-        out.write_slice(&events_bytes);
-        out
+        encode_fastpath_frame(num_events_nibble << 2, extra_prefix, &events_bytes)
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, DecodeError> {
@@ -268,19 +279,7 @@ impl FastPathOutput {
         for update in &self.updates {
             update.encode(&mut inner);
         }
-
-        let fixed_prefix = 1 + inner.len();
-        let total = if fixed_prefix < 0x7F {
-            fixed_prefix + 1
-        } else {
-            fixed_prefix + 2
-        };
-
-        let mut out = Vec::with_capacity(total);
-        out.write_u8(0); // action=0, encryption flags=0
-        per::write_length(&mut out, total);
-        out.write_slice(&inner);
-        out
+        encode_fastpath_frame(0, &[], &inner) // action=0, encryption flags=0
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, DecodeError> {
