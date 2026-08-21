@@ -61,12 +61,21 @@ impl Default for VirtualMicFactory {
 
 impl AudioInputBackendFactory for VirtualMicFactory {
     fn build_backend(&self) -> Box<dyn AudioInputBackend> {
-        Box::new(VirtualMicBackend { tx: None })
+        Box::new(VirtualMicBackend {
+            tx: None,
+            retry_after: None,
+        })
     }
 }
 
+/// Cooldown between reconnect attempts once one fails - without it, a
+/// persistently broken/unavailable Pulse server gets retried at the audio
+/// chunk rate (every ~20ms), a reconnect storm.
+const RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
 struct VirtualMicBackend {
     tx: Option<Sender<Vec<u8>>>,
+    retry_after: Option<std::time::Instant>,
 }
 
 fn current_session_uid() -> Option<u32> {
@@ -133,12 +142,24 @@ fn spawn_writer(format: &AudioFormat) -> Option<Sender<Vec<u8>>> {
 impl AudioInputBackend for VirtualMicBackend {
     fn on_audio_data(&mut self, format: &AudioFormat, data: &[u8]) {
         if self.tx.is_none() {
+            let in_cooldown = self
+                .retry_after
+                .is_some_and(|t| std::time::Instant::now() < t);
+            if in_cooldown {
+                return;
+            }
             self.tx = spawn_writer(format);
+            self.retry_after = if self.tx.is_some() {
+                None
+            } else {
+                Some(std::time::Instant::now() + RECONNECT_BACKOFF)
+            };
         }
         if let Some(tx) = &self.tx
             && tx.send(data.to_vec()).is_err()
         {
-            self.tx = None; // writer thread died - respawn on next chunk
+            self.tx = None; // writer thread died - respawn (after cooldown) on next chunk
+            self.retry_after = Some(std::time::Instant::now() + RECONNECT_BACKOFF);
         }
     }
 }
