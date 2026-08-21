@@ -151,7 +151,10 @@ mod tests {
         let mut cursor = ReadCursor::new(&buf);
         assert!(matches!(
             TpduHeader::decode(&mut cursor, TpduCode::CONNECTION_REQUEST),
-            Err(DecodeError::InvalidValue { field: "tpdu.li", .. })
+            Err(DecodeError::InvalidValue {
+                field: "tpdu.li",
+                ..
+            })
         ));
     }
 

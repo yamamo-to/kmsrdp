@@ -702,10 +702,12 @@ impl Acceptor {
             > MAX_CONFIRM_ACTIVE_LEN
         {
             self.confirm_active_buf.clear();
-            return Err(ConnectorError::Decode(rdpcore_pdu::DecodeError::InvalidValue {
-                field: "confirm_active.reassembly",
-                reason: "exceeded maximum allowed reassembled size",
-            }));
+            return Err(ConnectorError::Decode(
+                rdpcore_pdu::DecodeError::InvalidValue {
+                    field: "confirm_active.reassembly",
+                    reason: "exceeded maximum allowed reassembled size",
+                },
+            ));
         }
         self.confirm_active_buf.extend_from_slice(&send_data.data);
         if !send_data.complete {

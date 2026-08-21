@@ -465,7 +465,11 @@ impl RdpdrChannel {
     /// on the wire (no completion_id allocated, nothing sent) - used when
     /// [`MAX_PENDING_OPS`] is already reached, so the consumer's callback
     /// still fires instead of the command being silently dropped.
-    fn fail_command_without_issuing(&mut self, command: DriveCommand, status: u32) -> Vec<DriveCommand> {
+    fn fail_command_without_issuing(
+        &mut self,
+        command: DriveCommand,
+        status: u32,
+    ) -> Vec<DriveCommand> {
         match command {
             DriveCommand::Create { request_tag, .. } => {
                 self.consumer.on_create_reply(request_tag, Err(status))
@@ -479,12 +483,12 @@ impl RdpdrChannel {
             DriveCommand::Write { request_tag, .. } => {
                 self.consumer.on_write_reply(request_tag, Err(status))
             }
-            DriveCommand::QueryDirectory { request_tag, .. } => {
-                self.consumer.on_query_directory_reply(request_tag, Err(status))
-            }
-            DriveCommand::SetInformation { request_tag, .. } => {
-                self.consumer.on_set_information_reply(request_tag, Err(status))
-            }
+            DriveCommand::QueryDirectory { request_tag, .. } => self
+                .consumer
+                .on_query_directory_reply(request_tag, Err(status)),
+            DriveCommand::SetInformation { request_tag, .. } => self
+                .consumer
+                .on_set_information_reply(request_tag, Err(status)),
         }
     }
 
@@ -506,7 +510,8 @@ impl RdpdrChannel {
                 // real I/O error completion would. A dropped Close in
                 // particular would otherwise leak the handle on the
                 // client for the rest of the session.
-                let follow_up = self.fail_command_without_issuing(command, pdu::STATUS_UNSUCCESSFUL);
+                let follow_up =
+                    self.fail_command_without_issuing(command, pdu::STATUS_UNSUCCESSFUL);
                 queue.extend(follow_up);
                 continue;
             }
@@ -916,7 +921,10 @@ mod tests {
         // CREATE - the consumer must still be told it failed, not left
         // hanging forever.
         send_message(&mut channel, device_list_remove(&[1]));
-        assert_eq!(replies.lock().unwrap().as_slice(), &[(1, Err(pdu::STATUS_UNSUCCESSFUL))]);
+        assert_eq!(
+            replies.lock().unwrap().as_slice(),
+            &[(1, Err(pdu::STATUS_UNSUCCESSFUL))]
+        );
     }
 
     #[test]
@@ -937,7 +945,11 @@ mod tests {
 
         let out = send_message(
             &mut channel,
-            device_list_announce(&[(pdu::RDPDR_DTYP_FILESYSTEM, MAX_DEVICES as u32, "one-too-many")]),
+            device_list_announce(&[(
+                pdu::RDPDR_DTYP_FILESYSTEM,
+                MAX_DEVICES as u32,
+                "one-too-many",
+            )]),
         );
         assert_eq!(out.len(), 1); // rejection reply only, no on_device_ready commands
         assert_eq!(channel.devices().len(), MAX_DEVICES);
@@ -1050,7 +1062,10 @@ mod tests {
         assert!(out.is_empty());
         let got = replies.lock().unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0], (MAX_PENDING_OPS as u64 + 1, Err(pdu::STATUS_UNSUCCESSFUL)));
+        assert_eq!(
+            got[0],
+            (MAX_PENDING_OPS as u64 + 1, Err(pdu::STATUS_UNSUCCESSFUL))
+        );
     }
 
     #[test]

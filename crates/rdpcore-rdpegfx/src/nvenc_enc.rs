@@ -89,9 +89,7 @@ struct Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.encoder.is_null() {
-            if let Err(e) =
-                unsafe { (self.fl.nvenc_destroy_encoder)(self.encoder) }.into_error()
-            {
+            if let Err(e) = unsafe { (self.fl.nvenc_destroy_encoder)(self.encoder) }.into_error() {
                 tracing::warn!("NVENC destroy encoder failed: {e:?}");
             }
             self.encoder = ptr::null_mut();
