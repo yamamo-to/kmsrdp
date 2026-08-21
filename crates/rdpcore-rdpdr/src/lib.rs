@@ -161,6 +161,13 @@ struct PendingOp {
 /// new commands.
 const MAX_PENDING_OPS: usize = 4096;
 
+/// Bounds how many devices a single connection can have announced at
+/// once. Without this, a client repeatedly sending `DeviceListAnnounce`
+/// (each re-invoking `DriveConsumer::on_device_ready`, which may open
+/// files/handles on the consumer side) could grow `devices` without bound
+/// for the life of the connection.
+const MAX_DEVICES: usize = 256;
+
 pub struct RdpdrChannel {
     channel_id: u16,
     user_channel_id: u16,
@@ -275,7 +282,9 @@ impl RdpdrChannel {
             }
             pdu::ClientMessage::DeviceListAnnounce(devices) => {
                 for device in devices {
-                    if self.supported & device.device_type != 0 {
+                    let at_capacity = !self.devices.contains_key(&device.device_id)
+                        && self.devices.len() >= MAX_DEVICES;
+                    if self.supported & device.device_type != 0 && !at_capacity {
                         self.devices.insert(
                             device.device_id,
                             (device.device_type, device.preferred_dos_name.clone()),
@@ -291,6 +300,12 @@ impl RdpdrChannel {
                         );
                         self.encode_commands(commands, &mut out);
                     } else {
+                        if at_capacity {
+                            tracing::warn!(
+                                "rdpdr: rejecting device {} - {MAX_DEVICES} devices already announced",
+                                device.device_id
+                            );
+                        }
                         out.extend(self.wrap(pdu::encode_device_reply(
                             device.device_id,
                             pdu::STATUS_UNSUCCESSFUL,
@@ -299,8 +314,29 @@ impl RdpdrChannel {
                 }
             }
             pdu::ClientMessage::DeviceListRemove(device_ids) => {
-                for device_id in device_ids {
-                    self.devices.remove(&device_id);
+                for device_id in &device_ids {
+                    self.devices.remove(device_id);
+                }
+                // The client will never send a DeviceIoCompletion for a
+                // device it just unplugged - without this, any I/O still
+                // outstanding against it would sit in `pending` forever:
+                // the consumer's callback never fires (a FUSE-style
+                // consumer blocking on that reply would hang), and the
+                // slot stays charged against MAX_PENDING_OPS. Synthesize a
+                // failure completion for each instead.
+                let stale: Vec<u32> = self
+                    .pending
+                    .iter()
+                    .filter(|(_, op)| device_ids.contains(&op.device_id))
+                    .map(|(&completion_id, _)| completion_id)
+                    .collect();
+                for completion_id in stale {
+                    if let Some(pending) = self.pending.remove(&completion_id) {
+                        // Device is gone - any follow-up commands the
+                        // callback returns have nowhere to go, so encode
+                        // nothing for them.
+                        let _ = self.dispatch_completion(pending, pdu::STATUS_UNSUCCESSFUL, &[]);
+                    }
                 }
             }
             pdu::ClientMessage::DeviceIoCompletion {
@@ -421,13 +457,48 @@ impl RdpdrChannel {
         })
     }
 
+    /// Reports a command as failed with `status` without ever issuing it
+    /// on the wire (no completion_id allocated, nothing sent) - used when
+    /// [`MAX_PENDING_OPS`] is already reached, so the consumer's callback
+    /// still fires instead of the command being silently dropped.
+    fn fail_command_without_issuing(&mut self, command: DriveCommand, status: u32) -> Vec<DriveCommand> {
+        match command {
+            DriveCommand::Create { request_tag, .. } => {
+                self.consumer.on_create_reply(request_tag, Err(status))
+            }
+            DriveCommand::Close { request_tag, .. } => {
+                self.consumer.on_close_reply(request_tag, status)
+            }
+            DriveCommand::Read { request_tag, .. } => {
+                self.consumer.on_read_reply(request_tag, Err(status))
+            }
+            DriveCommand::Write { request_tag, .. } => {
+                self.consumer.on_write_reply(request_tag, Err(status))
+            }
+            DriveCommand::QueryDirectory { request_tag, .. } => {
+                self.consumer.on_query_directory_reply(request_tag, Err(status))
+            }
+            DriveCommand::SetInformation { request_tag, .. } => {
+                self.consumer.on_set_information_reply(request_tag, Err(status))
+            }
+        }
+    }
+
     fn encode_commands(&mut self, commands: Vec<DriveCommand>, out: &mut Vec<Vec<u8>>) {
         for command in commands {
             if self.pending.len() >= MAX_PENDING_OPS {
                 tracing::warn!(
-                    "rdpdr: dropping DriveCommand - {MAX_PENDING_OPS} I/O requests already \
-                     outstanding (client not completing I/O?)"
+                    "rdpdr: {MAX_PENDING_OPS} I/O requests already outstanding (client not \
+                     completing I/O?); failing new command instead of issuing it"
                 );
+                // The consumer is still waiting on a reply for this
+                // command (e.g. a FUSE op blocked on it) - fail it
+                // directly rather than silently dropping it, same as a
+                // real I/O error completion would. A dropped Close in
+                // particular would otherwise leak the handle on the
+                // client for the rest of the session.
+                let follow_up = self.fail_command_without_issuing(command, pdu::STATUS_UNSUCCESSFUL);
+                self.encode_commands(follow_up, out);
                 continue;
             }
             let device_id = drive_command_device_id(&command);
@@ -748,6 +819,229 @@ mod tests {
 
         send_message(&mut channel, device_list_remove(&[1]));
         assert!(channel.devices().is_empty());
+    }
+
+    #[test]
+    fn device_list_remove_fails_pending_ops_against_that_device() {
+        type CreateReplies = Arc<Mutex<Vec<(u64, Result<irp::CreateReply, u32>)>>>;
+
+        struct CreateOnReadyConsumer {
+            replies: CreateReplies,
+        }
+        impl DriveConsumer for CreateOnReadyConsumer {
+            fn on_device_ready(
+                &mut self,
+                device_id: u32,
+                _device_type: u32,
+                _dos_name: &str,
+            ) -> Vec<DriveCommand> {
+                vec![DriveCommand::Create {
+                    device_id,
+                    path: "\\".to_owned(),
+                    desired_access: irp::GENERIC_READ,
+                    create_disposition: irp::FILE_OPEN,
+                    create_options: irp::FILE_DIRECTORY_FILE,
+                    request_tag: 1,
+                }]
+            }
+            fn on_create_reply(
+                &mut self,
+                request_tag: u64,
+                result: Result<irp::CreateReply, u32>,
+            ) -> Vec<DriveCommand> {
+                self.replies.lock().unwrap().push((request_tag, result));
+                Vec::new()
+            }
+            fn on_close_reply(&mut self, _request_tag: u64, _status: u32) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_read_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<Vec<u8>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_write_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<u32, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_query_directory_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<Option<irp::DirectoryEntry>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_set_information_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<(), u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+        }
+
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let (mut channel, _initial) = RdpdrChannel::new(
+            1004,
+            1002,
+            pdu::RDPDR_DTYP_FILESYSTEM,
+            Box::new(CreateOnReadyConsumer {
+                replies: Arc::clone(&replies),
+            }),
+        );
+
+        // on_device_ready issues a CREATE, now pending with no completion
+        // sent yet.
+        send_message(
+            &mut channel,
+            device_list_announce(&[(pdu::RDPDR_DTYP_FILESYSTEM, 1, "share")]),
+        );
+        assert!(replies.lock().unwrap().is_empty());
+
+        // The client unplugs the device without ever completing that
+        // CREATE - the consumer must still be told it failed, not left
+        // hanging forever.
+        send_message(&mut channel, device_list_remove(&[1]));
+        assert_eq!(replies.lock().unwrap().as_slice(), &[(1, Err(pdu::STATUS_UNSUCCESSFUL))]);
+    }
+
+    #[test]
+    fn device_announce_beyond_max_devices_is_rejected() {
+        let (mut channel, _initial) = RdpdrChannel::new(
+            1004,
+            1002,
+            pdu::RDPDR_DTYP_FILESYSTEM,
+            Box::new(RecordingConsumer::default()),
+        );
+        for id in 0..MAX_DEVICES as u32 {
+            send_message(
+                &mut channel,
+                device_list_announce(&[(pdu::RDPDR_DTYP_FILESYSTEM, id, "share")]),
+            );
+        }
+        assert_eq!(channel.devices().len(), MAX_DEVICES);
+
+        let out = send_message(
+            &mut channel,
+            device_list_announce(&[(pdu::RDPDR_DTYP_FILESYSTEM, MAX_DEVICES as u32, "one-too-many")]),
+        );
+        assert_eq!(out.len(), 1); // rejection reply only, no on_device_ready commands
+        assert_eq!(channel.devices().len(), MAX_DEVICES);
+        assert!(!channel.devices().contains_key(&(MAX_DEVICES as u32)));
+
+        // Re-announcing an already-registered device at capacity must
+        // still work (it's not a *new* entry).
+        let out = send_message(
+            &mut channel,
+            device_list_announce(&[(pdu::RDPDR_DTYP_FILESYSTEM, 0, "share-again")]),
+        );
+        assert_eq!(out.len(), 1);
+        // The wire DosName field is a fixed 8 bytes, so "share-again" is
+        // truncated to "share-ag" - unrelated to what this test checks.
+        assert_eq!(
+            channel.devices().get(&0),
+            Some(&(pdu::RDPDR_DTYP_FILESYSTEM, "share-ag".to_owned()))
+        );
+    }
+
+    #[test]
+    fn command_beyond_max_pending_ops_fails_instead_of_hanging() {
+        type CreateReplies = Arc<Mutex<Vec<(u64, Result<irp::CreateReply, u32>)>>>;
+
+        struct FloodingConsumer {
+            replies: CreateReplies,
+            next_tag: u64,
+        }
+        impl DriveConsumer for FloodingConsumer {
+            fn on_device_ready(
+                &mut self,
+                _device_id: u32,
+                _device_type: u32,
+                _dos_name: &str,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_create_reply(
+                &mut self,
+                request_tag: u64,
+                result: Result<irp::CreateReply, u32>,
+            ) -> Vec<DriveCommand> {
+                self.replies.lock().unwrap().push((request_tag, result));
+                Vec::new()
+            }
+            fn on_close_reply(&mut self, _request_tag: u64, _status: u32) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_read_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<Vec<u8>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_write_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<u32, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_query_directory_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<Option<irp::DirectoryEntry>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_set_information_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<(), u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn poll_commands(&mut self) -> Vec<DriveCommand> {
+                self.next_tag += 1;
+                vec![DriveCommand::Create {
+                    device_id: 1,
+                    path: "\\".to_owned(),
+                    desired_access: irp::GENERIC_READ,
+                    create_disposition: irp::FILE_OPEN,
+                    create_options: irp::FILE_DIRECTORY_FILE,
+                    request_tag: self.next_tag,
+                }]
+            }
+        }
+
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let (mut channel, _initial) = RdpdrChannel::new(
+            1004,
+            1002,
+            pdu::RDPDR_DTYP_FILESYSTEM,
+            Box::new(FloodingConsumer {
+                replies: Arc::clone(&replies),
+                next_tag: 0,
+            }),
+        );
+
+        for _ in 0..MAX_PENDING_OPS {
+            let out = channel.flush_pending_commands();
+            assert_eq!(out.len(), 1);
+        }
+        assert!(replies.lock().unwrap().is_empty());
+
+        // One more, past the cap: must fail immediately via the
+        // consumer's callback rather than being silently dropped.
+        let out = channel.flush_pending_commands();
+        assert!(out.is_empty());
+        let got = replies.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], (MAX_PENDING_OPS as u64 + 1, Err(pdu::STATUS_UNSUCCESSFUL)));
     }
 
     #[test]
