@@ -537,6 +537,11 @@ struct DrmCapturer {
     cards: Vec<CardCtx>,
     /// Per-head last FB id, keyed by connector name (stable across refresh).
     head_fb: Vec<HeadFbState>,
+    /// Caches each `(card_idx, CRTC)`'s primary-plane handle - see
+    /// `primary_plane_for`'s doc comment for why this is safe to cache
+    /// (unlike the framebuffer attached to it, which is re-checked via
+    /// `fb_handle`/`force_full` on every call regardless).
+    primary_plane_cache: std::collections::HashMap<(usize, crtc::Handle), plane::Handle>,
 }
 
 struct CapturedHead {
@@ -570,7 +575,51 @@ impl DrmCapturer {
                 last_fb: None,
             })
             .collect();
-        Ok(Self { cards, head_fb })
+        Ok(Self {
+            cards,
+            head_fb,
+            primary_plane_cache: std::collections::HashMap::new(),
+        })
+    }
+
+    /// A CRTC's primary-plane assignment is fixed by the driver at
+    /// startup and never changes at runtime (unlike the *framebuffer*
+    /// attached to that plane, which changes every frame and is always
+    /// re-read) - so unlike `refresh_heads`'s connector/CRTC walk (which
+    /// must re-run every tick to notice real hotplug changes), finding
+    /// which plane is a CRTC's primary one is safe to cache. Without
+    /// this, every single capture tick walked every plane on the card
+    /// and queried each one's `type` property (its own `get_properties`
+    /// plus a per-property `get_property` ioctl loop) just to re-derive
+    /// a mapping that was already known. Self-healing: falls back to
+    /// the full walk if the cached handle doesn't validate.
+    fn primary_plane_for(
+        &mut self,
+        card_idx: usize,
+        crtc: crtc::Handle,
+    ) -> io::Result<plane::Info> {
+        let card = &self.cards[card_idx].card;
+        if let Some(&cached) = self.primary_plane_cache.get(&(card_idx, crtc))
+            && let Ok(info) = card.get_plane(cached)
+            && info.crtc() == Some(crtc)
+        {
+            return Ok(info);
+        }
+
+        let (handle, info) = card
+            .plane_handles()?
+            .into_iter()
+            .find_map(|handle| {
+                let info = card.get_plane(handle).ok()?;
+                if info.crtc() != Some(crtc) {
+                    return None;
+                }
+                let ty = plane_type(card, handle).ok()?;
+                (ty == "Primary").then_some((handle, info))
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no primary plane for CRTC"))?;
+        self.primary_plane_cache.insert((card_idx, crtc), handle);
+        Ok(info)
     }
 
     fn capture(&mut self) -> io::Result<RawFrame> {
@@ -615,21 +664,8 @@ impl DrmCapturer {
     }
 
     fn capture_head(&mut self, head: &EnumeratedHead) -> io::Result<CapturedHead> {
+        let plane_info = self.primary_plane_for(head.card_idx, head.crtc)?;
         let card_ctx = &self.cards[head.card_idx];
-        let (plane_handle, plane_info) = card_ctx
-            .card
-            .plane_handles()?
-            .into_iter()
-            .find_map(|handle| {
-                let info = card_ctx.card.get_plane(handle).ok()?;
-                if info.crtc() != Some(head.crtc) {
-                    return None;
-                }
-                let ty = plane_type(&card_ctx.card, handle).ok()?;
-                (ty == "Primary").then_some((handle, info))
-            })
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no primary plane for CRTC"))?;
-        let _ = plane_handle;
 
         let fb_handle = plane_info.framebuffer().ok_or_else(|| {
             io::Error::new(
