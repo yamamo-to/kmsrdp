@@ -53,11 +53,21 @@ const SHARE_ID: u32 = 0x0001_0000;
 /// own fragment reassembly.
 const MAX_CONFIRM_ACTIVE_LEN: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ClientCredentials {
     pub domain: String,
     pub username: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for ClientCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientCredentials")
+            .field("domain", &self.domain)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Everything the caller needs once the connection reaches steady state.
@@ -1134,6 +1144,18 @@ mod tests {
         out.write_u32_le(SHARE_ID);
         out.extend(body);
         out
+    }
+
+    #[test]
+    fn client_credentials_debug_redacts_password() {
+        let creds = ClientCredentials {
+            domain: "DOMAIN".to_owned(),
+            username: "admin".to_owned(),
+            password: "super_secret_password".to_owned(),
+        };
+        let formatted = format!("{creds:?}");
+        assert!(!formatted.contains("super_secret_password"));
+        assert!(formatted.contains("[REDACTED]"));
     }
 
     #[test]
