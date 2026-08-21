@@ -225,7 +225,10 @@ impl Bridge {
     fn submit_close(&self, device_id: u32, file_id: u32) -> Result<(), Errno> {
         let (tx, rx) = mpsc::channel();
         let tag = self.alloc_tag();
-        self.pending.lock().unwrap().insert(tag, Pending::Close(tx));
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tag, Pending::Close(tx));
         self.enqueue(DriveCommand::Close {
             device_id,
             file_id,
@@ -247,7 +250,10 @@ impl Bridge {
     ) -> Result<Vec<u8>, Errno> {
         let (tx, rx) = mpsc::channel();
         let tag = self.alloc_tag();
-        self.pending.lock().unwrap().insert(tag, Pending::Read(tx));
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tag, Pending::Read(tx));
         self.enqueue(DriveCommand::Read {
             device_id,
             file_id,
@@ -271,7 +277,10 @@ impl Bridge {
     ) -> Result<u32, Errno> {
         let (tx, rx) = mpsc::channel();
         let tag = self.alloc_tag();
-        self.pending.lock().unwrap().insert(tag, Pending::Write(tx));
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tag, Pending::Write(tx));
         self.enqueue(DriveCommand::Write {
             device_id,
             file_id,
@@ -477,7 +486,7 @@ impl Bridge {
         uid: Option<u32>,
         gid: Option<u32>,
     ) {
-        let mut meta = self.meta.lock().unwrap();
+        let mut meta = self.meta.lock().unwrap_or_else(|e| e.into_inner());
         let Some(meta) = meta.get_mut(&(device_id, path.to_owned())) else {
             return;
         };
@@ -494,14 +503,14 @@ impl Bridge {
 
     fn ensure_root_ino(&self, device_id: u32) {
         let key = (device_id, "\\".to_owned());
-        let mut path_to_ino = self.path_to_ino.lock().unwrap();
-        let mut ino_to_path = self.ino_to_path.lock().unwrap();
+        let mut path_to_ino = self.path_to_ino.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ino_to_path = self.ino_to_path.lock().unwrap_or_else(|e| e.into_inner());
         if path_to_ino.contains_key(&key) {
             return;
         }
         path_to_ino.insert(key, ROOT_INO);
         ino_to_path.insert((device_id, ROOT_INO), "\\".to_owned());
-        self.meta.lock().unwrap().insert(
+        self.meta.lock().unwrap_or_else(|e| e.into_inner()).insert(
             (device_id, "\\".to_owned()),
             CachedMeta::new(true, self.uid, self.gid),
         );
@@ -509,7 +518,7 @@ impl Bridge {
 
     fn inode_for(&self, device_id: u32, win_path: &str) -> u64 {
         let key = (device_id, win_path.to_owned());
-        let mut path_to_ino = self.path_to_ino.lock().unwrap();
+        let mut path_to_ino = self.path_to_ino.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ino) = path_to_ino.get(&key) {
             return *ino;
         }
@@ -553,7 +562,10 @@ impl Bridge {
             gid: self.gid,
         };
         let _ = self.inode_for(device_id, &path);
-        self.meta.lock().unwrap().insert((device_id, path), meta);
+        self.meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((device_id, path), meta);
     }
 
     fn attr_for(&self, device_id: u32, win_path: &str) -> Option<FileAttr> {
@@ -656,7 +668,10 @@ impl Bridge {
             .unwrap()
             .remove(&(device_id, win_path.to_owned()));
         if let Some(ino) = ino {
-            self.ino_to_path.lock().unwrap().remove(&(device_id, ino));
+            self.ino_to_path
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(device_id, ino));
         }
     }
 
@@ -668,9 +683,9 @@ impl Bridge {
             format!("{old_path}\\")
         };
 
-        let mut path_to_ino = self.path_to_ino.lock().unwrap();
-        let mut ino_to_path = self.ino_to_path.lock().unwrap();
-        let mut meta = self.meta.lock().unwrap();
+        let mut path_to_ino = self.path_to_ino.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ino_to_path = self.ino_to_path.lock().unwrap_or_else(|e| e.into_inner());
+        let mut meta = self.meta.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut remaps: Vec<(String, String, u64)> = Vec::new();
         for ((did, path), ino) in path_to_ino.iter() {
@@ -711,7 +726,7 @@ struct FuseFs {
 
 impl FuseFs {
     fn active(&self) -> (Arc<Bridge>, u32) {
-        let g = self.active.lock().unwrap();
+        let g = self.active.lock().unwrap_or_else(|e| e.into_inner());
         (Arc::clone(&g.bridge), g.device_id)
     }
 }
@@ -774,13 +789,17 @@ impl Filesystem for FuseFs {
         ) {
             Ok(create) => {
                 let fh = bridge.next_fh.fetch_add(1, Ordering::Relaxed);
-                bridge.opens.lock().unwrap().insert(
-                    fh,
-                    OpenHandle {
-                        device_id,
-                        file_id: create.file_id,
-                    },
-                );
+                bridge
+                    .opens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        fh,
+                        OpenHandle {
+                            device_id,
+                            file_id: create.file_id,
+                        },
+                    );
                 reply.opened(FileHandle(fh), FopenFlags::empty());
             }
             Err(e) => reply.error(e),
@@ -800,7 +819,7 @@ impl Filesystem for FuseFs {
             reply.error(Errno::ENOENT);
             return;
         };
-        let opens = bridge.opens.lock().unwrap();
+        let opens = bridge.opens.lock().unwrap_or_else(|e| e.into_inner());
         let Some(handle) = opens.get(&fh.0) else {
             reply.error(Errno::EBADF);
             return;
@@ -869,7 +888,12 @@ impl Filesystem for FuseFs {
         reply: ReplyEmpty,
     ) {
         let (bridge, _device_id) = self.active();
-        if let Some(handle) = bridge.opens.lock().unwrap().remove(&fh.0) {
+        if let Some(handle) = bridge
+            .opens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&fh.0)
+        {
             let _ = bridge.submit_close(handle.device_id, handle.file_id);
         }
         reply.ok();
@@ -904,13 +928,17 @@ impl Filesystem for FuseFs {
         ) {
             Ok(create) => {
                 let fh = bridge.next_fh.fetch_add(1, Ordering::Relaxed);
-                bridge.opens.lock().unwrap().insert(
-                    fh,
-                    OpenHandle {
-                        device_id,
-                        file_id: create.file_id,
-                    },
-                );
+                bridge
+                    .opens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        fh,
+                        OpenHandle {
+                            device_id,
+                            file_id: create.file_id,
+                        },
+                    );
                 reply.opened(FileHandle(fh), FopenFlags::empty());
             }
             Err(e) => reply.error(e),
@@ -929,7 +957,7 @@ impl Filesystem for FuseFs {
         reply: ReplyData,
     ) {
         let (bridge, _device_id) = self.active();
-        let opens = bridge.opens.lock().unwrap();
+        let opens = bridge.opens.lock().unwrap_or_else(|e| e.into_inner());
         let Some(handle) = opens.get(&fh.0) else {
             reply.error(Errno::EBADF);
             return;
@@ -956,7 +984,7 @@ impl Filesystem for FuseFs {
         reply: ReplyWrite,
     ) {
         let (bridge, _device_id) = self.active();
-        let opens = bridge.opens.lock().unwrap();
+        let opens = bridge.opens.lock().unwrap_or_else(|e| e.into_inner());
         let Some(handle) = opens.get(&fh.0) else {
             reply.error(Errno::EBADF);
             return;
@@ -967,7 +995,7 @@ impl Filesystem for FuseFs {
         match bridge.submit_write(device_id, file_id, offset, data.to_vec()) {
             Ok(n) => {
                 if let Some(path) = bridge.path_for(device_id, ino.0) {
-                    let mut meta = bridge.meta.lock().unwrap();
+                    let mut meta = bridge.meta.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(m) = meta.get_mut(&(device_id, path)) {
                         let end = offset.saturating_add(n as u64);
                         if end > m.size {
@@ -993,7 +1021,12 @@ impl Filesystem for FuseFs {
         reply: ReplyEmpty,
     ) {
         let (bridge, _device_id) = self.active();
-        if let Some(handle) = bridge.opens.lock().unwrap().remove(&fh.0) {
+        if let Some(handle) = bridge
+            .opens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&fh.0)
+        {
             let _ = bridge.submit_close(handle.device_id, handle.file_id);
         }
         reply.ok();
@@ -1034,21 +1067,29 @@ impl Filesystem for FuseFs {
         ) {
             Ok(create) => {
                 let mode = (_mode & !_umask) & 0o7777;
-                bridge.meta.lock().unwrap().insert(
-                    (device_id, path.clone()),
-                    CachedMeta::fresh(false, bridge.uid, bridge.gid, mode),
-                );
+                bridge
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        (device_id, path.clone()),
+                        CachedMeta::fresh(false, bridge.uid, bridge.gid, mode),
+                    );
                 let attr = bridge
                     .attr_for(device_id, &path)
                     .expect("meta just inserted");
                 let fh = bridge.next_fh.fetch_add(1, Ordering::Relaxed);
-                bridge.opens.lock().unwrap().insert(
-                    fh,
-                    OpenHandle {
-                        device_id,
-                        file_id: create.file_id,
-                    },
-                );
+                bridge
+                    .opens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        fh,
+                        OpenHandle {
+                            device_id,
+                            file_id: create.file_id,
+                        },
+                    );
                 reply.created(
                     &TTL,
                     &attr,
@@ -1090,10 +1131,14 @@ impl Filesystem for FuseFs {
             Ok(create) => {
                 let _ = bridge.submit_close(device_id, create.file_id);
                 let dir_mode = (mode & !umask) & 0o7777;
-                bridge.meta.lock().unwrap().insert(
-                    (device_id, path.clone()),
-                    CachedMeta::fresh(true, bridge.uid, bridge.gid, dir_mode),
-                );
+                bridge
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        (device_id, path.clone()),
+                        CachedMeta::fresh(true, bridge.uid, bridge.gid, dir_mode),
+                    );
                 match bridge.attr_for(device_id, &path) {
                     Some(attr) => reply.entry(&TTL, &attr, Generation(0)),
                     None => reply.error(Errno::EIO),
@@ -1483,7 +1528,7 @@ impl MountRegistry {
         };
 
         {
-            let mut slots = self.slots.lock().unwrap();
+            let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(slot) = slots.get_mut(&dos_name) {
                 slot.members.insert(conn_id, member);
                 tracing::info!(
@@ -1522,7 +1567,7 @@ impl MountRegistry {
                 }
             };
 
-        let mut slots = self.slots.lock().unwrap();
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = slots.get_mut(&dos_name) {
             // Another connection won the race; discard our mount asynchronously
             // so we do not block this connection's RDP loop.
@@ -1559,7 +1604,7 @@ impl MountRegistry {
     }
 
     fn leave(&self, dos_name: &str, conn_id: u64) {
-        let mut slots = self.slots.lock().unwrap();
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let Some(slot) = slots.get_mut(dos_name) else {
             return;
         };
@@ -1588,8 +1633,13 @@ impl MountRegistry {
             // Clear stale opens from the departing owner's bridge; swap the
             // live backend so FUSE keeps serving without umount/remount.
             {
-                let mut active = slot.active.lock().unwrap();
-                active.bridge.opens.lock().unwrap().clear();
+                let mut active = slot.active.lock().unwrap_or_else(|e| e.into_inner());
+                active
+                    .bridge
+                    .opens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
                 active.bridge.abort_pending();
                 *active = ActiveBackend {
                     bridge: Arc::clone(&member.bridge),
@@ -1759,7 +1809,12 @@ impl DriveConsumer for FuseDriveConsumer {
         request_tag: u64,
         result: Result<CreateReply, u32>,
     ) -> Vec<DriveCommand> {
-        if let Some(Pending::Create(tx)) = self.bridge.pending.lock().unwrap().remove(&request_tag)
+        if let Some(Pending::Create(tx)) = self
+            .bridge
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&request_tag)
         {
             let _ = tx.send(result);
         }
@@ -1767,7 +1822,13 @@ impl DriveConsumer for FuseDriveConsumer {
     }
 
     fn on_close_reply(&mut self, request_tag: u64, status: u32) -> Vec<DriveCommand> {
-        if let Some(Pending::Close(tx)) = self.bridge.pending.lock().unwrap().remove(&request_tag) {
+        if let Some(Pending::Close(tx)) = self
+            .bridge
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&request_tag)
+        {
             let _ = tx.send(status);
         }
         Vec::new()
@@ -1778,14 +1839,26 @@ impl DriveConsumer for FuseDriveConsumer {
         request_tag: u64,
         result: Result<Vec<u8>, u32>,
     ) -> Vec<DriveCommand> {
-        if let Some(Pending::Read(tx)) = self.bridge.pending.lock().unwrap().remove(&request_tag) {
+        if let Some(Pending::Read(tx)) = self
+            .bridge
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&request_tag)
+        {
             let _ = tx.send(result);
         }
         Vec::new()
     }
 
     fn on_write_reply(&mut self, request_tag: u64, result: Result<u32, u32>) -> Vec<DriveCommand> {
-        if let Some(Pending::Write(tx)) = self.bridge.pending.lock().unwrap().remove(&request_tag) {
+        if let Some(Pending::Write(tx)) = self
+            .bridge
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&request_tag)
+        {
             let _ = tx.send(result);
         }
         Vec::new()
@@ -1796,8 +1869,12 @@ impl DriveConsumer for FuseDriveConsumer {
         request_tag: u64,
         result: Result<Option<DirectoryEntry>, u32>,
     ) -> Vec<DriveCommand> {
-        if let Some(Pending::QueryDir(tx)) =
-            self.bridge.pending.lock().unwrap().remove(&request_tag)
+        if let Some(Pending::QueryDir(tx)) = self
+            .bridge
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&request_tag)
         {
             let _ = tx.send(result);
         }
@@ -1809,7 +1886,12 @@ impl DriveConsumer for FuseDriveConsumer {
         request_tag: u64,
         result: Result<(), u32>,
     ) -> Vec<DriveCommand> {
-        if let Some(Pending::SetInfo(tx)) = self.bridge.pending.lock().unwrap().remove(&request_tag)
+        if let Some(Pending::SetInfo(tx)) = self
+            .bridge
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&request_tag)
         {
             let _ = tx.send(result);
         }
@@ -2005,17 +2087,24 @@ mod tests {
     fn seed_path(bridge: &Bridge, device_id: u32, path: &str, is_dir: bool) {
         bridge.ensure_root_ino(device_id);
         let _ = bridge.inode_for(device_id, path);
-        bridge.meta.lock().unwrap().insert(
-            (device_id, path.to_owned()),
-            CachedMeta::new(is_dir, bridge.uid, bridge.gid),
-        );
+        bridge
+            .meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (device_id, path.to_owned()),
+                CachedMeta::new(is_dir, bridge.uid, bridge.gid),
+            );
     }
 
     fn complete_command(bridge: &Bridge, cmd: DriveCommand) {
         match cmd {
             DriveCommand::Create { request_tag, .. } => {
-                if let Some(Pending::Create(tx)) =
-                    bridge.pending.lock().unwrap().remove(&request_tag)
+                if let Some(Pending::Create(tx)) = bridge
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&request_tag)
                 {
                     let _ = tx.send(Ok(CreateReply {
                         file_id: 42,
@@ -2024,15 +2113,21 @@ mod tests {
                 }
             }
             DriveCommand::Close { request_tag, .. } => {
-                if let Some(Pending::Close(tx)) =
-                    bridge.pending.lock().unwrap().remove(&request_tag)
+                if let Some(Pending::Close(tx)) = bridge
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&request_tag)
                 {
                     let _ = tx.send(0);
                 }
             }
             DriveCommand::SetInformation { request_tag, .. } => {
-                if let Some(Pending::SetInfo(tx)) =
-                    bridge.pending.lock().unwrap().remove(&request_tag)
+                if let Some(Pending::SetInfo(tx)) = bridge
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&request_tag)
                 {
                     let _ = tx.send(Ok(()));
                 }
@@ -2040,8 +2135,11 @@ mod tests {
             DriveCommand::QueryDirectory {
                 request_tag, path, ..
             } => {
-                if let Some(Pending::QueryDir(tx)) =
-                    bridge.pending.lock().unwrap().remove(&request_tag)
+                if let Some(Pending::QueryDir(tx)) = bridge
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&request_tag)
                 {
                     let _ = tx.send(Ok(if path.is_some() {
                         Some(DirectoryEntry {
@@ -2061,14 +2159,21 @@ mod tests {
                 }
             }
             DriveCommand::Read { request_tag, .. } => {
-                if let Some(Pending::Read(tx)) = bridge.pending.lock().unwrap().remove(&request_tag)
+                if let Some(Pending::Read(tx)) = bridge
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&request_tag)
                 {
                     let _ = tx.send(Ok(Vec::new()));
                 }
             }
             DriveCommand::Write { request_tag, .. } => {
-                if let Some(Pending::Write(tx)) =
-                    bridge.pending.lock().unwrap().remove(&request_tag)
+                if let Some(Pending::Write(tx)) = bridge
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&request_tag)
                 {
                     let _ = tx.send(Ok(0));
                 }

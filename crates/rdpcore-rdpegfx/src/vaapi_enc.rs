@@ -35,7 +35,8 @@ pub struct VaapiH264Encoder {
     qp: u8,
 }
 
-// Accessed only under GfxSession's Mutex.
+// SAFETY: libva Display/Context are !Send, but GfxSession only accesses this
+// encoder under a Mutex from one task at a time, so Send without Sync is OK.
 unsafe impl Send for VaapiH264Encoder {}
 
 impl VaapiH264Encoder {

@@ -194,7 +194,11 @@ async fn main() -> Result<()> {
                 .take(20)
                 .map(char::from)
                 .collect();
-            tracing::warn!(user = %username, password = %generated, "KMSRDP_PASSWORD not set; generated one-shot password");
+            tracing::warn!(
+                user = %username,
+                "KMSRDP_PASSWORD not set; generated a one-shot password (printed once on stderr)"
+            );
+            eprintln!("kmsrdp: one-shot RDP password for user {username}: {generated}");
             generated
         }
     };

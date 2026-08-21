@@ -311,11 +311,14 @@ impl GfxSession {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.inner.lock().unwrap().is_ready()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_ready()
     }
 
     pub fn failed(&self) -> bool {
-        self.inner.lock().unwrap().state == State::Failed
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).state == State::Failed
     }
 
     pub fn encode_frame(
@@ -332,7 +335,10 @@ impl GfxSession {
     }
 
     pub fn resize(&self, width: u16, height: u16) -> Option<Vec<Vec<u8>>> {
-        self.inner.lock().unwrap().resize(width, height)
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resize(width, height)
     }
 
     pub fn dvc_handler(&self) -> GfxDvcHandler {
@@ -377,7 +383,7 @@ impl DvcHandler for GfxDvcHandler {
             }
             rest = &rest[pdu_len..];
 
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             match msg {
                 ClientMessage::CapsAdvertise { sets } => out.extend(inner.on_caps(&sets)),
                 ClientMessage::FrameAcknowledge {

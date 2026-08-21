@@ -89,12 +89,6 @@ impl OpenH264Encoder {
     }
 }
 
-impl Default for OpenH264Encoder {
-    fn default() -> Self {
-        Self::new().expect("openh264 default init")
-    }
-}
-
 impl H264Encoder for OpenH264Encoder {
     fn encode_bgrx(
         &mut self,

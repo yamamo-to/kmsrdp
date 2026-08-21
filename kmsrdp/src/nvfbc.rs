@@ -152,9 +152,15 @@ macro_rules! nvfbc_fns {
             $($field: unsafe extern "C" fn($($arg),*) $(-> $ret)?,)+
         }
         impl NvfbcFns {
+            /// # Safety
+            /// `lib` must remain loaded for the lifetime of the returned function
+            /// pointers (kept via `NvfbcCapturer::_lib`).
             unsafe fn load(lib: &Library) -> io::Result<Self> {
                 $(
                     let $field = {
+                        // SAFETY: `lib` is a loaded Library; symbol name is a
+                        // static NUL-terminated C string; returned fn ptr is
+                        // only used while `lib` stays alive in `_lib`.
                         let sym: Symbol<unsafe extern "C" fn($($arg),*) $(-> $ret)?> =
                             unsafe { lib.get(concat!($name, "\0").as_bytes()) }
                                 .map_err(|e| io::Error::other(format!("dlsym {}: {e}", $name)))?;
@@ -188,10 +194,13 @@ struct NvfbcCapturer {
 
 impl NvfbcCapturer {
     fn last_error(&self) -> String {
+        // SAFETY: `handle` is a live NvFBC session; the returned C string is
+        // owned by the library until the next NvFBC call on this handle.
         let ptr = unsafe { (self.fns.get_last_error_str)(self.handle) };
         if ptr.is_null() {
             return "(no error string)".to_string();
         }
+        // SAFETY: non-null pointer from NvFBCGetLastErrorStr; nul-terminated.
         unsafe { CStr::from_ptr(ptr) }
             .to_string_lossy()
             .into_owned()
@@ -208,9 +217,11 @@ impl NvfbcCapturer {
     }
 
     fn new() -> io::Result<Self> {
+        // SAFETY: dlopen of a well-known soname; failure is converted to Err.
         let lib = unsafe { Library::new("libnvidia-fbc.so.1") }
             .or_else(|_| unsafe { Library::new("libnvidia-fbc.so") })
             .map_err(|e| io::Error::other(format!("failed to load libnvidia-fbc: {e}")))?;
+        // SAFETY: `lib` is stored in `_lib` for the capturer lifetime.
         let fns = unsafe { NvfbcFns::load(&lib)? };
 
         let mut handle = 0u64;
@@ -222,6 +233,8 @@ impl NvfbcCapturer {
             glx_ctx: std::ptr::null_mut(),
             glx_fb_config: std::ptr::null_mut(),
         };
+        // SAFETY: params point at local valid structs; MAGIC_PRIVATE_DATA is
+        // static; handle out-param is a stack u64.
         let status = unsafe { (fns.create_handle)(&mut handle, &mut create_params) };
         if status != NVFBC_SUCCESS {
             return Err(io::Error::other(format!(
@@ -260,6 +273,8 @@ impl NvfbcCapturer {
             b_allow_direct_capture: NVFBC_FALSE,
         };
         this.check(
+            // SAFETY: handle is from a successful CreateHandle; params are
+            // local and correctly versioned for this driver ABI.
             unsafe { (this.fns.create_capture_session)(this.handle, &mut session_params) },
             "NvFBCCreateCaptureSession",
         )?;
@@ -274,6 +289,8 @@ impl NvfbcCapturer {
             diff_map_size: Size { w: 0, h: 0 },
         };
         this.check(
+            // SAFETY: capture session exists; pp_buffer points at Box-owned
+            // storage that outlives the capturer.
             unsafe { (this.fns.to_sys_set_up)(this.handle, &mut setup_params) },
             "NvFBCToSysSetUp",
         )?;
@@ -282,6 +299,7 @@ impl NvfbcCapturer {
     }
 
     fn grab(&self) -> io::Result<(u32, u32, Vec<u8>)> {
+        // SAFETY: FrameGrabInfo is a POD C struct; zero is a valid initial state.
         let mut info: FrameGrabInfo = unsafe { std::mem::zeroed() };
         let mut params = ToSysGrabFrameParams {
             dw_version: nvfbc_struct_version(std::mem::size_of::<ToSysGrabFrameParams>(), 2),
@@ -290,11 +308,12 @@ impl NvfbcCapturer {
             dw_timeout_ms: 0,
         };
         self.check(
+            // SAFETY: handle/session are live; params point at local FrameGrabInfo.
             unsafe { (self.fns.to_sys_grab_frame)(self.handle, &mut params) },
             "NvFBCToSysGrabFrame",
         )?;
 
-        // Safety: NvFBC wrote a fresh buffer pointer through `buffer_ptr`
+        // SAFETY: NvFBC wrote a fresh buffer pointer through `buffer_ptr`
         // during setup/grab, valid for `info.dw_byte_size` bytes until the
         // next grab call.
         let data = unsafe {
@@ -311,10 +330,12 @@ impl Drop for NvfbcCapturer {
         let mut destroy_session = DestroyCaptureSessionParams {
             dw_version: nvfbc_struct_version(std::mem::size_of::<DestroyCaptureSessionParams>(), 1),
         };
+        // SAFETY: best-effort teardown of a handle we still own; ignore status.
         unsafe { (self.fns.destroy_capture_session)(self.handle, &mut destroy_session) };
         let mut destroy_handle = DestroyHandleParams {
             dw_version: nvfbc_struct_version(std::mem::size_of::<DestroyHandleParams>(), 1),
         };
+        // SAFETY: handle was created by us; destroy after capture session.
         unsafe { (self.fns.destroy_handle)(self.handle, &mut destroy_handle) };
     }
 }

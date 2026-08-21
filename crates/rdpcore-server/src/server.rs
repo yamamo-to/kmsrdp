@@ -859,7 +859,8 @@ impl Session {
                         Ok(SteadyStateFrame::FastPathInput(bytes)) => {
                             match fastpath::FastPathInput::decode(&bytes) {
                                 Ok(input_pdu) => {
-                                    let mut input = self.input.lock().unwrap();
+                                    let mut input =
+                                        self.input.lock().unwrap_or_else(|e| e.into_inner());
                                     for event in input_pdu.events {
                                         dispatch_input_event(&mut *input, event);
                                     }

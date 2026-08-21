@@ -116,6 +116,9 @@ pub struct NvencH264Encoder {
     _nvenc_lib: &'static NVENCLibrary,
 }
 
+// SAFETY: NvencH264Encoder holds raw CUDA/NVENC handles that are not Sync,
+// but GfxSession only touches the encoder under a Mutex from one task at a
+// time, so moving it across threads without concurrent access is sound.
 unsafe impl Send for NvencH264Encoder {}
 
 impl NvencH264Encoder {
