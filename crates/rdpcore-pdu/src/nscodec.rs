@@ -16,6 +16,16 @@ pub fn encode(
 
     let w = usize::from(width);
     let h = usize::from(height);
+    // Every caller today passes server-owned framebuffer geometry, so this
+    // can't be hit in practice - but width/height/stride aren't validated
+    // against data.len() anywhere else either, and the row loop below
+    // indexes `data` directly. Catch a mismatch here instead of an
+    // out-of-bounds panic in the loop.
+    debug_assert!(
+        h == 0 || w == 0 || (h - 1) * stride + w * 4 <= data.len(),
+        "nscodec::encode: {width}x{height} @ stride {stride} exceeds data.len()={}",
+        data.len()
+    );
     let pixels = w * h;
     let cll = i32::from(color_loss_level);
 

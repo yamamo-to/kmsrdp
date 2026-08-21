@@ -224,6 +224,11 @@ impl FastPathUpdatePdu {
     fn encode(&self, out: &mut Vec<u8>) {
         let header = (self.update_code & 0x0F) | ((self.fragmentation.as_u8() & 0x3) << 4);
         out.write_u8(header);
+        debug_assert!(
+            self.data.len() <= usize::from(u16::MAX),
+            "FastPathUpdatePdu ({} bytes) exceeds the 16-bit size field - caller must fragment",
+            self.data.len()
+        );
         out.write_u16_le(self.data.len() as u16);
         out.write_slice(&self.data);
     }

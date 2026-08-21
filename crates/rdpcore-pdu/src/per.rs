@@ -88,7 +88,8 @@ pub fn read_u32(cursor: &mut ReadCursor<'_>) -> Result<u32, DecodeError> {
 /// Fixed 2-byte big-endian "constrained INTEGER (min..max)" collapsed to a
 /// subtract-and-store-as-u16 pattern - no separate length prefix.
 pub fn write_u16(out: &mut Vec<u8>, value: u16, min: u16) {
-    out.write_u16_be(value - min);
+    debug_assert!(value >= min, "per::write_u16: value {value} < min {min}");
+    out.write_u16_be(value.wrapping_sub(min));
 }
 
 pub fn read_u16(cursor: &mut ReadCursor<'_>, min: u16) -> Result<u16, DecodeError> {
@@ -120,7 +121,12 @@ pub fn read_object_id(cursor: &mut ReadCursor<'_>) -> Result<[u8; 6], DecodeErro
 /// Length-prefixed octet string where the length field stores `len - min`,
 /// but the full string (all `min`-or-more bytes) still follows on the wire.
 pub fn write_octet_string(out: &mut Vec<u8>, bytes: &[u8], min: usize) {
-    write_length(out, bytes.len() - min);
+    debug_assert!(
+        bytes.len() >= min,
+        "per::write_octet_string: {} bytes < min {min}",
+        bytes.len()
+    );
+    write_length(out, bytes.len().saturating_sub(min));
     out.write_slice(bytes);
 }
 
@@ -148,7 +154,12 @@ pub fn read_padding(cursor: &mut ReadCursor<'_>, n: usize) -> Result<(), DecodeE
 /// practice): length-prefixed (`len - min`, PER length), 2 digits per byte
 /// via `(c - '0') % 10`, odd count padded with a `'0'` mate.
 pub fn write_numeric_string(out: &mut Vec<u8>, value: &str, min: usize) {
-    write_length(out, value.len() - min);
+    debug_assert!(
+        value.len() >= min,
+        "per::write_numeric_string: {} chars < min {min}",
+        value.len()
+    );
+    write_length(out, value.len().saturating_sub(min));
     let digits: Vec<u8> = value.bytes().map(|c| (c.wrapping_sub(b'0')) % 10).collect();
     let mut chunks = digits.chunks(2);
     for pair in &mut chunks {
