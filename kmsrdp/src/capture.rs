@@ -319,14 +319,21 @@ fn refresh_heads(cards: &[CardCtx]) -> io::Result<Vec<EnumeratedHead>> {
     let mut heads = Vec::new();
     let mut discovered = Vec::new();
     for (card_idx, ctx) in cards.iter().enumerate() {
-        collect_heads_on_card(
+        // A transient per-card DRM error (e.g. a hiccup in
+        // resource_handles()) must not blank every other, otherwise-
+        // healthy card's frame for this tick - tolerate it and move on
+        // to the next card, mirroring open_drm_cards_and_heads's own
+        // per-card handling at startup.
+        if let Err(e) = collect_heads_on_card(
             &ctx.card,
             &ctx.name,
             card_idx,
             mode,
             &mut heads,
             &mut discovered,
-        )?;
+        ) {
+            discovered.push(format!("{}: {e}", ctx.name));
+        }
         if matches!(mode, DisplayMode::Single(_)) && !heads.is_empty() {
             break;
         }
