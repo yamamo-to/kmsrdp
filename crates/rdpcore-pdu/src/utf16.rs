@@ -23,12 +23,17 @@ pub fn write_fixed(out: &mut Vec<u8>, s: &str, byte_len: usize) {
 /// none) - works both for NUL-padded fixed fields and for
 /// length-includes-terminator fields (Client Info's clientAddress/clientDir).
 pub fn read_fixed(bytes: &[u8]) -> String {
-    let units: Vec<u16> = bytes
+    // Feeds `char::decode_utf16` straight off a `take_while` over the raw
+    // code units instead of collecting into an intermediate `Vec<u16>`
+    // first (as `String::from_utf16_lossy` would need) - one fewer heap
+    // buffer per decoded string field.
+    let units = bytes
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
-    String::from_utf16_lossy(&units[..end])
+        .take_while(|&u| u != 0);
+    char::decode_utf16(units)
+        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
 }
 
 /// Raw UTF-16LE bytes, no terminator - used where the length prefix
@@ -43,11 +48,12 @@ pub fn encode_units(s: &str) -> Vec<u8> {
 
 /// Inverse of [`encode_units`]: decodes exactly `bytes` with no NUL search.
 pub fn decode_units(bytes: &[u8]) -> String {
-    let units: Vec<u16> = bytes
+    let units = bytes
         .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    String::from_utf16_lossy(&units)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]));
+    char::decode_utf16(units)
+        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
 }
 
 #[cfg(test)]
