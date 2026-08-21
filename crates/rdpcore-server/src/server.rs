@@ -231,7 +231,6 @@ struct Session {
     require_nla: bool,
     #[cfg(feature = "dvc-echo")]
     echo_smoke_test: bool,
-    handshake_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl RdpServer {
@@ -254,7 +253,6 @@ impl RdpServer {
             require_nla: self.require_nla,
             #[cfg(feature = "dvc-echo")]
             echo_smoke_test: self.echo_smoke_test,
-            handshake_permits: Arc::clone(&self.handshake_permits),
         }
     }
 
@@ -272,12 +270,31 @@ impl RdpServer {
         };
         let server = Arc::new(self);
         loop {
-            let (tcp, peer) = listener.accept().await?;
+            let (tcp, peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // A single bad accept() (e.g. EMFILE under fd
+                    // pressure, or a client that reset the connection
+                    // between select() and accept()) must not take the
+                    // whole listener down permanently - log and keep
+                    // accepting.
+                    warn!(error = %e, "accept() failed, continuing to listen");
+                    continue;
+                }
+            };
+            // Acquired here, before spawning - not inside the connection
+            // task - so a flood of TCP connections that never send a byte
+            // backpressures accept() itself once MAX_CONCURRENT_HANDSHAKES
+            // is in flight, instead of piling up unboundedly as spawned
+            // tasks and open fds all waiting on a permit.
+            let Ok(permit) = Arc::clone(&server.handshake_permits).acquire_owned().await else {
+                unreachable!("handshake_permits semaphore is never closed");
+            };
             let session = server.session();
             let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(
                 async move {
-                    if let Err(e) = session.handle_connection(tcp).await {
+                    if let Err(e) = session.handle_connection(tcp, permit).await {
                         warn!(error = %e, "connection ended");
                     }
                 }
@@ -297,15 +314,14 @@ impl RdpServer {
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Session {
-    async fn handle_connection(&self, tcp: TcpStream) -> anyhow::Result<()> {
+    async fn handle_connection(
+        &self,
+        tcp: TcpStream,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> anyhow::Result<()> {
         let peer = tcp.peer_addr()?;
-        // Held only for the handshake itself - queues if
-        // MAX_CONCURRENT_HANDSHAKES is already in flight, never rejects.
-        let permit = self
-            .handshake_permits
-            .acquire()
-            .await
-            .expect("handshake_permits semaphore is never closed");
+        // Held only for the handshake itself; acquired by the accept loop
+        // before this task was even spawned (see `run`).
         let negotiated = match tokio::time::timeout(HANDSHAKE_TIMEOUT, self.negotiate(tcp)).await {
             Ok(result) => result?,
             Err(_) => {
