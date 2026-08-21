@@ -30,10 +30,17 @@ pub fn encode(bgrx: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut r = vec![0u8; pixel_count];
     let mut g = vec![0u8; pixel_count];
     let mut b = vec![0u8; pixel_count];
-    for i in 0..pixel_count {
-        b[i] = bgrx[i * 4];
-        g[i] = bgrx[i * 4 + 1];
-        r[i] = bgrx[i * 4 + 2];
+    // Slice-per-pixel via chunks_exact instead of manually indexing
+    // bgrx[i*4 + k] - lets the compiler prove each 4-byte chunk is in
+    // bounds once instead of bounds-checking three separate `i*4+k`
+    // computations per pixel, and vectorizes better.
+    for (px, ((r_i, g_i), b_i)) in bgrx
+        .chunks_exact(4)
+        .zip(r.iter_mut().zip(g.iter_mut()).zip(b.iter_mut()))
+    {
+        *b_i = px[0];
+        *g_i = px[1];
+        *r_i = px[2];
     }
 
     let mut out = Vec::with_capacity(1 + pixel_count * 3 / 2);
@@ -60,10 +67,13 @@ pub fn decode(data: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Decod
 
     let pixel_count = width * height;
     let mut bgrx = vec![0u8; pixel_count * 4];
-    for i in 0..pixel_count {
-        bgrx[i * 4] = b[i];
-        bgrx[i * 4 + 1] = g[i];
-        bgrx[i * 4 + 2] = r[i];
+    for (px, ((&r_i, &g_i), &b_i)) in bgrx
+        .chunks_exact_mut(4)
+        .zip(r.iter().zip(g.iter()).zip(b.iter()))
+    {
+        px[0] = b_i;
+        px[1] = g_i;
+        px[2] = r_i;
     }
     Ok(bgrx)
 }
