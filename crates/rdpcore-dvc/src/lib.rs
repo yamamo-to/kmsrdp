@@ -116,22 +116,15 @@ impl DvcMux {
     /// `payload` is one SVC chunk (Channel PDU Header included) of
     /// `"drdynvc"`-channel data from an incoming MCS Send Data Request.
     pub fn on_channel_data(&mut self, payload: &[u8]) -> Result<Vec<Vec<u8>>, DecodeError> {
-        let (_total_length, flags, chunk) = svc::dechunkify(payload)?;
-        if flags & svc::CHANNEL_FLAG_FIRST != 0 {
-            self.svc_incoming.clear();
-        }
-        if self.svc_incoming.len().saturating_add(chunk.len()) > MAX_DVC_MESSAGE_SIZE {
-            self.svc_incoming.clear();
-            return Err(DecodeError::InvalidValue {
-                field: "dvc.svc_incoming",
-                reason: "reassembled SVC message exceeded maximum allowed size",
-            });
-        }
-        self.svc_incoming.extend_from_slice(chunk);
-        if flags & svc::CHANNEL_FLAG_LAST == 0 {
+        let Some(message) = svc::reassemble(
+            &mut self.svc_incoming,
+            payload,
+            MAX_DVC_MESSAGE_SIZE,
+            "dvc.svc_incoming",
+        )?
+        else {
             return Ok(Vec::new()); // wait for the rest of this drdynvc-level message
-        }
-        let message = core::mem::take(&mut self.svc_incoming);
+        };
 
         match pdu::decode_client_message(&message)? {
             pdu::ClientMessage::CapabilityResponse { .. } => {

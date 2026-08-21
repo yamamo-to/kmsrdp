@@ -95,6 +95,40 @@ pub fn dechunkify(input: &[u8]) -> Result<(u32, u32, &[u8]), DecodeError> {
     Ok((total_length, flags, cursor.read_rest()))
 }
 
+/// Feeds one already-dechunked SVC payload into `buffer`, accumulating
+/// across calls until a `CHANNEL_FLAG_LAST` chunk completes one logical
+/// message - the exact same reassembly state machine `rdpcore-dvc`,
+/// `rdpcore-cliprdr`, and `rdpcore-rdpdr` each hand-rolled independently
+/// (clear on FIRST, reject if the running total would exceed `max_size`,
+/// extend, wait for LAST, then take the finished buffer).
+///
+/// Returns `Ok(Some(message))` once the message is complete, `Ok(None)`
+/// while still waiting for more chunks. `field` names the caller's
+/// buffer in the size-limit error, e.g. `"cliprdr.incoming_buffer"`.
+pub fn reassemble(
+    buffer: &mut Vec<u8>,
+    payload: &[u8],
+    max_size: usize,
+    field: &'static str,
+) -> Result<Option<Vec<u8>>, DecodeError> {
+    let (_total_length, flags, chunk) = dechunkify(payload)?;
+    if flags & CHANNEL_FLAG_FIRST != 0 {
+        buffer.clear();
+    }
+    if buffer.len().saturating_add(chunk.len()) > max_size {
+        buffer.clear();
+        return Err(DecodeError::InvalidValue {
+            field,
+            reason: "reassembled SVC message exceeded maximum allowed size",
+        });
+    }
+    buffer.extend_from_slice(chunk);
+    if flags & CHANNEL_FLAG_LAST == 0 {
+        return Ok(None);
+    }
+    Ok(Some(core::mem::take(buffer)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +178,77 @@ mod tests {
         reassembled.extend(body1);
         reassembled.extend(body2);
         assert_eq!(reassembled, data);
+    }
+
+    #[test]
+    fn reassemble_waits_for_the_last_chunk_then_returns_the_full_message() {
+        let data = vec![0xCD; DEFAULT_CHUNK_LENGTH * 2 + 42];
+        let chunks = chunkify(&data);
+        assert_eq!(chunks.len(), 3);
+
+        let mut buffer = Vec::new();
+        assert_eq!(
+            reassemble(&mut buffer, &chunks[0], usize::MAX, "test").unwrap(),
+            None
+        );
+        assert_eq!(
+            reassemble(&mut buffer, &chunks[1], usize::MAX, "test").unwrap(),
+            None
+        );
+        assert_eq!(
+            reassemble(&mut buffer, &chunks[2], usize::MAX, "test").unwrap(),
+            Some(data)
+        );
+        assert!(buffer.is_empty(), "buffer must be taken, not left behind");
+    }
+
+    #[test]
+    fn reassemble_rejects_messages_over_the_size_cap_and_clears_the_buffer() {
+        let mut buffer = Vec::new();
+        let mut first = Vec::new();
+        first.extend_from_slice(&20u32.to_le_bytes()); // total_length (unchecked)
+        first.extend_from_slice(&CHANNEL_FLAG_FIRST.to_le_bytes());
+        first.extend_from_slice(&[0u8; 20]);
+
+        let err = reassemble(&mut buffer, &first, 10, "test.buf").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DecodeError::InvalidValue {
+                    field: "test.buf",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert!(buffer.is_empty(), "buffer must be cleared on rejection");
+    }
+
+    #[test]
+    fn reassemble_drops_a_stale_partial_message_on_a_new_first_chunk() {
+        // A FIRST chunk arriving mid-reassembly (client abandoned the
+        // previous message, or this is simply the next one) must
+        // discard whatever was buffered, not append to it.
+        let mut buffer = Vec::new();
+        let stale_first = {
+            let mut raw = Vec::new();
+            raw.extend_from_slice(&99u32.to_le_bytes());
+            raw.extend_from_slice(&CHANNEL_FLAG_FIRST.to_le_bytes());
+            raw.extend_from_slice(b"stale-partial");
+            raw
+        };
+        assert_eq!(
+            reassemble(&mut buffer, &stale_first, usize::MAX, "test").unwrap(),
+            None
+        );
+        assert_eq!(buffer, b"stale-partial");
+
+        let fresh = chunkify(b"fresh message")
+            .pop()
+            .expect("single chunk for a short payload");
+        assert_eq!(
+            reassemble(&mut buffer, &fresh, usize::MAX, "test").unwrap(),
+            Some(b"fresh message".to_vec())
+        );
     }
 }

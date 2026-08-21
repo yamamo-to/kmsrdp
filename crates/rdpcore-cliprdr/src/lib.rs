@@ -145,23 +145,15 @@ impl CliprdrChannel {
     /// `payload` is one SVC chunk (Channel PDU Header included) of
     /// `"cliprdr"`-channel data from an incoming MCS Send Data Request.
     pub fn on_channel_data(&mut self, payload: &[u8]) -> Result<Vec<Vec<u8>>, DecodeError> {
-        let (_total_length, flags, chunk_body) = svc::dechunkify(payload)?;
-        if flags & svc::CHANNEL_FLAG_FIRST != 0 {
-            self.incoming_buffer.clear();
-        }
-        if self.incoming_buffer.len().saturating_add(chunk_body.len()) > MAX_CLIPRDR_MESSAGE_SIZE {
-            self.incoming_buffer.clear();
-            return Err(DecodeError::InvalidValue {
-                field: "cliprdr.incoming_buffer",
-                reason: "clipboard payload exceeded maximum allowed size",
-            });
-        }
-        self.incoming_buffer.extend_from_slice(chunk_body);
-        if flags & svc::CHANNEL_FLAG_LAST == 0 {
+        let Some(message) = svc::reassemble(
+            &mut self.incoming_buffer,
+            payload,
+            MAX_CLIPRDR_MESSAGE_SIZE,
+            "cliprdr.incoming_buffer",
+        )?
+        else {
             return Ok(Vec::new()); // wait for the rest
-        }
-
-        let message = core::mem::take(&mut self.incoming_buffer);
+        };
         match pdu::decode_client_message(&message)? {
             pdu::ClientMessage::FormatList(format_ids) => {
                 let formats: Vec<ClipboardFormat> = format_ids
