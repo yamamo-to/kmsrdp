@@ -51,6 +51,7 @@ impl FormatDataResponse {
 
 /// What a backend sends back through its factory-provided channel, to be
 /// turned into wire bytes by [`CliprdrChannel`].
+#[derive(Debug)]
 pub enum ClipboardMessage {
     /// Advertise newly-available local clipboard formats to the remote
     /// side (a Format List PDU).

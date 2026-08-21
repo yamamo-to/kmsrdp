@@ -11,15 +11,6 @@ use std::sync::Arc;
 use rdpcore_pdu::DecodeError;
 use rdpcore_pdu::svc::wrap_indication;
 
-pub trait RdpsndError: std::error::Error + Send {}
-impl<T: std::error::Error + Send> RdpsndError for T {}
-
-impl<'a, E: RdpsndError + 'a> From<E> for Box<dyn RdpsndError + 'a> {
-    fn from(e: E) -> Self {
-        Box::new(e)
-    }
-}
-
 /// A chunk of PCM (or whatever codec was negotiated) audio, plus a
 /// timestamp - produced by a backend once `start` is called, consumed by
 /// [`RdpsndChannel::encode_wave`].
@@ -99,7 +90,10 @@ impl WaveSubscriber {
 pub trait RdpsndServerHandler: Send + core::fmt::Debug {
     fn get_formats(&self) -> &[pdu::AudioFormat];
     fn choose_format(&mut self, common: &[pdu::NegotiatedFormat]) -> Option<pdu::NegotiatedFormat>;
-    fn start(&mut self, format: &pdu::NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>>;
+    fn start(
+        &mut self,
+        format: &pdu::NegotiatedFormat,
+    ) -> Result<(), Box<dyn std::error::Error + Send>>;
     fn stop(&mut self);
 }
 
@@ -262,7 +256,10 @@ mod tests {
             common.first().cloned()
         }
 
-        fn start(&mut self, format: &pdu::NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+        fn start(
+            &mut self,
+            format: &pdu::NegotiatedFormat,
+        ) -> Result<(), Box<dyn std::error::Error + Send>> {
             self.started_with = Some(format.clone());
             Ok(())
         }

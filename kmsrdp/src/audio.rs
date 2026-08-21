@@ -18,9 +18,7 @@ use pulse::def::BufferAttr;
 use pulse::sample::{Format, Spec};
 use pulse::stream::Direction;
 use rdpcore_rdpsnd::pdu::{AudioFormat, NegotiatedFormat};
-use rdpcore_rdpsnd::{
-    RdpsndError, RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory, WavePublisher,
-};
+use rdpcore_rdpsnd::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory, WavePublisher};
 
 const SAMPLE_RATE: u32 = 48000;
 const CHANNELS: u16 = 2;
@@ -204,7 +202,10 @@ impl RdpsndServerHandler for LocalAudioHandler {
         common.first().cloned()
     }
 
-    fn start(&mut self, _format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+    fn start(
+        &mut self,
+        _format: &NegotiatedFormat,
+    ) -> Result<(), Box<dyn std::error::Error + Send>> {
         self.stop();
         self.stop.store(false, Ordering::Release);
         let publisher = self.publisher.clone();
