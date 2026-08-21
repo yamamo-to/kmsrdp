@@ -59,11 +59,21 @@ impl SharedInput {
 
 impl RdpServerInputHandler for SharedInput {
     fn keyboard(&mut self, event: KeyboardEvent) {
-        self.inner.lock().unwrap().keyboard(event);
+        // Poison-tolerant: this Mutex is one process-wide singleton shared
+        // by every connected RDP session (see this struct's doc comment).
+        // A panic while injecting one session's event must not
+        // permanently break input for every other session too.
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keyboard(event);
     }
 
     fn mouse(&mut self, event: MouseEvent) {
-        self.inner.lock().unwrap().mouse(event);
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mouse(event);
     }
 }
 
@@ -96,7 +106,7 @@ impl RdpServerInputHandler for Input {
     fn mouse(&mut self, event: MouseEvent) {
         let result = match event {
             MouseEvent::Move { x, y } => {
-                let (width, height) = *self.mouse_scale.lock().unwrap();
+                let (width, height) = *self.mouse_scale.lock().unwrap_or_else(|e| e.into_inner());
                 self.device
                     .move_abs(f64::from(x) / width, f64::from(y) / height)
             }

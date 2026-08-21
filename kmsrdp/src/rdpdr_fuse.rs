@@ -305,7 +305,7 @@ impl Bridge {
         let tag = self.alloc_tag();
         self.pending
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(tag, Pending::QueryDir(tx));
         self.enqueue(DriveCommand::QueryDirectory {
             device_id,
@@ -331,7 +331,7 @@ impl Bridge {
         let tag = self.alloc_tag();
         self.pending
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(tag, Pending::SetInfo(tx));
         self.enqueue(DriveCommand::SetInformation {
             device_id,
@@ -530,7 +530,7 @@ impl Bridge {
         path_to_ino.insert(key, ino);
         self.ino_to_path
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert((device_id, ino), win_path.to_owned());
         ino
     }
@@ -538,7 +538,7 @@ impl Bridge {
     fn path_for(&self, device_id: u32, ino: u64) -> Option<String> {
         self.ino_to_path
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&(device_id, ino))
             .cloned()
     }
@@ -572,7 +572,7 @@ impl Bridge {
         let meta = self
             .meta
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&(device_id, win_path.to_owned()))?
             .clone();
         let ino = self.inode_for(device_id, win_path);
@@ -660,12 +660,12 @@ impl Bridge {
     fn forget_path(&self, device_id: u32, win_path: &str) {
         self.meta
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&(device_id, win_path.to_owned()));
         let ino = self
             .path_to_ino
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&(device_id, win_path.to_owned()));
         if let Some(ino) = ino {
             self.ino_to_path
@@ -1293,7 +1293,7 @@ impl Filesystem for FuseFs {
             bridge
                 .opens
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get(&h)
                 .map(|o| (o.device_id, o.file_id))
         });
@@ -1337,7 +1337,7 @@ impl Filesystem for FuseFs {
             if let Some(meta) = bridge
                 .meta
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get_mut(&(device_id, path.clone()))
             {
                 meta.size = size;
@@ -1366,7 +1366,7 @@ impl Filesystem for FuseFs {
             if let Some(meta) = bridge
                 .meta
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get_mut(&(device_id, path.clone()))
             {
                 if let Some(t) = atime {
