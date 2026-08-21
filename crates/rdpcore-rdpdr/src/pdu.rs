@@ -31,6 +31,7 @@ pub const PAKID_CORE_SERVER_ANNOUNCE: u16 = 0x496E;
 pub const PAKID_CORE_CLIENTID_CONFIRM: u16 = 0x4343;
 pub const PAKID_CORE_CLIENT_NAME: u16 = 0x434E;
 pub const PAKID_CORE_DEVICELIST_ANNOUNCE: u16 = 0x4441;
+pub const PAKID_CORE_DEVICELIST_REMOVE: u16 = 0x444D;
 pub const PAKID_CORE_DEVICE_REPLY: u16 = 0x6472;
 pub const PAKID_CORE_DEVICE_IOREQUEST: u16 = 0x4952;
 pub const PAKID_CORE_DEVICE_IOCOMPLETION: u16 = 0x4943;
@@ -240,6 +241,9 @@ pub enum ClientMessage {
     ClientName,
     ClientCapability,
     DeviceListAnnounce(Vec<DeviceAnnounce>),
+    /// `DeviceIds` unplugged/no-longer-redirected by the client
+    /// (`DR_DEVICELIST_REMOVE`, MS-RDPEFS 2.2.3.2).
+    DeviceListRemove(Vec<u32>),
     UserLoggedOn,
     /// Header stripped, body left raw - the caller (which remembers what
     /// `MajorFunction` this `CompletionId` corresponds to) decodes the
@@ -292,6 +296,31 @@ fn decode_device_list_announce(body: &[u8]) -> Result<Vec<DeviceAnnounce>, Decod
     Ok(devices)
 }
 
+fn decode_device_list_remove(body: &[u8]) -> Result<Vec<u32>, DecodeError> {
+    let mut cursor = ReadCursor::new(body);
+    let device_count = cursor.read_u32_le()? as usize;
+    // Reject impossible counts before allocating, same reasoning as
+    // decode_device_list_announce.
+    let needed = device_count
+        .checked_mul(4)
+        .ok_or(DecodeError::InvalidValue {
+            field: "rdpdr.deviceCount",
+            reason: "count overflow",
+        })?;
+    if cursor.remaining() < needed {
+        return Err(rdpcore_pdu::cursor::NotEnoughBytes {
+            needed,
+            remaining: cursor.remaining(),
+        }
+        .into());
+    }
+    let mut device_ids = Vec::with_capacity(device_count);
+    for _ in 0..device_count {
+        device_ids.push(cursor.read_u32_le()?);
+    }
+    Ok(device_ids)
+}
+
 pub fn decode_client_message(input: &[u8]) -> Result<ClientMessage, DecodeError> {
     let mut cursor = ReadCursor::new(input);
     let _component = cursor.read_u16_le()?;
@@ -304,6 +333,9 @@ pub fn decode_client_message(input: &[u8]) -> Result<ClientMessage, DecodeError>
         PAKID_CORE_CLIENT_CAPABILITY => Ok(ClientMessage::ClientCapability),
         PAKID_CORE_DEVICELIST_ANNOUNCE => Ok(ClientMessage::DeviceListAnnounce(
             decode_device_list_announce(body)?,
+        )),
+        PAKID_CORE_DEVICELIST_REMOVE => Ok(ClientMessage::DeviceListRemove(
+            decode_device_list_remove(body)?,
         )),
         PAKID_CORE_USER_LOGGEDON => Ok(ClientMessage::UserLoggedOn),
         PAKID_CORE_DEVICE_IOCOMPLETION => {
@@ -469,6 +501,27 @@ mod tests {
         // Vec::with_capacity to OOM under ASAN fuzz.
         let mut wire = Vec::new();
         write_header(&mut wire, PAKID_CORE_DEVICELIST_ANNOUNCE);
+        wire.write_u32_le(u32::MAX);
+        assert!(decode_client_message(&wire).is_err());
+    }
+
+    #[test]
+    fn decodes_device_list_remove() {
+        let mut wire = Vec::new();
+        write_header(&mut wire, PAKID_CORE_DEVICELIST_REMOVE);
+        wire.write_u32_le(2);
+        wire.write_u32_le(1);
+        wire.write_u32_le(3);
+        assert_eq!(
+            decode_client_message(&wire).unwrap(),
+            ClientMessage::DeviceListRemove(vec![1, 3])
+        );
+    }
+
+    #[test]
+    fn device_list_remove_rejects_hostile_device_count() {
+        let mut wire = Vec::new();
+        write_header(&mut wire, PAKID_CORE_DEVICELIST_REMOVE);
         wire.write_u32_le(u32::MAX);
         assert!(decode_client_message(&wire).is_err());
     }

@@ -149,9 +149,17 @@ pub trait DriveConsumerFactory: Send + Sync {
 }
 
 struct PendingOp {
+    device_id: u32,
     major_function: u32,
     request_tag: u64,
 }
+
+/// Bounds the number of outstanding (issued but not yet completed) device
+/// I/O requests for one connection. Without this, a stalled or
+/// unresponsive client that stops sending `DeviceIoCompletion`s would let
+/// `pending` grow without bound for as long as the consumer keeps issuing
+/// new commands.
+const MAX_PENDING_OPS: usize = 4096;
 
 pub struct RdpdrChannel {
     channel_id: u16,
@@ -173,6 +181,17 @@ pub struct RdpdrChannel {
 
 /// Maximum allowed size for an rdpdr channel message (16 MB).
 pub const MAX_RDPDR_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+fn drive_command_device_id(command: &DriveCommand) -> u32 {
+    match command {
+        DriveCommand::Create { device_id, .. }
+        | DriveCommand::Close { device_id, .. }
+        | DriveCommand::Read { device_id, .. }
+        | DriveCommand::Write { device_id, .. }
+        | DriveCommand::QueryDirectory { device_id, .. }
+        | DriveCommand::SetInformation { device_id, .. } => *device_id,
+    }
+}
 
 impl RdpdrChannel {
     /// `supported` is an OR of `pdu::RDPDR_DTYP_*` (e.g. just
@@ -279,15 +298,28 @@ impl RdpdrChannel {
                     }
                 }
             }
+            pdu::ClientMessage::DeviceListRemove(device_ids) => {
+                for device_id in device_ids {
+                    self.devices.remove(&device_id);
+                }
+            }
             pdu::ClientMessage::DeviceIoCompletion {
+                device_id,
                 completion_id,
                 io_status,
                 body,
-                ..
             } => {
                 if let Some(pending) = self.pending.remove(&completion_id) {
-                    let commands = self.dispatch_completion(pending, io_status, &body)?;
-                    self.encode_commands(commands, &mut out);
+                    if pending.device_id != device_id {
+                        tracing::warn!(
+                            "rdpdr: DeviceIoCompletion device_id mismatch for completion {completion_id} \
+                             (expected {}, got {device_id}); dropping",
+                            pending.device_id
+                        );
+                    } else {
+                        let commands = self.dispatch_completion(pending, io_status, &body)?;
+                        self.encode_commands(commands, &mut out);
+                    }
                 }
             }
         }
@@ -391,6 +423,14 @@ impl RdpdrChannel {
 
     fn encode_commands(&mut self, commands: Vec<DriveCommand>, out: &mut Vec<Vec<u8>>) {
         for command in commands {
+            if self.pending.len() >= MAX_PENDING_OPS {
+                tracing::warn!(
+                    "rdpdr: dropping DriveCommand - {MAX_PENDING_OPS} I/O requests already \
+                     outstanding (client not completing I/O?)"
+                );
+                continue;
+            }
+            let device_id = drive_command_device_id(&command);
             let completion_id = self.next_completion_id;
             self.next_completion_id = self.next_completion_id.wrapping_add(1);
             let (major_function, request_tag, bytes) = match command {
@@ -480,6 +520,7 @@ impl RdpdrChannel {
             self.pending.insert(
                 completion_id,
                 PendingOp {
+                    device_id,
                     major_function,
                     request_tag,
                 },
@@ -676,6 +717,136 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         assert!(channel.devices().is_empty());
+    }
+
+    fn device_list_remove(device_ids: &[u32]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.write_u32_le(device_ids.len() as u32);
+        for id in device_ids {
+            body.write_u32_le(*id);
+        }
+        let mut out = Vec::new();
+        out.write_u16_le(pdu::RDPDR_CTYP_CORE);
+        out.write_u16_le(pdu::PAKID_CORE_DEVICELIST_REMOVE);
+        out.write_slice(&body);
+        out
+    }
+
+    #[test]
+    fn device_list_remove_evicts_announced_device() {
+        let (mut channel, _initial) = RdpdrChannel::new(
+            1004,
+            1002,
+            pdu::RDPDR_DTYP_FILESYSTEM,
+            Box::new(RecordingConsumer::default()),
+        );
+        send_message(
+            &mut channel,
+            device_list_announce(&[(pdu::RDPDR_DTYP_FILESYSTEM, 1, "share")]),
+        );
+        assert!(channel.devices().contains_key(&1));
+
+        send_message(&mut channel, device_list_remove(&[1]));
+        assert!(channel.devices().is_empty());
+    }
+
+    #[test]
+    fn device_io_completion_with_mismatched_device_id_is_dropped() {
+        type CreateReplies = Arc<Mutex<Vec<(u64, Result<irp::CreateReply, u32>)>>>;
+
+        struct CreateOnReadyConsumer {
+            replies: CreateReplies,
+        }
+        impl DriveConsumer for CreateOnReadyConsumer {
+            fn on_device_ready(
+                &mut self,
+                device_id: u32,
+                _device_type: u32,
+                _dos_name: &str,
+            ) -> Vec<DriveCommand> {
+                vec![DriveCommand::Create {
+                    device_id,
+                    path: "\\".to_owned(),
+                    desired_access: irp::GENERIC_READ,
+                    create_disposition: irp::FILE_OPEN,
+                    create_options: irp::FILE_DIRECTORY_FILE,
+                    request_tag: 1,
+                }]
+            }
+            fn on_create_reply(
+                &mut self,
+                request_tag: u64,
+                result: Result<irp::CreateReply, u32>,
+            ) -> Vec<DriveCommand> {
+                self.replies.lock().unwrap().push((request_tag, result));
+                Vec::new()
+            }
+            fn on_close_reply(&mut self, _request_tag: u64, _status: u32) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_read_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<Vec<u8>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_write_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<u32, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_query_directory_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<Option<irp::DirectoryEntry>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_set_information_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<(), u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+        }
+
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let (mut channel, _initial) = RdpdrChannel::new(
+            1004,
+            1002,
+            pdu::RDPDR_DTYP_FILESYSTEM,
+            Box::new(CreateOnReadyConsumer {
+                replies: Arc::clone(&replies),
+            }),
+        );
+
+        send_message(
+            &mut channel,
+            device_list_announce(&[(pdu::RDPDR_DTYP_FILESYSTEM, 1, "share")]),
+        );
+
+        // Completion claims a different DeviceId (2) than the pending
+        // CREATE was issued against (1) - must be dropped, not routed to
+        // the consumer as if it were a real reply.
+        let mut completion = Vec::new();
+        completion.write_u16_le(pdu::RDPDR_CTYP_CORE);
+        completion.write_u16_le(pdu::PAKID_CORE_DEVICE_IOCOMPLETION);
+        completion.write_u32_le(2); // DeviceId (wrong)
+        completion.write_u32_le(0); // CompletionId
+        completion.write_u32_le(pdu::STATUS_SUCCESS);
+        completion.write_u32_le(99); // FileId
+        completion.write_u8(irp::FILE_OPENED);
+
+        let out = send_message(&mut channel, completion);
+        assert!(out.is_empty());
+        assert!(
+            replies.lock().unwrap().is_empty(),
+            "mismatched-device_id completion must not reach the consumer"
+        );
     }
 
     #[test]
