@@ -17,9 +17,7 @@ use rdpcore_rdpdr::{DriveConsumerFactory, RdpdrChannel};
 use rdpcore_rdpeai::{AudioInputBackendFactory, AudioInputHandler};
 #[cfg(feature = "gfx")]
 use rdpcore_rdpegfx::{GfxSession, select_h264_encoder};
-use rdpcore_rdpsnd::{
-    RdpsndChannel, RdpsndServerMessage, SoundServerFactory, WaveSubscriber, wave_channel,
-};
+use rdpcore_rdpsnd::{RdpsndChannel, RdpsndServerMessage, SoundServerFactory, wave_channel};
 use rdpcore_transport::{ChannelKey, ConnectionWriter, Frame, FrameSender, Priority};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -479,7 +477,7 @@ impl Session {
             .find(|(name, _)| name == rdpcore_rdpsnd::pdu::CHANNEL_NAME)
             .map(|(_, id)| *id);
         let mut rdpsnd_audio_rx = None;
-        let mut rdpsnd = match (rdpsnd_channel_id, &self.sound_factory) {
+        let rdpsnd = match (rdpsnd_channel_id, &self.sound_factory) {
             (Some(channel_id), Some(factory)) => {
                 let (tx, rx) = wave_channel();
                 let (channel, initial) = RdpsndChannel::new(
@@ -495,9 +493,31 @@ impl Session {
                     });
                 }
                 rdpsnd_audio_rx = Some(rx);
-                Some(channel)
+                Some(Arc::new(tokio::sync::Mutex::new(channel)))
             }
             (Some(_channel_id), None) => None,
+            _ => None,
+        };
+
+        // Wave chunks are pumped by a dedicated task rather than the
+        // steady-state loop below: GFX/bitmap encode there is necessarily
+        // synchronous (see `try_send_gfx_frame`'s doc comment), and a
+        // select!-branch-only audio path would stall for the full encode
+        // duration every time one runs. Locking `rdpsnd` from here never
+        // contends with the loop below - the loop only ever touches it for
+        // `on_channel_data`, briefly and never across an await.
+        let _audio_task = match (rdpsnd.clone(), rdpsnd_audio_rx.take()) {
+            (Some(channel), Some(mut audio_rx)) => {
+                let sender = frame_sender.clone();
+                Some(AbortOnDrop(tokio::spawn(async move {
+                    while let Some(RdpsndServerMessage::Wave(pcm, timestamp_ms)) =
+                        audio_rx.recv().await
+                    {
+                        let mut channel = channel.lock().await;
+                        send_wave_frames(&mut channel, &sender, pcm, timestamp_ms);
+                    }
+                })))
+            }
             _ => None,
         };
 
@@ -792,12 +812,13 @@ impl Session {
                                 {
                                     return Ok(());
                                 }
+                                let mut rdpsnd_guard = lock_rdpsnd(&rdpsnd).await;
                                 if let Err(e) = handle_slow_path_frame(
                                     &bytes,
                                     io_channel_id,
                                     &mut display_updates_allowed,
                                     updates.as_mut(),
-                                    rdpsnd.as_mut(),
+                                    rdpsnd_guard.as_deref_mut(),
                                     cliprdr.as_mut(),
                                     dvc.as_mut(),
                                     rdpdr.as_mut(),
@@ -855,12 +876,13 @@ impl Session {
                                         {
                                             return Ok(());
                                         }
+                                        let mut rdpsnd_guard = lock_rdpsnd(&rdpsnd).await;
                                         if let Err(err) = handle_slow_path_frame(
                                             &bytes,
                                             io_channel_id,
                                             &mut display_updates_allowed,
                                             updates.as_mut(),
-                                            rdpsnd.as_mut(),
+                                            rdpsnd_guard.as_deref_mut(),
                                             cliprdr.as_mut(),
                                             dvc.as_mut(),
                                             rdpdr.as_mut(),
@@ -881,12 +903,13 @@ impl Session {
                             }
                         }
                         Ok(SteadyStateFrame::SlowPath(bytes)) => {
+                            let mut rdpsnd_guard = lock_rdpsnd(&rdpsnd).await;
                             if let Err(e) = handle_slow_path_frame(
                                 &bytes,
                                 io_channel_id,
                                 &mut display_updates_allowed,
                                 updates.as_mut(),
-                                rdpsnd.as_mut(),
+                                rdpsnd_guard.as_deref_mut(),
                                 cliprdr.as_mut(),
                                 dvc.as_mut(),
                                 rdpdr.as_mut(),
@@ -941,13 +964,6 @@ impl Session {
                             {
                                 return Ok(());
                             }
-                            // GFX encode can stall this task; push the newest
-                            // Wave immediately so A/V lag cannot accumulate.
-                            flush_latest_wave(
-                                &mut rdpsnd_audio_rx,
-                                rdpsnd.as_mut(),
-                                &frame_sender,
-                            );
                         }
                         Ok(Some(DisplayUpdate::Resized(size))) if resizing => {
                             debug!("dropping resize to {}x{}: a previous resize is still in flight", size.width, size.height);
@@ -973,12 +989,6 @@ impl Session {
                             }
                         }
                         Ok(None) => return Ok(()),
-                    }
-                }
-                wave = recv_optional_wave(&mut rdpsnd_audio_rx) => {
-                    let Some(RdpsndServerMessage::Wave(pcm, timestamp_ms)) = wave else { continue };
-                    if let Some(channel) = rdpsnd.as_mut() {
-                        send_wave_frames(channel, &frame_sender, pcm, timestamp_ms);
                     }
                 }
                 clipboard_event = recv_optional(&mut cliprdr_event_rx) => {
@@ -1184,10 +1194,27 @@ async fn recv_optional<T>(rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<T
     }
 }
 
-async fn recv_optional_wave(rx: &mut Option<WaveSubscriber>) -> Option<RdpsndServerMessage> {
-    match rx {
-        Some(rx) => rx.recv().await,
-        None => std::future::pending().await,
+/// Locks the shared `RdpsndChannel` for a control-plane touch
+/// (`on_channel_data`). Never held across an await beyond the lock
+/// acquisition itself, so it never competes with the audio task's own
+/// brief lock in `send_wave_frames`.
+async fn lock_rdpsnd(
+    rdpsnd: &Option<Arc<tokio::sync::Mutex<RdpsndChannel>>>,
+) -> Option<tokio::sync::MutexGuard<'_, RdpsndChannel>> {
+    match rdpsnd {
+        Some(channel) => Some(channel.lock().await),
+        None => None,
+    }
+}
+
+/// Aborts the wrapped task when dropped - used so the per-connection audio
+/// task (which otherwise loops forever on `WaveSubscriber::recv`) always
+/// stops when `run_steady_state` returns, on every exit path.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -1205,23 +1232,6 @@ fn send_wave_frames(
             bytes,
         });
     }
-}
-
-fn flush_latest_wave(
-    rx: &mut Option<WaveSubscriber>,
-    rdpsnd: Option<&mut RdpsndChannel>,
-    frame_sender: &rdpcore_transport::FrameSender,
-) {
-    let Some(rx) = rx.as_mut() else {
-        return;
-    };
-    let Some(RdpsndServerMessage::Wave(pcm, timestamp_ms)) = rx.take_latest() else {
-        return;
-    };
-    let Some(channel) = rdpsnd else {
-        return;
-    };
-    send_wave_frames(channel, frame_sender, pcm, timestamp_ms);
 }
 
 /// Slow-path traffic at steady state: static channels plus IO-channel
@@ -1785,5 +1795,79 @@ mod tests {
         assert_eq!(stats.tiles, 150); // 1200 / 8 scanline strips
         assert_eq!(stats.update_batches, 5); // ceil(150 / 32)
         assert_eq!(stats.raw_tiles, 150);
+    }
+
+    #[derive(Debug, Default)]
+    struct DummySoundHandler;
+
+    impl rdpcore_rdpsnd::RdpsndServerHandler for DummySoundHandler {
+        fn get_formats(&self) -> &[rdpcore_rdpsnd::pdu::AudioFormat] {
+            &[]
+        }
+
+        fn choose_format(
+            &mut self,
+            _common: &[rdpcore_rdpsnd::pdu::NegotiatedFormat],
+        ) -> Option<rdpcore_rdpsnd::pdu::NegotiatedFormat> {
+            None
+        }
+
+        fn start(
+            &mut self,
+            _format: &rdpcore_rdpsnd::pdu::NegotiatedFormat,
+        ) -> Result<(), Box<dyn rdpcore_rdpsnd::RdpsndError>> {
+            Ok(())
+        }
+
+        fn stop(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn lock_rdpsnd_returns_none_when_no_channel_negotiated() {
+        let rdpsnd: Option<std::sync::Arc<tokio::sync::Mutex<super::RdpsndChannel>>> = None;
+        assert!(super::lock_rdpsnd(&rdpsnd).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn lock_rdpsnd_locks_the_shared_channel() {
+        let (channel, _initial) =
+            super::RdpsndChannel::new(1004, 1002, Box::new(DummySoundHandler));
+        let rdpsnd = Some(std::sync::Arc::new(tokio::sync::Mutex::new(channel)));
+
+        let guard = super::lock_rdpsnd(&rdpsnd).await.expect("channel present");
+        assert_eq!(guard.channel_id(), 1004);
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_cancels_the_wrapped_task() {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let spy = SetOnDrop(std::sync::Arc::clone(&dropped));
+        let guard = super::AbortOnDrop(tokio::spawn(async move {
+            let _spy = spy;
+            std::future::pending::<()>().await;
+        }));
+
+        drop(guard);
+
+        // Cancellation is cooperative on the runtime's side - give it a few
+        // scheduling turns to actually drop the aborted task's future.
+        for _ in 0..100 {
+            if dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "AbortOnDrop must cancel (and drop) the task it wraps"
+        );
     }
 }
