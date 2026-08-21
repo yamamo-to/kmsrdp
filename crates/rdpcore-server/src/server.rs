@@ -282,6 +282,14 @@ impl RdpServer {
                     continue;
                 }
             };
+            // Without this, Nagle's algorithm can hold a Priority::Latency
+            // frame (audio wave chunk, input ack, control PDU) in the
+            // kernel send buffer for up to ~40ms waiting for
+            // coalescing/ACK - directly undermining the write scheduler's
+            // whole purpose of draining latency-sensitive frames first.
+            if let Err(e) = tcp.set_nodelay(true) {
+                warn!(error = %e, "failed to set TCP_NODELAY");
+            }
             // Acquired here, before spawning - not inside the connection
             // task - so a flood of TCP connections that never send a byte
             // backpressures accept() itself once MAX_CONCURRENT_HANDSHAKES
