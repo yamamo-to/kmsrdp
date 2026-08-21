@@ -219,7 +219,7 @@ async fn main() -> Result<()> {
     let input = SharedInput::new(Input {
         device,
         mouse_scale,
-        x11_typer: X11UnicodeTyper::new(session_rx.clone()),
+        x11_typer: X11UnicodeTyper::spawn(session_rx.clone()),
     });
 
     let drive_factory: Box<dyn rdpcore_rdpdr::DriveConsumerFactory> = {

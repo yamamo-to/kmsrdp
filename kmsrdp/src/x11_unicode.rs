@@ -112,13 +112,23 @@ impl X11Connection {
 /// Holds a [`watch::Receiver`] so it can detect session changes
 /// synchronously from the input handler (which is called on the async
 /// executor without an `await` point).
-pub struct X11UnicodeTyper {
+///
+/// `type_char` does several synchronous X11 round-trips plus a fixed 30ms
+/// sleep (see its comment) - too slow to run inline on the shared input
+/// path, which every connected RDP session's keyboard input funnels
+/// through via a single `Mutex<Input>` (see `bin/rdp_server.rs`'s
+/// `SharedInput`). A burst of IME-composed characters would otherwise
+/// stall every other session's mouse/keyboard input for the sleep
+/// duration. [`X11UnicodeTyper`] below runs this on a dedicated thread
+/// instead, the same pattern `nvfbc.rs` uses for its OpenGL-context-bound
+/// capture calls.
+struct X11UnicodeWorker {
     session_rx: watch::Receiver<Option<Session>>,
     conn: Option<X11Connection>,
 }
 
-impl X11UnicodeTyper {
-    pub fn new(session_rx: watch::Receiver<Option<Session>>) -> Self {
+impl X11UnicodeWorker {
+    fn new(session_rx: watch::Receiver<Option<Session>>) -> Self {
         Self {
             session_rx,
             conn: None,
@@ -129,7 +139,7 @@ impl X11UnicodeTyper {
     ///
     /// Silently does nothing if there is no X11 session (Wayland-only or no
     /// active session). Reconnects automatically when the session changes.
-    pub fn type_char(&mut self, codepoint: u32) {
+    fn type_char(&mut self, codepoint: u32) {
         // Reconnect if the session has changed since last call.
         if self.session_rx.has_changed().unwrap_or(false) {
             self.conn = None;
@@ -163,6 +173,34 @@ impl X11UnicodeTyper {
     }
 }
 
+/// Handle to a dedicated background thread that owns the actual X11
+/// connection and performs the (slow, blocking) character injection.
+/// `type_char` here is a cheap, non-blocking channel send, safe to call
+/// from the shared input-handling path.
+pub struct X11UnicodeTyper {
+    tx: std::sync::mpsc::Sender<u32>,
+}
+
+impl X11UnicodeTyper {
+    pub fn spawn(session_rx: watch::Receiver<Option<Session>>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<u32>();
+        std::thread::spawn(move || {
+            let mut worker = X11UnicodeWorker::new(session_rx);
+            for codepoint in rx {
+                worker.type_char(codepoint);
+            }
+        });
+        Self { tx }
+    }
+
+    /// Enqueues `codepoint` for injection on the dedicated X11 worker
+    /// thread. Never blocks the caller; silently drops the character if
+    /// the worker thread has terminated.
+    pub fn type_char(&self, codepoint: u32) {
+        let _ = self.tx.send(codepoint);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,29 +224,38 @@ mod tests {
 
     #[test]
     fn type_char_without_session_is_noop() {
-        let mut typer = X11UnicodeTyper::new(session_rx(None));
+        let mut typer = X11UnicodeWorker::new(session_rx(None));
         typer.type_char('あ' as u32);
     }
 
     #[test]
     fn type_char_wayland_session_without_display_is_noop() {
-        let mut typer = X11UnicodeTyper::new(session_rx(Some(sample_session(None))));
+        let mut typer = X11UnicodeWorker::new(session_rx(Some(sample_session(None))));
         typer.type_char('あ' as u32);
     }
 
     #[test]
     fn type_char_invalid_display_does_not_panic() {
-        let mut typer = X11UnicodeTyper::new(session_rx(Some(sample_session(Some(":254")))));
+        let mut typer = X11UnicodeWorker::new(session_rx(Some(sample_session(Some(":254")))));
         typer.type_char('A' as u32);
     }
 
     #[test]
     fn session_change_clears_cached_connection() {
         let (tx, rx) = watch::channel(Some(sample_session(Some(":0"))));
-        let mut typer = X11UnicodeTyper::new(rx);
+        let mut typer = X11UnicodeWorker::new(rx);
         typer.type_char('x' as u32);
         tx.send(Some(sample_session(Some(":1"))))
             .expect("session switch");
         typer.type_char('y' as u32);
+    }
+
+    #[test]
+    fn spawned_typer_type_char_does_not_block_caller() {
+        // No X11 session at all, so the worker thread's type_char is an
+        // immediate no-op - this just exercises that `type_char` on the
+        // public handle is a plain channel send, not the worker itself.
+        let typer = X11UnicodeTyper::spawn(session_rx(None));
+        typer.type_char('z' as u32);
     }
 }
