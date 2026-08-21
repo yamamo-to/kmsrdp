@@ -235,7 +235,18 @@ impl DriveConsumer for DirectoryListingSelfTest {
             }
             Err(status) => {
                 self.log(format!("directory query failed: NTSTATUS {status:#010x}"));
-                Vec::new()
+                // Not STATUS_NO_MORE_FILES (that's Ok(None) above) - the
+                // enumeration ended abnormally, but root_file_id is still
+                // open on the client. Close it rather than leaking the
+                // handle for the rest of the session.
+                let Some(root_file_id) = self.root_file_id.take() else {
+                    return Vec::new();
+                };
+                vec![DriveCommand::Close {
+                    device_id: self.device_id,
+                    file_id: root_file_id,
+                    request_tag: 5,
+                }]
             }
         }
     }
