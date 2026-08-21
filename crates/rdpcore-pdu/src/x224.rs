@@ -3,7 +3,7 @@
 //! is past the initial cleartext exchange (MS-RDPBCGR 2.2.1.1 / 2.2.1.2).
 
 use crate::DecodeError;
-use crate::cursor::{ReadCursor, WriteBuf};
+use crate::cursor::{NotEnoughBytes, ReadCursor, WriteBuf};
 use crate::tpdu::{TpduCode, TpduHeader};
 use crate::tpkt::{self, TpktHeader};
 
@@ -195,12 +195,15 @@ fn read_cookie(cursor: &mut ReadCursor<'_>) -> Result<Option<String>, DecodeErro
     cursor.advance(COOKIE_PREFIX.len());
 
     let value_start = cursor.pos();
-    loop {
-        if cursor.peek_u16_be()? == 0x0D0A {
-            break;
-        }
-        cursor.advance(1);
-    }
+    let rest = cursor.peek_slice(cursor.remaining())?;
+    let crlf_offset = rest
+        .windows(2)
+        .position(|w| w == [0x0D, 0x0A])
+        .ok_or(NotEnoughBytes {
+            needed: rest.len() + 1,
+            remaining: rest.len(),
+        })?;
+    cursor.advance(crlf_offset);
     let value_end = cursor.pos();
     cursor.advance(2); // CRLF
 
