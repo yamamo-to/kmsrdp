@@ -44,12 +44,7 @@ fn ioctl_check(ret: libc::c_int, what: &str) -> io::Result<()> {
 /// The type `T` must be plain data without uninitialized memory or invalid byte patterns.
 unsafe fn as_byte_slice<T: Sized>(val: &T) -> &[u8] {
     // SAFETY: val is a valid reference to T for size_of::<T>() bytes over its lifetime.
-    unsafe {
-        std::slice::from_raw_parts(
-            (val as *const T) as *const u8,
-            mem::size_of::<T>(),
-        )
-    }
+    unsafe { std::slice::from_raw_parts((val as *const T) as *const u8, mem::size_of::<T>()) }
 }
 
 impl VirtualInput {

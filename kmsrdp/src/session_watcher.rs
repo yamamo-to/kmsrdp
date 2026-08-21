@@ -231,9 +231,13 @@ pub async fn start() -> Result<watch::Receiver<Option<Session>>> {
         let mut backoff = std::time::Duration::from_secs(1);
         loop {
             if let Err(e) = run_watcher(&conn, tx.clone()).await {
-                tracing::warn!("kmsrdp: session watcher disconnected: {e}; reconnecting in {backoff:?}");
+                tracing::warn!(
+                    "kmsrdp: session watcher disconnected: {e}; reconnecting in {backoff:?}"
+                );
             } else {
-                tracing::info!("kmsrdp: session watcher stream closed; reconnecting in {backoff:?}");
+                tracing::info!(
+                    "kmsrdp: session watcher stream closed; reconnecting in {backoff:?}"
+                );
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(std::time::Duration::from_secs(30));

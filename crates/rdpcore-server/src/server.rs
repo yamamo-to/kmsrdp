@@ -306,8 +306,7 @@ impl Session {
             .acquire()
             .await
             .expect("handshake_permits semaphore is never closed");
-        let negotiated = match tokio::time::timeout(HANDSHAKE_TIMEOUT, self.negotiate(tcp)).await
-        {
+        let negotiated = match tokio::time::timeout(HANDSHAKE_TIMEOUT, self.negotiate(tcp)).await {
             Ok(result) => result?,
             Err(_) => {
                 warn!("handshake did not complete within {HANDSHAKE_TIMEOUT:?}");
@@ -575,11 +574,11 @@ impl Session {
                         // this task - nothing awaits its JoinHandle (only
                         // AbortOnDrop's Drop, which just aborts), so audio
                         // would otherwise stop dead with no log line at all.
-                        if let Err(panic) = std::panic::catch_unwind(
-                            std::panic::AssertUnwindSafe(|| {
+                        if let Err(panic) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 send_wave_frames(&mut channel, &sender, pcm, timestamp_ms);
-                            }),
-                        ) {
+                            }))
+                        {
                             warn!("rdpsnd: audio task panicked in send_wave_frames: {panic:?}");
                         }
                     }
