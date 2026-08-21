@@ -9,7 +9,7 @@
 use std::fs;
 use std::io;
 use std::os::unix::io::{AsFd, AsRawFd};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use drm::Device;
 use drm::control::{Device as ControlDevice, connector, crtc, plane, property};
@@ -371,7 +371,7 @@ pub struct RawFrame {
     pub width: u32,
     pub height: u32,
     pub stride: usize,
-    pub data: Vec<u8>,
+    pub data: Arc<[u8]>,
     /// True when the DRM primary plane swapped to a different framebuffer
     /// object (e.g. Xorg exited and fbcon restored the console FB). Existing
     /// RDP clients only receive dirty-rect updates, so a scene change that
@@ -445,7 +445,7 @@ impl Capturer {
                     width,
                     height,
                     stride: width as usize * 4,
-                    data,
+                    data: data.into(),
                     force_full: false,
                     monitors: vec![MonitorGeom {
                         left: 0,
@@ -545,7 +545,7 @@ struct CapturedHead {
     width: u32,
     height: u32,
     stride: usize,
-    data: Vec<u8>,
+    data: Arc<[u8]>,
     force_full: bool,
     connector: String,
 }
@@ -708,9 +708,16 @@ impl DrmCapturer {
                     .map(fd.as_raw_fd())
                     .map_err(|e| io::Error::other(format!("mmap failed: {e}")))?
             };
-            (pitch, mmap.to_vec())
+            // Copy straight from the mmap into the Arc<[u8]> RawFrame/
+            // CapturedHead ultimately need, instead of an intermediate
+            // Vec that a later Vec -> Arc<[u8]> conversion would have to
+            // copy *again* (Arc<[u8]>'s layout has a refcount header a
+            // Vec's buffer doesn't, so that conversion can never just
+            // reuse the allocation) - halves the memcpy bandwidth for
+            // this, the most common (non-tiled) capture path.
+            (pitch, Arc::from(&mmap[..]))
         } else if is_detileable_bgrx {
-            let data = gpu_detile::detile_to_bgrx(
+            let data: Arc<[u8]> = gpu_detile::detile_to_bgrx(
                 &card_ctx.path,
                 fd.as_raw_fd(),
                 fourcc,
@@ -719,7 +726,8 @@ impl DrmCapturer {
                 height,
                 offsets[0],
                 pitches[0],
-            )?;
+            )?
+            .into();
             (width as usize * 4, data)
         } else {
             return Err(io::Error::new(
@@ -801,7 +809,7 @@ fn compose_heads(heads: &[CapturedHead]) -> RawFrame {
         width: canvas_w,
         height: canvas_h,
         stride,
-        data,
+        data: data.into(),
         force_full,
         monitors,
     }
@@ -929,7 +937,7 @@ mod tests {
             width: 2,
             height: 1,
             stride: 8,
-            data: vec![1, 0, 0, 0, 2, 0, 0, 0],
+            data: vec![1, 0, 0, 0, 2, 0, 0, 0].into(),
             force_full: false,
             connector: "A".into(),
         };
@@ -939,7 +947,7 @@ mod tests {
             width: 2,
             height: 1,
             stride: 8,
-            data: vec![3, 0, 0, 0, 4, 0, 0, 0],
+            data: vec![3, 0, 0, 0, 4, 0, 0, 0].into(),
             force_full: true,
             connector: "B".into(),
         };

@@ -185,7 +185,9 @@ impl DisplayHub {
                         continue;
                     };
 
-                    let data: Arc<[u8]> = Arc::from(raw.data);
+                    // RawFrame::data is already an Arc<[u8]> (see
+                    // capture.rs) - no conversion, just a move.
+                    let data: Arc<[u8]> = raw.data;
                     let full = BitmapUpdate {
                         x: 0,
                         y: 0,
