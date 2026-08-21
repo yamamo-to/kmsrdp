@@ -534,6 +534,11 @@ impl Session {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        // Guarantees input::reset() runs once this connection's steady
+        // state ends, no matter which of the many return/`?` paths below
+        // gets taken.
+        let _reset_input_on_drop = ResetInputOnDrop(Arc::clone(&self.input));
+
         let (mut read_half, write_half) = tokio::io::split(stream);
         let (writer, frame_sender) = ConnectionWriter::new(write_half);
         // Detached: it keeps running/flushing until every `FrameSender`
@@ -1374,6 +1379,19 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Calls `RdpServerInputHandler::reset` when this connection's steady
+/// state ends, on every exit path (clean return, `?` propagation, even a
+/// panic unwind) - so a key/button this connection left physically "down"
+/// (client disconnected mid-keypress, before the matching `Released`
+/// arrived) doesn't stay stuck on a shared input device forever.
+struct ResetInputOnDrop(Arc<Mutex<dyn RdpServerInputHandler>>);
+
+impl Drop for ResetInputOnDrop {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).reset();
+    }
+}
+
 fn send_wave_frames(
     channel: &mut RdpsndChannel,
     frame_sender: &rdpcore_transport::FrameSender,
@@ -1991,5 +2009,30 @@ mod tests {
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "AbortOnDrop must cancel (and drop) the task it wraps"
         );
+    }
+
+    #[test]
+    fn reset_input_on_drop_calls_reset() {
+        use crate::input::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct RecordingHandler {
+            reset_calls: usize,
+        }
+        impl RdpServerInputHandler for RecordingHandler {
+            fn keyboard(&mut self, _event: KeyboardEvent) {}
+            fn mouse(&mut self, _event: MouseEvent) {}
+            fn reset(&mut self) {
+                self.reset_calls += 1;
+            }
+        }
+
+        let handler = Arc::new(Mutex::new(RecordingHandler::default()));
+        let dyn_handler: Arc<Mutex<dyn RdpServerInputHandler>> = handler.clone();
+        let guard = super::ResetInputOnDrop(dyn_handler);
+        assert_eq!(handler.lock().unwrap().reset_calls, 0);
+        drop(guard);
+        assert_eq!(handler.lock().unwrap().reset_calls, 1);
     }
 }

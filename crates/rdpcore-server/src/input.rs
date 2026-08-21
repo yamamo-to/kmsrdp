@@ -36,4 +36,16 @@ pub enum MouseEvent {
 pub trait RdpServerInputHandler: Send {
     fn keyboard(&mut self, event: KeyboardEvent);
     fn mouse(&mut self, event: MouseEvent);
+
+    /// Called when an RDP connection ends, for any reason (clean
+    /// disconnect, network drop, client crash). Implementations that
+    /// inject input into a persistent device (e.g. `uinput`) should
+    /// release any key/button this connection left physically "down" -
+    /// a client can disconnect mid-keypress (before the matching
+    /// `Released` arrives), and without this the device would otherwise
+    /// report that key held forever, which e.g. X11's key-repeat then
+    /// turns into the key retyping itself indefinitely.
+    ///
+    /// Default no-op so existing implementations still compile.
+    fn reset(&mut self) {}
 }

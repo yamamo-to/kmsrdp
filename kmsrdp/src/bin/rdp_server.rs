@@ -18,6 +18,7 @@
 //! uinput device ([`SharedInput`]); audio is per-connection. Clipboard
 //! backends are per-connection but share one process-wide local poller.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -40,6 +41,15 @@ struct Input {
     device: VirtualInput,
     mouse_scale: MouseScale,
     x11_typer: X11UnicodeTyper,
+    /// Linux keycodes currently reported as held down, so `reset` can
+    /// release exactly those on disconnect - a client that disconnects
+    /// mid-keypress (before the matching `Released` arrives) would
+    /// otherwise leave the shared uinput device reporting that key held
+    /// forever, which e.g. X11's key-repeat then turns into the key
+    /// retyping itself indefinitely.
+    pressed_keys: HashSet<i32>,
+    /// Same idea for mouse buttons.
+    pressed_buttons: HashSet<i32>,
 }
 
 /// Cloneable handle around the singleton uinput / X11 typer. All RDP
@@ -75,6 +85,10 @@ impl RdpServerInputHandler for SharedInput {
             .unwrap_or_else(|e| e.into_inner())
             .mouse(event);
     }
+
+    fn reset(&mut self) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).reset();
+    }
 }
 
 impl RdpServerInputHandler for Input {
@@ -98,28 +112,67 @@ impl RdpServerInputHandler for Input {
                 if let Err(e) = self.device.key(keycode, down) {
                     tracing::warn!(error = %e, "key injection failed");
                 }
+                if down {
+                    self.pressed_keys.insert(keycode);
+                } else {
+                    self.pressed_keys.remove(&keycode);
+                }
             }
             None => tracing::debug!(scancode = code, extended, "no keycode mapping for scancode"),
         }
     }
 
     fn mouse(&mut self, event: MouseEvent) {
+        let button = match event {
+            MouseEvent::LeftPressed | MouseEvent::LeftReleased => Some(uinput::BTN_LEFT),
+            MouseEvent::RightPressed | MouseEvent::RightReleased => Some(uinput::BTN_RIGHT),
+            MouseEvent::MiddlePressed | MouseEvent::MiddleReleased => Some(uinput::BTN_MIDDLE),
+            MouseEvent::Move { .. } | MouseEvent::VerticalScroll { .. } => None,
+        };
+        let down = matches!(
+            event,
+            MouseEvent::LeftPressed | MouseEvent::RightPressed | MouseEvent::MiddlePressed
+        );
+
         let result = match event {
             MouseEvent::Move { x, y } => {
                 let (width, height) = *self.mouse_scale.lock().unwrap_or_else(|e| e.into_inner());
                 self.device
                     .move_abs(f64::from(x) / width, f64::from(y) / height)
             }
-            MouseEvent::LeftPressed => self.device.button(uinput::BTN_LEFT, true),
-            MouseEvent::LeftReleased => self.device.button(uinput::BTN_LEFT, false),
-            MouseEvent::RightPressed => self.device.button(uinput::BTN_RIGHT, true),
-            MouseEvent::RightReleased => self.device.button(uinput::BTN_RIGHT, false),
-            MouseEvent::MiddlePressed => self.device.button(uinput::BTN_MIDDLE, true),
-            MouseEvent::MiddleReleased => self.device.button(uinput::BTN_MIDDLE, false),
+            MouseEvent::LeftPressed | MouseEvent::LeftReleased => {
+                self.device.button(uinput::BTN_LEFT, down)
+            }
+            MouseEvent::RightPressed | MouseEvent::RightReleased => {
+                self.device.button(uinput::BTN_RIGHT, down)
+            }
+            MouseEvent::MiddlePressed | MouseEvent::MiddleReleased => {
+                self.device.button(uinput::BTN_MIDDLE, down)
+            }
             MouseEvent::VerticalScroll { value } => self.device.scroll(value),
         };
         if let Err(e) = result {
             tracing::warn!(error = %e, "mouse injection failed");
+        }
+        if let Some(button) = button {
+            if down {
+                self.pressed_buttons.insert(button);
+            } else {
+                self.pressed_buttons.remove(&button);
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        for keycode in self.pressed_keys.drain() {
+            if let Err(e) = self.device.key(keycode, false) {
+                tracing::warn!(error = %e, keycode, "failed to release stuck key on disconnect");
+            }
+        }
+        for button in self.pressed_buttons.drain() {
+            if let Err(e) = self.device.button(button, false) {
+                tracing::warn!(error = %e, button, "failed to release stuck mouse button on disconnect");
+            }
         }
     }
 }
@@ -234,6 +287,8 @@ async fn main() -> Result<()> {
         device,
         mouse_scale,
         x11_typer: X11UnicodeTyper::spawn(session_rx.clone()),
+        pressed_keys: HashSet::new(),
+        pressed_buttons: HashSet::new(),
     });
 
     let drive_factory: Box<dyn rdpcore_rdpdr::DriveConsumerFactory> = {
