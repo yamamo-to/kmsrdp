@@ -558,7 +558,7 @@ impl Session {
 
         // Wave chunks are pumped by a dedicated task rather than the
         // steady-state loop below: GFX/bitmap encode there is necessarily
-        // synchronous (see `try_send_gfx_frame`'s doc comment), and a
+        // synchronous (see `try_encode_gfx_frame`'s doc comment), and a
         // select!-branch-only audio path would stall for the full encode
         // duration every time one runs. Locking `rdpsnd` from here never
         // contends with the loop below - the loop only ever touches it for
@@ -571,8 +571,19 @@ impl Session {
                         audio_rx.recv().await
                     {
                         let mut channel = channel.lock().await;
-                        send_wave_frames(&mut channel, &sender, pcm, timestamp_ms);
+                        // Catch rather than let a panic here silently kill
+                        // this task - nothing awaits its JoinHandle (only
+                        // AbortOnDrop's Drop, which just aborts), so audio
+                        // would otherwise stop dead with no log line at all.
+                        if let Err(panic) = std::panic::catch_unwind(
+                            std::panic::AssertUnwindSafe(|| {
+                                send_wave_frames(&mut channel, &sender, pcm, timestamp_ms);
+                            }),
+                        ) {
+                            warn!("rdpsnd: audio task panicked in send_wave_frames: {panic:?}");
+                        }
                     }
+                    debug!("rdpsnd: audio task ending (wave sender dropped)");
                 })))
             }
             _ => None,
@@ -1320,9 +1331,21 @@ fn gfx_env_enabled() -> bool {
 /// there isn't one (no rdpsnd negotiated for this connection), which is
 /// exactly the right behavior for a `tokio::select!` branch that should
 /// simply never fire in that case.
+///
+/// If the sender side is ever dropped, `rx` is cleared to `None` so later
+/// calls take that never-resolving path instead of `UnboundedReceiver::
+/// recv` on a closed channel, which returns `Ready(None)` immediately on
+/// every poll - left as `Some`, this select! branch would busy-loop the
+/// connection's task at 100% CPU instead of parking.
 async fn recv_optional<T>(rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<T>>) -> Option<T> {
     match rx {
-        Some(rx) => rx.recv().await,
+        Some(r) => {
+            let msg = r.recv().await;
+            if msg.is_none() {
+                *rx = None;
+            }
+            msg
+        }
         None => std::future::pending().await,
     }
 }
