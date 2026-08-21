@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.43
+Version:        0.1.46
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,19 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Fri Aug 21 2026 kmsrdp contributors <noreply@example.com> - 0.1.46-1
+- Decouple RDPSND wave delivery from the steady-state session loop
+- Release stuck keys/mouse buttons on RDP disconnect
+- Broad correctness/security hardening across the RDP stack (write
+  scheduler priority, RDPDR device lifecycle, NVENC resource teardown,
+  handshake timeouts, and more)
+- Performance and code-quality pass: TCP_NODELAY, fewer per-frame
+  allocations/copies in capture and video encoding, deduplicated
+  protocol decode helpers
+- Fixes packaging: this spec's Version had drifted from Cargo.toml
+  since 0.1.44, so 0.1.44/0.1.45 never actually shipped correctly
+  versioned RPMs
+
 * Fri Aug 21 2026 kmsrdp contributors <noreply@example.com> - 0.1.43-1
 - Drain stale PulseAudio/PipeWire capture buffer to prevent audio lag accumulation
 - Use monotonic real-time timestamps in RDPSND Wave2 frames

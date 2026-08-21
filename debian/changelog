@@ -1,3 +1,19 @@
+kmsrdp (0.1.46) unstable; urgency=medium
+
+  * Decouple RDPSND wave delivery from the steady-state session loop.
+  * Release stuck keys/mouse buttons on RDP disconnect.
+  * Broad correctness/security hardening across the RDP stack (write
+    scheduler priority, RDPDR device lifecycle, NVENC resource teardown,
+    handshake timeouts, and more).
+  * Performance and code-quality pass: TCP_NODELAY, fewer per-frame
+    allocations/copies in capture and video encoding, deduplicated
+    protocol decode helpers.
+  * Fixes packaging: debian/changelog's version had drifted from
+    Cargo.toml since 0.1.44, so 0.1.44/0.1.45 never actually shipped
+    correctly versioned debs.
+
+ -- kmsrdp contributors <noreply@example.com>  Fri, 21 Aug 2026 11:55:00 +0900
+
 kmsrdp (0.1.43) unstable; urgency=medium
 
   * Drain stale PulseAudio/PipeWire capture buffer to prevent audio lag accumulation.
