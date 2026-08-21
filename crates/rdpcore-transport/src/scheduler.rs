@@ -65,11 +65,19 @@ impl Scheduler {
         Self::default()
     }
 
+    /// A single `ChannelKey` (e.g. the multiplexed drdynvc mux channel)
+    /// can legitimately carry both `Latency` and `Bulk` frames - so
+    /// channels are split into a separate scheduler queue per
+    /// `(ChannelKey, Priority)` pair rather than one queue per key. That
+    /// keeps FIFO order within each priority class while still letting a
+    /// `Latency` frame on a channel preempt `Bulk` frames already queued
+    /// for that same channel, instead of getting stuck behind them in one
+    /// shared FIFO.
     pub fn enqueue(&mut self, frame: Frame) {
         let idx = self
             .queues
             .iter()
-            .position(|q| q.key == frame.channel)
+            .position(|q| q.key == frame.channel && q.priority == frame.priority)
             .unwrap_or_else(|| {
                 self.queues.push(ChannelQueue {
                     key: frame.channel,
@@ -197,6 +205,25 @@ mod tests {
         assert_eq!(s.pop_next(), Some(vec![10]));
         assert_eq!(s.pop_next(), Some(vec![2]));
         assert_eq!(s.pop_next(), Some(vec![20]));
+        assert_eq!(s.pop_next(), None);
+    }
+
+    #[test]
+    fn priority_is_tracked_per_frame_not_per_channel() {
+        // Models drdynvc: GFX (Bulk) and DVC control (Latency) frames both
+        // travel over the same multiplexed ChannelKey.
+        let mut s = Scheduler::new();
+        let dvc = ChannelKey::Static(1004);
+        s.enqueue(frame(dvc, Priority::Bulk, 1));
+        s.enqueue(frame(dvc, Priority::Bulk, 2));
+        s.enqueue(frame(dvc, Priority::Latency, 0xAA));
+
+        // The channel's first-ever frames were Bulk, but a Latency frame
+        // on the SAME channel key must still preempt Bulk frames already
+        // queued ahead of it for that key, not get stuck behind them.
+        assert_eq!(s.pop_next(), Some(vec![0xAA]));
+        assert_eq!(s.pop_next(), Some(vec![1]));
+        assert_eq!(s.pop_next(), Some(vec![2]));
         assert_eq!(s.pop_next(), None);
     }
 
