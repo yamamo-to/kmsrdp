@@ -182,9 +182,18 @@ impl RdpServerBuilder {
             require_nla: self.require_nla,
             #[cfg(feature = "dvc-echo")]
             echo_smoke_test: self.echo_smoke_test,
+            handshake_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES)),
         }
     }
 }
+
+/// Bounds how many connections may be in the (unauthenticated, pre-steady-
+/// state) handshake phase at once. Combined with `HANDSHAKE_TIMEOUT` (see
+/// `handle_connection`), this caps the resources a flood of slow/idle
+/// sockets can tie up before either completing the handshake or timing
+/// out - accept() itself is never blocked, connections beyond this limit
+/// just queue for a permit.
+const MAX_CONCURRENT_HANDSHAKES: usize = 512;
 
 pub struct RdpServer {
     addr: Option<SocketAddr>,
@@ -202,6 +211,7 @@ pub struct RdpServer {
     require_nla: bool,
     #[cfg(feature = "dvc-echo")]
     echo_smoke_test: bool,
+    handshake_permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// Per-connection clone of the shared server handles. Accepting a new
@@ -221,6 +231,7 @@ struct Session {
     require_nla: bool,
     #[cfg(feature = "dvc-echo")]
     echo_smoke_test: bool,
+    handshake_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl RdpServer {
@@ -243,6 +254,7 @@ impl RdpServer {
             require_nla: self.require_nla,
             #[cfg(feature = "dvc-echo")]
             echo_smoke_test: self.echo_smoke_test,
+            handshake_permits: Arc::clone(&self.handshake_permits),
         }
     }
 
@@ -275,9 +287,54 @@ impl RdpServer {
     }
 }
 
+/// Bounds everything before the steady-state loop: cleartext negotiation,
+/// TLS handshake, CredSSP, and the MCS/finalization handshake. None of
+/// that involves waiting on the user, so a client that opens a socket and
+/// then trickles bytes (or sends none at all) would otherwise tie up a
+/// connection task - and its slot in the per-connection resources below -
+/// indefinitely. Once `run_steady_state` starts, no timeout applies: an
+/// idle-but-connected client is expected and fine.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl Session {
-    async fn handle_connection(&self, mut tcp: TcpStream) -> anyhow::Result<()> {
+    async fn handle_connection(&self, tcp: TcpStream) -> anyhow::Result<()> {
         let peer = tcp.peer_addr()?;
+        // Held only for the handshake itself - queues if
+        // MAX_CONCURRENT_HANDSHAKES is already in flight, never rejects.
+        let permit = self
+            .handshake_permits
+            .acquire()
+            .await
+            .expect("handshake_permits semaphore is never closed");
+        let negotiated = match tokio::time::timeout(HANDSHAKE_TIMEOUT, self.negotiate(tcp)).await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                warn!("handshake did not complete within {HANDSHAKE_TIMEOUT:?}");
+                return Ok(());
+            }
+        };
+        drop(permit);
+        let Some((tls, acceptor, accepted)) = negotiated else {
+            return Ok(());
+        };
+        self.run_steady_state(peer, tls, acceptor, accepted).await
+    }
+
+    /// Runs cleartext negotiation through MCS finalization. `Ok(None)`
+    /// means the connection ended for an expected reason (rejected
+    /// negotiation, failed auth, ...) and the caller should just return
+    /// `Ok(())`; errors are unexpected I/O/protocol failures.
+    async fn negotiate(
+        &self,
+        mut tcp: TcpStream,
+    ) -> anyhow::Result<
+        Option<(
+            tokio_rustls::server::TlsStream<TcpStream>,
+            Acceptor,
+            AcceptedConnection,
+        )>,
+    > {
         let desktop = self.display.size().await;
         let mut acceptor =
             Acceptor::new(desktop.width, desktop.height).with_require_nla(self.require_nla);
@@ -305,7 +362,7 @@ impl Session {
                     "rejected at negotiation - client offered neither \
                      PROTOCOL_HYBRID nor PROTOCOL_SSL"
                 );
-                return Ok(());
+                return Ok(None);
             }
             other => anyhow::bail!("unexpected acceptor event before TLS upgrade: {other:?}"),
         }
@@ -326,11 +383,11 @@ impl Session {
         if acceptor.requires_credssp() {
             let Some(credentials) = self.nla_credentials.clone() else {
                 info!("client requested NLA but server has no NLA credentials configured");
-                return Ok(());
+                return Ok(None);
             };
             if self.tls_public_key.is_empty() {
                 warn!("client requested NLA but server TLS public key is missing");
-                return Ok(());
+                return Ok(None);
             }
             info!("starting CredSSP (NTLMv2)");
             match credssp::run_credssp_nla(
@@ -347,7 +404,7 @@ impl Session {
                 }
                 Err(e) => {
                     warn!("CredSSP failed: {e}");
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         }
@@ -425,7 +482,7 @@ impl Session {
                             credentials.username, credentials.domain
                         );
                         acceptor.reject_client_info();
-                        return Ok(());
+                        return Ok(None);
                     }
                     if !result.response.is_empty() {
                         tls.write_all(&result.response).await?;
@@ -444,12 +501,12 @@ impl Session {
                 }
                 AcceptorEvent::Rejected => {
                     warn!("rejected during handshake");
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         };
 
-        self.run_steady_state(peer, tls, acceptor, accepted).await
+        Ok(Some((tls, acceptor, accepted)))
     }
 
     async fn run_steady_state<S>(
