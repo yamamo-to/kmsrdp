@@ -264,19 +264,7 @@ fn decode_device_list_announce(body: &[u8]) -> Result<Vec<DeviceAnnounce>, Decod
     // before variable deviceData; reject impossible counts so a hostile
     // DeviceCount cannot `Vec::with_capacity` to OOM under fuzz/ASAN.
     const MIN_ANNOUNCE_BYTES: usize = 4 + 4 + 8 + 4;
-    let needed = device_count
-        .checked_mul(MIN_ANNOUNCE_BYTES)
-        .ok_or(DecodeError::InvalidValue {
-            field: "rdpdr.deviceCount",
-            reason: "count overflow",
-        })?;
-    if cursor.remaining() < needed {
-        return Err(rdpcore_pdu::cursor::NotEnoughBytes {
-            needed,
-            remaining: cursor.remaining(),
-        }
-        .into());
-    }
+    cursor.ensure_count(device_count, MIN_ANNOUNCE_BYTES, "rdpdr.deviceCount")?;
     let mut devices = Vec::with_capacity(device_count);
     for _ in 0..device_count {
         let device_type = cursor.read_u32_le()?;
@@ -301,19 +289,7 @@ fn decode_device_list_remove(body: &[u8]) -> Result<Vec<u32>, DecodeError> {
     let device_count = cursor.read_u32_le()? as usize;
     // Reject impossible counts before allocating, same reasoning as
     // decode_device_list_announce.
-    let needed = device_count
-        .checked_mul(4)
-        .ok_or(DecodeError::InvalidValue {
-            field: "rdpdr.deviceCount",
-            reason: "count overflow",
-        })?;
-    if cursor.remaining() < needed {
-        return Err(rdpcore_pdu::cursor::NotEnoughBytes {
-            needed,
-            remaining: cursor.remaining(),
-        }
-        .into());
-    }
+    cursor.ensure_count(device_count, 4, "rdpdr.deviceCount")?;
     let mut device_ids = Vec::with_capacity(device_count);
     for _ in 0..device_count {
         device_ids.push(cursor.read_u32_le()?);

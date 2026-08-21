@@ -96,20 +96,7 @@ pub fn decode_client_message(input: &[u8]) -> Result<ClientMessage, DecodeError>
             // hostile num_formats to reserve gigabytes with nothing to
             // back it, same reasoning as rdpdr's DeviceCount check.
             const MIN_FORMAT_BYTES: usize = 2 + 2 + 4 + 4 + 2 + 2 + 2;
-            let needed =
-                num_formats
-                    .checked_mul(MIN_FORMAT_BYTES)
-                    .ok_or(DecodeError::InvalidValue {
-                        field: "rdpeai.numFormats",
-                        reason: "count overflow",
-                    })?;
-            if cursor.remaining() < needed {
-                return Err(rdpcore_pdu::cursor::NotEnoughBytes {
-                    needed,
-                    remaining: cursor.remaining(),
-                }
-                .into());
-            }
+            cursor.ensure_count(num_formats, MIN_FORMAT_BYTES, "rdpeai.numFormats")?;
             let formats = (0..num_formats)
                 .map(|_| AudioFormat::decode(&mut cursor))
                 .collect::<Result<_, _>>()?;

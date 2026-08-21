@@ -163,14 +163,7 @@ fn decode_client_audio_formats(body: &[u8]) -> Result<ClientAudioFormats, Decode
     // NumFormats checks. `count` is a u16 so the blast radius is already
     // small, but this keeps the three format-list decoders consistent.
     const MIN_FORMAT_BYTES: usize = 2 + 2 + 4 + 4 + 2 + 2 + 2;
-    let needed = usize::from(count) * MIN_FORMAT_BYTES;
-    if cursor.remaining() < needed {
-        return Err(rdpcore_pdu::cursor::NotEnoughBytes {
-            needed,
-            remaining: cursor.remaining(),
-        }
-        .into());
-    }
+    cursor.ensure_count(usize::from(count), MIN_FORMAT_BYTES, "rdpsnd.formatCount")?;
     let formats = (0..count)
         .map(|_| AudioFormat::decode(&mut cursor))
         .collect::<Result<_, _>>()?;

@@ -51,6 +51,29 @@ impl<'a> ReadCursor<'a> {
         }
     }
 
+    /// Rejects a client-controlled element `count` before a caller would
+    /// otherwise use it to size a `Vec::with_capacity` - i.e. before
+    /// `count * min_item_bytes` overflows, and before it claims more
+    /// bytes than actually remain. Several decoders across this codebase
+    /// (RDPDR's DeviceCount, RDPEAI's NumFormats, RDPSND's format count,
+    /// ...) hand-rolled exactly this `checked_mul` + remaining-bytes
+    /// check; `field` names the count in the error, e.g.
+    /// `"rdpdr.deviceCount"`.
+    pub fn ensure_count(
+        &self,
+        count: usize,
+        min_item_bytes: usize,
+        field: &'static str,
+    ) -> Result<(), crate::DecodeError> {
+        let needed = count
+            .checked_mul(min_item_bytes)
+            .ok_or(crate::DecodeError::InvalidValue {
+                field,
+                reason: "count overflow",
+            })?;
+        self.ensure(needed).map_err(Into::into)
+    }
+
     pub fn advance(&mut self, n: usize) {
         self.pos = self.pos.saturating_add(n).min(self.buf.len());
     }
@@ -174,5 +197,39 @@ impl WriteBuf for Vec<u8> {
 
     fn write_slice(&mut self, s: &[u8]) {
         self.extend_from_slice(s);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DecodeError;
+
+    #[test]
+    fn ensure_count_accepts_a_count_that_fits() {
+        let cursor = ReadCursor::new(&[0u8; 20]);
+        assert!(cursor.ensure_count(5, 4, "test.count").is_ok());
+    }
+
+    #[test]
+    fn ensure_count_rejects_overflow_before_multiplying() {
+        let cursor = ReadCursor::new(&[0u8; 20]);
+        let err = cursor
+            .ensure_count(usize::MAX, 4, "test.count")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::InvalidValue {
+                field: "test.count",
+                reason: "count overflow"
+            }
+        ));
+    }
+
+    #[test]
+    fn ensure_count_rejects_a_count_the_buffer_cannot_back() {
+        let cursor = ReadCursor::new(&[0u8; 20]);
+        let err = cursor.ensure_count(6, 4, "test.count").unwrap_err();
+        assert!(matches!(err, DecodeError::NotEnoughBytes(_)));
     }
 }
