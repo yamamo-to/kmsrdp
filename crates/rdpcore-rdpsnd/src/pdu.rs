@@ -171,7 +171,19 @@ pub fn encode_training() -> Vec<u8> {
 /// `wFormatNo` + `cBlockNo` + 3 bytes padding + `dwAudioTimestamp` (the
 /// real per-chunk timestamp) + raw audio data running to the end of the
 /// PDU.
+/// Largest `data` that fits in one `Wave2` PDU: `BodySize` is a `u16` and
+/// the fixed header ahead of `data` is 12 bytes. Callers with more than
+/// this (see [`crate::RdpsndChannel::encode_wave`]) must split across
+/// multiple PDUs - `encode_wave2` itself just asserts the invariant rather
+/// than silently truncating the wire length field.
+pub const MAX_WAVE2_CHUNK_BYTES: usize = u16::MAX as usize - 12;
+
 pub fn encode_wave2(format_no: u16, block_no: u8, timestamp_ms: u32, data: &[u8]) -> Vec<u8> {
+    debug_assert!(
+        data.len() <= MAX_WAVE2_CHUNK_BYTES,
+        "encode_wave2: {} bytes exceeds the u16 BodySize field - caller must split",
+        data.len()
+    );
     let body_len = 12 + data.len();
     let mut out = Vec::with_capacity(body_len + 4);
     write_header(&mut out, SNDC_WAVE2, body_len);
@@ -325,6 +337,22 @@ mod tests {
             0x1000
         );
         assert_eq!(&encoded[16..], &data[..]);
+    }
+
+    #[test]
+    fn wave2_at_max_chunk_size_does_not_truncate_body_size() {
+        let data = vec![0xCD; MAX_WAVE2_CHUNK_BYTES];
+        let encoded = encode_wave2(1, 0, 0, &data);
+        let body_len = u16::from_le_bytes([encoded[2], encoded[3]]) as usize;
+        assert_eq!(body_len, 12 + MAX_WAVE2_CHUNK_BYTES);
+        assert_eq!(body_len, u16::MAX as usize);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the u16 BodySize field")]
+    fn wave2_over_max_chunk_size_trips_the_invariant_check() {
+        let data = vec![0xCD; MAX_WAVE2_CHUNK_BYTES + 1];
+        encode_wave2(1, 0, 0, &data);
     }
 
     #[test]

@@ -204,6 +204,11 @@ impl RdpsndChannel {
     /// empty `Vec` if nothing has been negotiated/started yet (the caller
     /// should just drop the chunk - there's no destination format to
     /// encode it against).
+    ///
+    /// A `pcm` larger than one `Wave2` PDU can carry (its `BodySize` is a
+    /// `u16`) is split across multiple PDUs rather than silently
+    /// truncating the wire length field - normal 20ms-ish chunks never hit
+    /// this, but a backlog drained in one go after a capture stall could.
     pub fn encode_wave(&mut self, pcm: Vec<u8>, timestamp_ms: u32) -> Vec<Vec<u8>> {
         if !matches!(self.state, State::Ready) {
             return Vec::new();
@@ -211,9 +216,20 @@ impl RdpsndChannel {
         let Some(format_no) = self.negotiated.as_ref().map(|n| n.format_no) else {
             return Vec::new();
         };
-        let body = pdu::encode_wave2(format_no, self.block_no, timestamp_ms, &pcm);
-        self.block_no = self.block_no.wrapping_add(1);
-        wrap_indication(self.user_channel_id, self.channel_id, body)
+        let mut out = Vec::new();
+        // Preserve the historical behavior of still sending one
+        // empty-data Wave2 PDU for an empty `pcm`.
+        let chunks: Vec<&[u8]> = if pcm.is_empty() {
+            vec![&[]]
+        } else {
+            pcm.chunks(pdu::MAX_WAVE2_CHUNK_BYTES).collect()
+        };
+        for chunk in chunks {
+            let body = pdu::encode_wave2(format_no, self.block_no, timestamp_ms, chunk);
+            self.block_no = self.block_no.wrapping_add(1);
+            out.extend(wrap_indication(self.user_channel_id, self.channel_id, body));
+        }
+        out
     }
 }
 
@@ -384,6 +400,29 @@ mod tests {
             "expected multiple SVC chunks, got {}",
             wave_frames.len()
         );
+    }
+
+    #[test]
+    fn a_pcm_chunk_over_one_wave2_pdu_splits_without_panicking() {
+        let formats = vec![pdu::AudioFormat::pcm(2, 48000, 16)];
+        let handler = Box::new(FakeHandler {
+            formats: formats.clone(),
+            ..Default::default()
+        });
+        let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
+        channel
+            .on_channel_data(&client_audio_formats_payload(&formats))
+            .unwrap();
+        channel
+            .on_channel_data(&training_confirm_payload())
+            .unwrap();
+
+        // Bigger than any single Wave2 PDU can carry (its BodySize is a
+        // u16) - models a backlog drained in one go after a capture
+        // stall. Must split rather than corrupt the wire length field.
+        let pcm_len = pdu::MAX_WAVE2_CHUNK_BYTES + 500;
+        let wave_frames = channel.encode_wave(vec![0x22; pcm_len], 0);
+        assert!(!wave_frames.is_empty());
     }
 
     #[test]
