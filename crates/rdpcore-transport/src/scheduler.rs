@@ -57,6 +57,13 @@ struct ChannelQueue {
 #[derive(Default)]
 pub struct Scheduler {
     queues: Vec<ChannelQueue>,
+    /// Indices into `queues` of every `Bulk`-priority queue, in creation
+    /// order - `queues` only ever grows and a queue's priority is fixed
+    /// at creation (see `enqueue`), so this can be maintained
+    /// incrementally instead of re-filtering `queues` on every `pop_next`
+    /// call, which the doc comment on `pop_next` notes runs between every
+    /// single frame write.
+    bulk_order: Vec<usize>,
     next_bulk_channel: usize,
 }
 
@@ -84,7 +91,11 @@ impl Scheduler {
                     priority: frame.priority,
                     pending: VecDeque::new(),
                 });
-                self.queues.len() - 1
+                let idx = self.queues.len() - 1;
+                if frame.priority == Priority::Bulk {
+                    self.bulk_order.push(idx);
+                }
+                idx
             });
         self.queues[idx].pending.push_back(frame.bytes);
     }
@@ -110,21 +121,15 @@ impl Scheduler {
             }
         }
 
-        let bulk_indices: Vec<usize> = self
-            .queues
-            .iter()
-            .enumerate()
-            .filter(|(_, q)| q.priority == Priority::Bulk)
-            .map(|(i, _)| i)
-            .collect();
-        if bulk_indices.is_empty() {
+        if self.bulk_order.is_empty() {
             return None;
         }
 
-        for offset in 0..bulk_indices.len() {
-            let idx = bulk_indices[(self.next_bulk_channel + offset) % bulk_indices.len()];
+        for offset in 0..self.bulk_order.len() {
+            let idx = self.bulk_order[(self.next_bulk_channel + offset) % self.bulk_order.len()];
             if let Some(bytes) = self.queues[idx].pending.pop_front() {
-                self.next_bulk_channel = (self.next_bulk_channel + offset + 1) % bulk_indices.len();
+                self.next_bulk_channel =
+                    (self.next_bulk_channel + offset + 1) % self.bulk_order.len();
                 return Some(bytes);
             }
         }
