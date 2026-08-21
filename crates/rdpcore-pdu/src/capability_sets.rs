@@ -144,11 +144,13 @@ impl RawCapabilitySet {
 }
 
 fn write_capset(out: &mut Vec<u8>, set_type: u16, body: &[u8]) {
-    RawCapabilitySet {
-        set_type,
-        body: body.to_vec(),
-    }
-    .write(out);
+    // Writes `body` in place rather than going through
+    // `RawCapabilitySet::write`, which would need an owned copy of it
+    // first (`body.to_vec()`) just to immediately serialize and drop it -
+    // this runs for every capability set in every Demand Active.
+    out.write_u16_le(set_type);
+    out.write_u16_le((body.len() + 4) as u16);
+    out.write_slice(body);
 }
 
 // ---------------------------------------------------------------------

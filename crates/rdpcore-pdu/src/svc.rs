@@ -53,15 +53,18 @@ pub fn wrap_indication(initiator: u16, channel_id: u16, data: Vec<u8>) -> Vec<Ve
 /// ready to become its own MCS Send Data Request/Indication payload.
 pub fn chunkify(data: &[u8]) -> Vec<Vec<u8>> {
     let total_length = data.len() as u32;
-    let body_chunks: Vec<&[u8]> = if data.is_empty() {
-        vec![&[]]
-    } else {
-        data.chunks(DEFAULT_CHUNK_LENGTH).collect()
-    };
-    let count = body_chunks.len();
+    if data.is_empty() {
+        let mut out = Vec::with_capacity(8);
+        out.write_u32_le(total_length);
+        out.write_u32_le(CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST);
+        return vec![out];
+    }
 
-    body_chunks
-        .into_iter()
+    // `Chunks` is an `ExactSizeIterator`, so the chunk count needed for
+    // first/last flags can be read straight off it instead of collecting
+    // into a throwaway `Vec<&[u8]>` first just to call `.len()`.
+    let count = data.len().div_ceil(DEFAULT_CHUNK_LENGTH);
+    data.chunks(DEFAULT_CHUNK_LENGTH)
         .enumerate()
         .map(|(i, chunk)| {
             let mut flags = 0u32;
@@ -105,6 +108,16 @@ mod tests {
         assert_eq!(total_length as usize, data.len());
         assert_eq!(flags, CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST);
         assert_eq!(body, data);
+    }
+
+    #[test]
+    fn empty_payload_is_a_single_first_and_last_chunk() {
+        let chunks = chunkify(&[]);
+        assert_eq!(chunks.len(), 1);
+        let (total_length, flags, body) = dechunkify(&chunks[0]).unwrap();
+        assert_eq!(total_length, 0);
+        assert_eq!(flags, CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST);
+        assert!(body.is_empty());
     }
 
     #[test]
