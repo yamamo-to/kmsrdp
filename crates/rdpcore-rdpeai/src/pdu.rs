@@ -88,8 +88,28 @@ pub fn decode_client_message(input: &[u8]) -> Result<ClientMessage, DecodeError>
             version: cursor.read_u32_le()?,
         }),
         MSG_SNDIN_FORMATS => {
-            let num_formats = cursor.read_u32_le()?;
+            let num_formats = cursor.read_u32_le()? as usize;
             let _cb_size_formats_packet = cursor.read_u32_le()?;
+            // Each format is at least 18 bytes (fixed WAVEFORMATEX fields
+            // before its variable-length extra data) - reject impossible
+            // counts before `collect`'s upstream Vec reservation can use a
+            // hostile num_formats to reserve gigabytes with nothing to
+            // back it, same reasoning as rdpdr's DeviceCount check.
+            const MIN_FORMAT_BYTES: usize = 2 + 2 + 4 + 4 + 2 + 2 + 2;
+            let needed =
+                num_formats
+                    .checked_mul(MIN_FORMAT_BYTES)
+                    .ok_or(DecodeError::InvalidValue {
+                        field: "rdpeai.numFormats",
+                        reason: "count overflow",
+                    })?;
+            if cursor.remaining() < needed {
+                return Err(rdpcore_pdu::cursor::NotEnoughBytes {
+                    needed,
+                    remaining: cursor.remaining(),
+                }
+                .into());
+            }
             let formats = (0..num_formats)
                 .map(|_| AudioFormat::decode(&mut cursor))
                 .collect::<Result<_, _>>()?;
@@ -134,6 +154,18 @@ mod tests {
             decode_client_message(&encoded).unwrap(),
             ClientMessage::Formats { formats }
         );
+    }
+
+    #[test]
+    fn formats_rejects_hostile_num_formats() {
+        // MessageId + NumFormats=u32::MAX + cbSizeFormatsPacket, no actual
+        // format data - would previously let the u32::MAX flow straight
+        // into a Vec reservation before any byte was validated.
+        let mut wire = Vec::new();
+        wire.write_u8(MSG_SNDIN_FORMATS);
+        wire.write_u32_le(u32::MAX);
+        wire.write_u32_le(0);
+        assert!(decode_client_message(&wire).is_err());
     }
 
     #[test]
