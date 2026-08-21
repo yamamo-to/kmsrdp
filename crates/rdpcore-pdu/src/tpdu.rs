@@ -48,7 +48,11 @@ impl TpduHeader {
     }
 
     pub fn variable_part_size(&self) -> usize {
-        usize::from(self.li) + 1 - self.code.header_fixed_part_size()
+        // `decode` below already rejects an `li` too small for the fixed
+        // part, so this never actually underflows for a `TpduHeader` that
+        // came from `decode` - but `saturating_sub` keeps that true by
+        // construction rather than by the caller having to remember it.
+        (usize::from(self.li) + 1).saturating_sub(self.code.header_fixed_part_size())
     }
 
     pub fn write(&self, out: &mut Vec<u8>) {
@@ -79,6 +83,16 @@ impl TpduHeader {
             return Err(DecodeError::InvalidValue {
                 field: "tpdu.li",
                 reason: "0xFF is reserved for X.224 extensions, unsupported",
+            });
+        }
+        // `li` is the header length excluding LI itself, so the fixed
+        // part (LI included) is `li + 1` bytes - reject anything too
+        // small to hold it before `variable_part_size` (or the `- 2`
+        // below) can underflow on it.
+        if usize::from(li) + 1 < code.header_fixed_part_size() {
+            return Err(DecodeError::InvalidValue {
+                field: "tpdu.li",
+                reason: "too small to hold this TPDU code's fixed header part",
             });
         }
 
@@ -125,6 +139,20 @@ mod tests {
         let mut cursor = ReadCursor::new(&buf);
         let decoded = TpduHeader::decode(&mut cursor, TpduCode::DATA).unwrap();
         assert_eq!(decoded, header);
+    }
+
+    #[test]
+    fn rejects_li_too_small_for_fixed_part_instead_of_underflowing() {
+        // Connection Request needs li >= 6 (7-byte fixed part, LI itself
+        // excluded from the count); li=3 previously underflowed
+        // `variable_part_size`'s subtraction instead of being rejected
+        // here in `decode`.
+        let buf = [3u8, TpduCode::CONNECTION_REQUEST.0, 0, 0, 0, 0, 0];
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(matches!(
+            TpduHeader::decode(&mut cursor, TpduCode::CONNECTION_REQUEST),
+            Err(DecodeError::InvalidValue { field: "tpdu.li", .. })
+        ));
     }
 
     #[test]

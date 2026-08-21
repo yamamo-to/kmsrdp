@@ -40,4 +40,8 @@ fuzz_target!(|data: &[u8]| {
     let _ = gcc::ClientGccBlocks::decode(data);
     let _ = gcc::ConferenceCreateRequest::decode(data);
     let _ = gcc::ConferenceCreateResponse::decode(data);
+    // Cleartext, pre-TLS negotiation - the very first bytes read off any
+    // connection, from an unauthenticated client.
+    let _ = x224::ConnectionRequest::decode(data);
+    let _ = x224::ConnectionConfirm::decode(data);
 });
