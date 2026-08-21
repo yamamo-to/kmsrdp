@@ -1620,7 +1620,16 @@ fn spawn_shared_mount(
         MountOption::DefaultPermissions,
         MountOption::AutoUnmount,
     ];
-    config.n_threads = Some(1);
+    // One mount is shared (refcounted) across every RDP connection that
+    // redirects this DosName, and each FUSE op blocks its dispatch thread
+    // for up to OP_TIMEOUT waiting on the client to complete the
+    // corresponding DriveCommand round trip. With a single thread, one
+    // slow/unresponsive client stalls every other op on this mount -
+    // including from other connections - for up to that long. Bridge's
+    // shared state (`outbound`/`pending`/`path_to_ino`/`ino_to_path`/
+    // `meta`/`opens`) is all Mutex- or Atomic-guarded specifically so
+    // multiple dispatch threads can run concurrently here.
+    config.n_threads = Some(4);
     let fs = FuseFs {
         active: Arc::clone(&active),
     };
