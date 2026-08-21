@@ -44,19 +44,31 @@ struct X11Connection {
     root: u32,
 }
 
+/// The topmost keycodes are conventionally left spare by keyboard layouts
+/// for exactly this kind of remap trick.
+///
+/// Number of usable spare keycodes below `max`, down to `min`, is
+/// typically far more than the pool size - but on a layout with fewer
+/// free keycodes than `SCRATCH_KEYCODE_POOL_SIZE`, wrap around that
+/// smaller range instead of letting every slot past it collapse onto
+/// `min` - that would defeat the pool's whole point (see its doc comment)
+/// far more than necessary given how many keycodes are actually available.
+fn scratch_keycode_pool(min: u8, max: u8) -> [u8; SCRATCH_KEYCODE_POOL_SIZE as usize] {
+    let span = max.saturating_sub(min).saturating_add(1).max(1);
+    let mut pool = [0u8; SCRATCH_KEYCODE_POOL_SIZE as usize];
+    for (i, slot) in pool.iter_mut().enumerate() {
+        *slot = max.saturating_sub((i as u8) % span);
+    }
+    pool
+}
+
 impl X11Connection {
     fn open(display: &str) -> io::Result<Self> {
         let (conn, screen_num) = x11rb::connect(Some(display))
             .map_err(|e| io::Error::other(format!("X11 connect failed on {display}: {e}")))?;
         let setup = conn.setup();
         let root = setup.roots[screen_num].root;
-        // The topmost keycodes are conventionally left spare by keyboard
-        // layouts for exactly this kind of remap trick.
-        let highest = setup.max_keycode;
-        let mut scratch_keycodes = [0u8; SCRATCH_KEYCODE_POOL_SIZE as usize];
-        for (i, slot) in scratch_keycodes.iter_mut().enumerate() {
-            *slot = highest.saturating_sub(i as u8).max(setup.min_keycode);
-        }
+        let scratch_keycodes = scratch_keycode_pool(setup.min_keycode, setup.max_keycode);
         Ok(Self {
             conn,
             scratch_keycodes,
@@ -206,6 +218,38 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use tokio::sync::watch;
+
+    #[test]
+    fn scratch_keycode_pool_is_all_distinct_when_span_covers_it() {
+        // Plenty of spare keycodes (typical real keyboards): every slot
+        // gets its own keycode, same as before this had a wraparound.
+        let pool = scratch_keycode_pool(8, 255);
+        let mut sorted = pool.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), pool.len(), "expected all-distinct slots");
+        assert_eq!(pool[0], 255);
+    }
+
+    #[test]
+    fn scratch_keycode_pool_wraps_instead_of_collapsing_on_a_tiny_layout() {
+        // Only 3 free keycodes (253, 254, 255) - fewer than the pool size.
+        // Every one of them must still show up, rather than 5 of 8 slots
+        // collapsing onto a single keycode.
+        let pool = scratch_keycode_pool(253, 255);
+        for keycode in [253u8, 254, 255] {
+            assert!(
+                pool.contains(&keycode),
+                "expected {keycode} to appear somewhere in the pool"
+            );
+        }
+    }
+
+    #[test]
+    fn scratch_keycode_pool_handles_a_single_free_keycode() {
+        let pool = scratch_keycode_pool(255, 255);
+        assert!(pool.iter().all(|&k| k == 255));
+    }
 
     fn session_rx(session: Option<Session>) -> watch::Receiver<Option<Session>> {
         let (_, rx) = watch::channel(session);
