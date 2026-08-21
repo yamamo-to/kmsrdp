@@ -14,12 +14,13 @@
 //! `-dev` package needed to build) since this is the same "read-only,
 //! ask-for-nothing-we-don't-need" posture as the rest of `capture.rs`.
 
+use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
 use std::fs;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::Mutex;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use drm_fourcc::{DrmFourcc, DrmModifier};
 use khronos_egl as egl;
@@ -569,7 +570,23 @@ impl GpuDetiler {
     }
 }
 
-static DETILER: OnceLock<Mutex<io::Result<GpuDetiler>>> = OnceLock::new();
+/// One entry per distinct `card_path` seen - a multi-GPU/multi-monitor
+/// host can have tiled framebuffers on more than one card, each needing
+/// its own GBM/EGL device.
+struct DetilerSlot {
+    detiler: Option<GpuDetiler>,
+    /// Set after a failed init; `detile_to_bgrx` won't retry before this
+    /// (avoids hammering a broken driver every capture tick), but unlike
+    /// the old single permanently-cached `Err`, it always retries
+    /// eventually - a transient race at startup no longer wedges capture
+    /// for the rest of the process's life.
+    retry_after: Option<Instant>,
+}
+
+const DETILER_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+static DETILERS: LazyLock<Mutex<HashMap<String, DetilerSlot>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Detile a single-plane RGB(A) dma-buf via GBM/EGL and return tightly
 /// packed BGRX8888 bytes (stride == `width * 4`).
@@ -588,10 +605,27 @@ pub fn detile_to_bgrx(
     offset: u32,
     pitch: u32,
 ) -> io::Result<Vec<u8>> {
-    let cell = DETILER.get_or_init(|| Mutex::new(GpuDetiler::new(card_path)));
-    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
-    let detiler = guard
-        .as_mut()
-        .map_err(|e| io::Error::other(format!("GPU detiler init failed: {e}")))?;
+    let mut slots = DETILERS.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = slots.entry(card_path.to_owned()).or_insert(DetilerSlot {
+        detiler: None,
+        retry_after: None,
+    });
+    if slot.detiler.is_none() {
+        if let Some(retry_after) = slot.retry_after
+            && Instant::now() < retry_after
+        {
+            return Err(io::Error::other(format!(
+                "GPU detiler for {card_path} still in backoff after a previous init failure"
+            )));
+        }
+        match GpuDetiler::new(card_path) {
+            Ok(detiler) => slot.detiler = Some(detiler),
+            Err(e) => {
+                slot.retry_after = Some(Instant::now() + DETILER_RETRY_BACKOFF);
+                return Err(io::Error::other(format!("GPU detiler init failed: {e}")));
+            }
+        }
+    }
+    let detiler = slot.detiler.as_mut().expect("just initialized above");
     detiler.detile(fd, fourcc, modifier, width, height, offset, pitch)
 }

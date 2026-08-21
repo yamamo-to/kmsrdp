@@ -28,6 +28,7 @@
 use std::ffi::{CStr, c_void};
 use std::io;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use libloading::{Library, Symbol};
 
@@ -330,15 +331,41 @@ type GrabReply = io::Result<(u32, u32, Vec<u8>)>;
 static WORKER: OnceLock<std::sync::mpsc::Sender<std::sync::mpsc::Sender<GrabReply>>> =
     OnceLock::new();
 
+/// Cooldown between NvFBC init retries once one fails - avoids hammering a
+/// broken/unavailable driver on every capture tick, while still (unlike a
+/// permanently cached failure) eventually recovering if e.g. the driver
+/// was just not ready yet at process startup.
+const INIT_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
 fn worker() -> &'static std::sync::mpsc::Sender<std::sync::mpsc::Sender<GrabReply>> {
     WORKER.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<std::sync::mpsc::Sender<GrabReply>>();
         std::thread::spawn(move || {
-            let capturer = NvfbcCapturer::new();
+            // NvFBC binds to whichever thread creates it (see module doc
+            // comment), so a retry after a failed init has to happen here,
+            // not by the caller re-entering this function.
+            let mut capturer: Option<NvfbcCapturer> = None;
+            let mut retry_after: Option<Instant> = None;
             for reply_tx in rx {
+                if capturer.is_none() {
+                    let in_backoff = matches!(retry_after, Some(t) if Instant::now() < t);
+                    if !in_backoff {
+                        match NvfbcCapturer::new() {
+                            Ok(c) => capturer = Some(c),
+                            Err(e) => {
+                                retry_after = Some(Instant::now() + INIT_RETRY_BACKOFF);
+                                let _ = reply_tx
+                                    .send(Err(io::Error::other(format!("NvFBC init failed: {e}"))));
+                                continue;
+                            }
+                        }
+                    }
+                }
                 let result = match &capturer {
-                    Ok(c) => c.grab(),
-                    Err(e) => Err(io::Error::other(format!("NvFBC init failed: {e}"))),
+                    Some(c) => c.grab(),
+                    None => Err(io::Error::other(
+                        "NvFBC init failed previously; retry backoff active",
+                    )),
                 };
                 let _ = reply_tx.send(result);
             }
