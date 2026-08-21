@@ -903,13 +903,12 @@ impl Session {
                                 {
                                     return Ok(());
                                 }
-                                let mut rdpsnd_guard = lock_rdpsnd(&rdpsnd).await;
                                 if let Err(e) = handle_slow_path_frame(
                                     &bytes,
                                     io_channel_id,
                                     &mut display_updates_allowed,
                                     updates.as_mut(),
-                                    rdpsnd_guard.as_deref_mut(),
+                                    &rdpsnd,
                                     cliprdr.as_mut(),
                                     dvc.as_mut(),
                                     rdpdr.as_mut(),
@@ -967,13 +966,12 @@ impl Session {
                                         {
                                             return Ok(());
                                         }
-                                        let mut rdpsnd_guard = lock_rdpsnd(&rdpsnd).await;
                                         if let Err(err) = handle_slow_path_frame(
                                             &bytes,
                                             io_channel_id,
                                             &mut display_updates_allowed,
                                             updates.as_mut(),
-                                            rdpsnd_guard.as_deref_mut(),
+                                            &rdpsnd,
                                             cliprdr.as_mut(),
                                             dvc.as_mut(),
                                             rdpdr.as_mut(),
@@ -994,13 +992,12 @@ impl Session {
                             }
                         }
                         Ok(SteadyStateFrame::SlowPath(bytes)) => {
-                            let mut rdpsnd_guard = lock_rdpsnd(&rdpsnd).await;
                             if let Err(e) = handle_slow_path_frame(
                                 &bytes,
                                 io_channel_id,
                                 &mut display_updates_allowed,
                                 updates.as_mut(),
-                                rdpsnd_guard.as_deref_mut(),
+                                &rdpsnd,
                                 cliprdr.as_mut(),
                                 dvc.as_mut(),
                                 rdpdr.as_mut(),
@@ -1366,19 +1363,6 @@ async fn recv_optional<T>(rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<T
     }
 }
 
-/// Locks the shared `RdpsndChannel` for a control-plane touch
-/// (`on_channel_data`). Never held across an await beyond the lock
-/// acquisition itself, so it never competes with the audio task's own
-/// brief lock in `send_wave_frames`.
-async fn lock_rdpsnd(
-    rdpsnd: &Option<Arc<tokio::sync::Mutex<RdpsndChannel>>>,
-) -> Option<tokio::sync::MutexGuard<'_, RdpsndChannel>> {
-    match rdpsnd {
-        Some(channel) => Some(channel.lock().await),
-        None => None,
-    }
-}
-
 /// Aborts the wrapped task when dropped - used so the per-connection audio
 /// task (which otherwise loops forever on `WaveSubscriber::recv`) always
 /// stops when `run_steady_state` returns, on every exit path.
@@ -1414,7 +1398,7 @@ async fn handle_slow_path_frame(
     io_channel_id: u16,
     display_updates_allowed: &mut bool,
     updates: &mut dyn crate::display::RdpServerDisplayUpdates,
-    rdpsnd: Option<&mut RdpsndChannel>,
+    rdpsnd: &Option<Arc<tokio::sync::Mutex<RdpsndChannel>>>,
     cliprdr: Option<&mut CliprdrChannel>,
     dvc: Option<&mut DvcMux>,
     rdpdr: Option<&mut RdpdrChannel>,
@@ -1472,18 +1456,25 @@ async fn handle_slow_path_frame(
         return Ok(());
     }
 
-    if let Some(channel) = rdpsnd
-        && send_data.channel_id == channel.channel_id()
-    {
-        let channel_id = channel.channel_id();
-        for response in channel.on_channel_data(&send_data.data)? {
-            let _ = frame_sender.send(Frame {
-                channel: ChannelKey::Static(channel_id),
-                priority: Priority::Latency,
-                bytes: response,
-            });
+    if let Some(channel) = rdpsnd {
+        // Locked only right here, for the single synchronous
+        // on_channel_data call - never across the IO-channel branch's
+        // send_outbound_bitmap().await above, which would otherwise stall
+        // the audio task for the encode's duration (the exact stall
+        // `_audio_task`'s own doc comment says this lock is meant to
+        // avoid contending with).
+        let mut channel = channel.lock().await;
+        if send_data.channel_id == channel.channel_id() {
+            let channel_id = channel.channel_id();
+            for response in channel.on_channel_data(&send_data.data)? {
+                let _ = frame_sender.send(Frame {
+                    channel: ChannelKey::Static(channel_id),
+                    priority: Priority::Latency,
+                    bytes: response,
+                });
+            }
+            return Ok(());
         }
-        return Ok(());
     }
     if let Some(channel) = cliprdr
         && send_data.channel_id == channel.channel_id()
@@ -1967,47 +1958,6 @@ mod tests {
         assert_eq!(stats.tiles, 150); // 1200 / 8 scanline strips
         assert_eq!(stats.update_batches, 5); // ceil(150 / 32)
         assert_eq!(stats.raw_tiles, 150);
-    }
-
-    #[derive(Debug, Default)]
-    struct DummySoundHandler;
-
-    impl rdpcore_rdpsnd::RdpsndServerHandler for DummySoundHandler {
-        fn get_formats(&self) -> &[rdpcore_rdpsnd::pdu::AudioFormat] {
-            &[]
-        }
-
-        fn choose_format(
-            &mut self,
-            _common: &[rdpcore_rdpsnd::pdu::NegotiatedFormat],
-        ) -> Option<rdpcore_rdpsnd::pdu::NegotiatedFormat> {
-            None
-        }
-
-        fn start(
-            &mut self,
-            _format: &rdpcore_rdpsnd::pdu::NegotiatedFormat,
-        ) -> Result<(), Box<dyn rdpcore_rdpsnd::RdpsndError>> {
-            Ok(())
-        }
-
-        fn stop(&mut self) {}
-    }
-
-    #[tokio::test]
-    async fn lock_rdpsnd_returns_none_when_no_channel_negotiated() {
-        let rdpsnd: Option<std::sync::Arc<tokio::sync::Mutex<super::RdpsndChannel>>> = None;
-        assert!(super::lock_rdpsnd(&rdpsnd).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn lock_rdpsnd_locks_the_shared_channel() {
-        let (channel, _initial) =
-            super::RdpsndChannel::new(1004, 1002, Box::new(DummySoundHandler));
-        let rdpsnd = Some(std::sync::Arc::new(tokio::sync::Mutex::new(channel)));
-
-        let guard = super::lock_rdpsnd(&rdpsnd).await.expect("channel present");
-        assert_eq!(guard.channel_id(), 1004);
     }
 
     #[tokio::test]
