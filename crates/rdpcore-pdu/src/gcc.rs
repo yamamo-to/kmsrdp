@@ -67,6 +67,26 @@ fn write_block(out: &mut Vec<u8>, kind: u16, body: &[u8]) {
     out.write_slice(body);
 }
 
+/// Walks a sequence of `UserDataHeader`-prefixed TLV blocks (the shape
+/// both `ClientGccBlocks` and `ServerGccBlocks` decode - a list of
+/// `CS_*`/`SC_*` blocks with no fixed order or required-presence encoded
+/// on the wire itself), calling `f(kind, body)` for each one. Callers
+/// just match on `kind`; only that per-kind dispatch differs between the
+/// client and server block sets.
+fn for_each_user_data_block<'a>(
+    input: &'a [u8],
+    mut f: impl FnMut(u16, &'a [u8]) -> Result<(), DecodeError>,
+) -> Result<(), DecodeError> {
+    let mut cursor = ReadCursor::new(input);
+    while cursor.remaining() >= 4 {
+        let header = UserDataHeader::decode(&mut cursor)?;
+        let body_len = usize::from(header.length).saturating_sub(4);
+        let body = cursor.read_slice(body_len)?;
+        f(header.kind, body)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Client Core Data (CS_CORE) - fixed 128-byte part only; the optional tail
 // (postBeta2ColorDepth, ..., deviceScaleFactor) is accepted-but-ignored.
@@ -265,7 +285,6 @@ impl ClientGccBlocks {
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, DecodeError> {
-        let mut cursor = ReadCursor::new(input);
         let mut core = None;
         let mut security = None;
         let mut network = None;
@@ -273,12 +292,9 @@ impl ClientGccBlocks {
         let mut message_channel = None;
         let mut core_early_capability_flags = None;
 
-        while cursor.remaining() >= 4 {
-            let header = UserDataHeader::decode(&mut cursor)?;
-            let body_len = usize::from(header.length).saturating_sub(4);
-            let body = cursor.read_slice(body_len)?;
+        for_each_user_data_block(input, |kind, body| {
             let mut body_cursor = ReadCursor::new(body);
-            match header.kind {
+            match kind {
                 CS_CORE => {
                     core_early_capability_flags = early_capability_flags_from_cs_core(body);
                     core = Some(ClientCoreData::decode(&mut body_cursor)?);
@@ -292,7 +308,8 @@ impl ClientGccBlocks {
                 CS_MONITOR => {} // client-only; no server response block exists.
                 _ => {}
             }
-        }
+            Ok(())
+        })?;
 
         Ok(Self {
             core: core.ok_or(DecodeError::InvalidValue {
@@ -482,18 +499,14 @@ impl ServerGccBlocks {
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, DecodeError> {
-        let mut cursor = ReadCursor::new(input);
         let mut core = None;
         let mut network = None;
         let mut security = None;
         let mut message_channel = None;
 
-        while cursor.remaining() >= 4 {
-            let header = UserDataHeader::decode(&mut cursor)?;
-            let body_len = usize::from(header.length).saturating_sub(4);
-            let body = cursor.read_slice(body_len)?;
+        for_each_user_data_block(input, |kind, body| {
             let mut body_cursor = ReadCursor::new(body);
-            match header.kind {
+            match kind {
                 SC_CORE => core = Some(ServerCoreData::decode(&mut body_cursor)?),
                 SC_NET => network = Some(ServerNetworkData::decode(&mut body_cursor)?),
                 SC_SECURITY => security = Some(ServerSecurityData::decode(&mut body_cursor)?),
@@ -502,7 +515,8 @@ impl ServerGccBlocks {
                 }
                 _ => {}
             }
-        }
+            Ok(())
+        })?;
 
         Ok(Self {
             core: core.ok_or(DecodeError::InvalidValue {
