@@ -147,7 +147,12 @@ impl VirtualInput {
 
     /// Moves the pointer to a fractional (0.0..=1.0, 0.0..=1.0) position
     /// within the current CRTC/screen.
+    /// `fx`/`fy` are fractions of the desktop size (0.0..=1.0); out-of-range
+    /// values (e.g. a stale coordinate racing a resize) are clamped rather
+    /// than reported outside the device's declared absmin/absmax.
     pub fn move_abs(&self, fx: f64, fy: f64) -> io::Result<()> {
+        let fx = fx.clamp(0.0, 1.0);
+        let fy = fy.clamp(0.0, 1.0);
         self.emit(&[
             (sys::EV_ABS, sys::ABS_X, (POINTER_MAX as f64 * fx) as i32),
             (sys::EV_ABS, sys::ABS_Y, (POINTER_MAX as f64 * fy) as i32),
@@ -254,5 +259,15 @@ mod tests {
         let mid = (POINTER_MAX as f64 * 0.5) as i32;
         assert_eq!(mid, POINTER_MAX / 2);
         assert_eq!((POINTER_MAX as f64 * 1.0) as i32, POINTER_MAX);
+    }
+
+    #[test]
+    fn move_abs_clamps_out_of_range_fractions() {
+        // Mirrors the clamp move_abs applies before scaling - out-of-range
+        // fractions (e.g. a stale coordinate racing a resize) must not
+        // report a position outside the device's declared absmin/absmax.
+        assert_eq!(1.5f64.clamp(0.0, 1.0), 1.0);
+        assert_eq!((-0.5f64).clamp(0.0, 1.0), 0.0);
+        assert!(f64::NAN.clamp(0.0, 1.0).is_nan());
     }
 }
