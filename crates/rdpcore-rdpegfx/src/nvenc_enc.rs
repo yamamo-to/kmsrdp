@@ -174,12 +174,20 @@ impl NvencH264Encoder {
 
     fn destroy_buffers(&mut self) {
         if let Some(b) = self.buffers.take() {
-            let _ = unsafe {
+            if let Err(e) = unsafe {
                 (self.session.fl.nvenc_destroy_input_buffer)(self.session.encoder, b.input)
-            };
-            let _ = unsafe {
+            }
+            .into_error()
+            {
+                tracing::warn!("NVENC destroy input buffer failed: {e:?}");
+            }
+            if let Err(e) = unsafe {
                 (self.session.fl.nvenc_destory_bit_stream_buffer)(self.session.encoder, b.output)
-            };
+            }
+            .into_error()
+            {
+                tracing::warn!("NVENC destroy bitstream buffer failed: {e:?}");
+            }
         }
     }
 
