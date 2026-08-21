@@ -38,6 +38,20 @@ fn ioctl_check(ret: libc::c_int, what: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Helper to convert a reference to a plain data struct into a raw byte slice for FFI writes.
+///
+/// # Safety
+/// The type `T` must be plain data without uninitialized memory or invalid byte patterns.
+unsafe fn as_byte_slice<T: Sized>(val: &T) -> &[u8] {
+    // SAFETY: val is a valid reference to T for size_of::<T>() bytes over its lifetime.
+    unsafe {
+        std::slice::from_raw_parts(
+            (val as *const T) as *const u8,
+            mem::size_of::<T>(),
+        )
+    }
+}
+
 impl VirtualInput {
     pub fn create() -> io::Result<Self> {
         let file = OpenOptions::new()
@@ -46,6 +60,7 @@ impl VirtualInput {
             .or_else(|_| OpenOptions::new().write(true).open("/dev/input/uinput"))?;
         let fd = file.as_raw_fd();
 
+        // SAFETY: fd is a valid file descriptor open for writing to /dev/uinput.
         unsafe {
             ioctl_check(sys::ui_set_evbit(fd, sys::EV_SYN), "UI_SET_EVBIT(EV_SYN)")?;
             ioctl_check(sys::ui_set_evbit(fd, sys::EV_KEY), "UI_SET_EVBIT(EV_KEY)")?;
@@ -81,11 +96,12 @@ impl VirtualInput {
         // Legacy `uinput_user_dev` device-creation path (pre Linux-4.5
         // UI_DEV_SETUP/UI_ABS_SETUP), still fully supported today and all
         // this crate's ioctl bindings give us.
+        // SAFETY: uinput_user_dev is a POD C struct safely zero-initializable.
         let mut dev: sys::uinput_user_dev = unsafe { mem::zeroed() };
         let name = b"kmsrdp\0";
-        dev.name[..name.len()].copy_from_slice(unsafe {
-            std::slice::from_raw_parts(name.as_ptr() as *const i8, name.len())
-        });
+        for (dst, &src) in dev.name.iter_mut().zip(name.iter()) {
+            *dst = src as i8;
+        }
         dev.id.bustype = 0x03; // BUS_USB
         dev.id.vendor = 0xa3a7;
         dev.id.product = 0x0003;
@@ -95,12 +111,9 @@ impl VirtualInput {
         dev.absmin[sys::ABS_Y as usize] = 0;
         dev.absmax[sys::ABS_Y as usize] = POINTER_MAX;
 
-        let dev_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &dev as *const _ as *const u8,
-                mem::size_of::<sys::uinput_user_dev>(),
-            )
-        };
+        // SAFETY: dev is a local valid uinput_user_dev struct.
+        let dev_bytes = unsafe { as_byte_slice(&dev) };
+        // SAFETY: fd is valid and dev_bytes points to valid memory.
         let written = unsafe {
             libc::write(
                 fd,
@@ -112,6 +125,7 @@ impl VirtualInput {
             return Err(io::Error::last_os_error());
         }
 
+        // SAFETY: fd is valid and dev was successfully written.
         ioctl_check(unsafe { sys::ui_dev_create(fd) }, "UI_DEV_CREATE")?;
 
         // Give userspace (libinput etc.) a moment to notice the new device
@@ -124,18 +138,16 @@ impl VirtualInput {
     fn emit(&self, events: &[(i32, i32, i32)]) -> io::Result<()> {
         let fd = self.file.as_raw_fd();
         for &(kind, code, value) in events {
+            // SAFETY: input_event is a C struct safely zero-initializable for input events.
             let ev = sys::input_event {
                 time: unsafe { mem::zeroed() },
                 kind: kind as u16,
                 code: code as u16,
                 value,
             };
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &ev as *const _ as *const u8,
-                    mem::size_of::<sys::input_event>(),
-                )
-            };
+            // SAFETY: ev is a valid local input_event struct.
+            let bytes = unsafe { as_byte_slice(&ev) };
+            // SAFETY: fd is valid and bytes points to valid memory.
             let written =
                 unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
             if written != bytes.len() as isize {
@@ -151,8 +163,8 @@ impl VirtualInput {
     /// values (e.g. a stale coordinate racing a resize) are clamped rather
     /// than reported outside the device's declared absmin/absmax.
     pub fn move_abs(&self, fx: f64, fy: f64) -> io::Result<()> {
-        let fx = fx.clamp(0.0, 1.0);
-        let fy = fy.clamp(0.0, 1.0);
+        let fx = if fx.is_nan() { 0.0 } else { fx.clamp(0.0, 1.0) };
+        let fy = if fy.is_nan() { 0.0 } else { fy.clamp(0.0, 1.0) };
         self.emit(&[
             (sys::EV_ABS, sys::ABS_X, (POINTER_MAX as f64 * fx) as i32),
             (sys::EV_ABS, sys::ABS_Y, (POINTER_MAX as f64 * fy) as i32),

@@ -18,6 +18,22 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 const CERT_FILE_NAME: &str = "tls.crt";
 const KEY_FILE_NAME: &str = "tls.key";
 
+#[derive(Debug, thiserror::Error)]
+pub enum TlsError {
+    #[error("Certificate generation failed: {0}")]
+    CertificateGeneration(String),
+    #[error("TLS configuration failed: {0}")]
+    ServerConfig(#[from] rustls::Error),
+    #[error("Parse TLS certificate PEM: {0}")]
+    ParseCertificatePem(String),
+    #[error("Parse TLS private key PEM: {0}")]
+    ParsePrivateKeyPem(String),
+    #[error("Parse TLS key for CredSSP pubkey: {0}")]
+    ParseCredSspPublicKey(String),
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+}
+
 /// TLS acceptor plus the subjectPublicKey bytes CredSSP needs for `pubKeyAuth`.
 pub struct TlsIdentity {
     pub acceptor: TlsAcceptor,
@@ -27,7 +43,7 @@ pub struct TlsIdentity {
     pub public_key: Vec<u8>,
 }
 
-pub fn build_acceptor() -> io::Result<TlsIdentity> {
+pub fn build_acceptor() -> Result<TlsIdentity, TlsError> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let hostnames = tls_hostnames();
@@ -45,8 +61,7 @@ pub fn build_acceptor() -> io::Result<TlsIdentity> {
 
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
-        .map_err(|e| io::Error::other(format!("TLS config failed: {e}")))?;
+        .with_single_cert(vec![cert_der], key_der)?;
 
     Ok(TlsIdentity {
         acceptor: TlsAcceptor::from(Arc::new(config)),
@@ -63,10 +78,10 @@ fn ephemeral_requested() -> bool {
 
 fn generate_identity(
     hostnames: &[String],
-) -> io::Result<(CertificateDer<'static>, PrivateKeyDer<'static>, Vec<u8>)> {
+) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>, Vec<u8>), TlsError> {
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(hostnames.to_vec())
-            .map_err(|e| io::Error::other(format!("certificate generation failed: {e}")))?;
+            .map_err(|e| TlsError::CertificateGeneration(e.to_string()))?;
 
     let public_key = signing_key.public_key_raw().to_vec();
     let cert_der: CertificateDer<'static> = cert.der().clone();
@@ -77,7 +92,7 @@ fn generate_identity(
 
 fn load_or_create_identity(
     hostnames: &[String],
-) -> io::Result<(CertificateDer<'static>, PrivateKeyDer<'static>, Vec<u8>)> {
+) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>, Vec<u8>), TlsError> {
     let (cert_path, key_path) = tls_paths()?;
 
     if cert_path.is_file() && key_path.is_file() {
@@ -108,7 +123,7 @@ fn load_or_create_identity(
 
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(hostnames.to_vec())
-            .map_err(|e| io::Error::other(format!("certificate generation failed: {e}")))?;
+            .map_err(|e| TlsError::CertificateGeneration(e.to_string()))?;
 
     if let Err(e) = persist_identity(
         &cert_path,
@@ -139,16 +154,16 @@ fn load_or_create_identity(
 fn load_identity_files(
     cert_path: &Path,
     key_path: &Path,
-) -> io::Result<(CertificateDer<'static>, PrivateKeyDer<'static>, Vec<u8>)> {
+) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>, Vec<u8>), TlsError> {
     let cert_pem = fs::read(cert_path)?;
     let key_pem = fs::read_to_string(key_path)?;
 
     let cert_der = CertificateDer::from_pem_slice(&cert_pem)
-        .map_err(|e| io::Error::other(format!("parse TLS certificate PEM: {e}")))?;
+        .map_err(|e| TlsError::ParseCertificatePem(e.to_string()))?;
     let key_der = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
-        .map_err(|e| io::Error::other(format!("parse TLS private key PEM: {e}")))?;
+        .map_err(|e| TlsError::ParsePrivateKeyPem(e.to_string()))?;
     let key_pair = rcgen::KeyPair::from_pem(&key_pem)
-        .map_err(|e| io::Error::other(format!("parse TLS key for CredSSP pubkey: {e}")))?;
+        .map_err(|e| TlsError::ParseCredSspPublicKey(e.to_string()))?;
 
     Ok((cert_der, key_der, key_pair.public_key_raw().to_vec()))
 }
@@ -173,6 +188,26 @@ fn persist_identity(
     Ok(())
 }
 
+struct TmpFileGuard<'a>(&'a Path, bool);
+
+impl<'a> TmpFileGuard<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self(path, true)
+    }
+
+    fn disarm(mut self) {
+        self.1 = false;
+    }
+}
+
+impl Drop for TmpFileGuard<'_> {
+    fn drop(&mut self) {
+        if self.1 {
+            let _ = fs::remove_file(self.0);
+        }
+    }
+}
+
 fn write_private_file(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let rand_suffix: u64 = rand::random();
     let tmp = path.with_file_name(format!(
@@ -182,6 +217,8 @@ fn write_private_file(path: &Path, contents: &[u8], mode: u32) -> io::Result<()>
             .unwrap_or("kmsrdp-tls"),
         rand_suffix
     ));
+
+    let guard = TmpFileGuard::new(&tmp);
 
     {
         let mut file = OpenOptions::new()
@@ -194,6 +231,7 @@ fn write_private_file(path: &Path, contents: &[u8], mode: u32) -> io::Result<()>
     }
     fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
     fs::rename(&tmp, path)?;
+    guard.disarm();
     Ok(())
 }
 
@@ -343,6 +381,19 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"secret data");
         let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tmp_file_guard_deletes_file_on_drop_if_not_disarmed() {
+        let dir = tempfile_dir();
+        let tmp_path = dir.join("test.tmp");
+        fs::write(&tmp_path, b"temp content").unwrap();
+        assert!(tmp_path.exists());
+        {
+            let _guard = TmpFileGuard::new(&tmp_path);
+        }
+        assert!(!tmp_path.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -146,21 +146,34 @@ impl Bridge {
     }
 
     fn enqueue(&self, command: DriveCommand) {
-        self.outbound.lock().unwrap().push_back(command);
+        self.outbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(command);
         if self.wake.send(()).is_err() {
             tracing::warn!("kmsrdp: rdpdr FUSE: wake channel closed; RDP connection may be gone");
         }
     }
 
     fn poll_commands(&self) -> Vec<DriveCommand> {
-        self.outbound.lock().unwrap().drain(..).collect()
+        self.outbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
     }
 
     /// Drop all in-flight waiters so FUSE threads unblock immediately when
     /// the RDP connection is gone (umount must not wait out [`OP_TIMEOUT`]).
     fn abort_pending(&self) {
-        self.outbound.lock().unwrap().clear();
-        self.pending.lock().unwrap().clear();
+        self.outbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     fn submit_create(
@@ -175,7 +188,7 @@ impl Bridge {
         let tag = self.alloc_tag();
         self.pending
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(tag, Pending::Create(tx));
         let path_for_log = path.clone();
         self.enqueue(DriveCommand::Create {

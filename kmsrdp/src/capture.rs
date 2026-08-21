@@ -818,6 +818,19 @@ fn blit_bgrx(
     let src_h = src_h as i32;
     let dst_w = dst_w as i32;
     let dst_h = dst_h as i32;
+
+    if dst_x == 0
+        && dst_y == 0
+        && src_w == dst_w
+        && src_h == dst_h
+        && src_stride == dst_stride
+    {
+        let total_bytes = (src_h as usize).saturating_mul(src_stride);
+        if total_bytes <= src.len() && total_bytes <= dst.len() {
+            dst[..total_bytes].copy_from_slice(&src[..total_bytes]);
+            return;
+        }
+    }
     for row in 0..src_h {
         let dy = dst_y + row;
         if dy < 0 || dy >= dst_h {

@@ -227,16 +227,37 @@ pub async fn start() -> Result<watch::Receiver<Option<Session>>> {
     let (tx, rx) = watch::channel(initial);
 
     tokio::spawn(async move {
-        if let Err(e) = run_watcher(conn, tx).await {
-            tracing::warn!("kmsrdp: session watcher stopped: {e}");
+        let mut conn = conn;
+        let mut backoff = std::time::Duration::from_secs(1);
+        loop {
+            if let Err(e) = run_watcher(&conn, tx.clone()).await {
+                tracing::warn!("kmsrdp: session watcher disconnected: {e}; reconnecting in {backoff:?}");
+            } else {
+                tracing::info!("kmsrdp: session watcher stream closed; reconnecting in {backoff:?}");
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+
+            match Connection::system().await {
+                Ok(new_conn) => {
+                    conn = new_conn;
+                    backoff = std::time::Duration::from_secs(1);
+                    let session = find_active_session(&conn).await;
+                    apply_session_env(&session);
+                    let _ = tx.send(session);
+                }
+                Err(e) => {
+                    tracing::warn!("kmsrdp: D-Bus reconnect failed: {e}");
+                }
+            }
         }
     });
 
     Ok(rx)
 }
 
-async fn run_watcher(conn: Connection, tx: watch::Sender<Option<Session>>) -> Result<()> {
-    let manager = LoginManagerProxy::new(&conn)
+async fn run_watcher(conn: &Connection, tx: watch::Sender<Option<Session>>) -> Result<()> {
+    let manager = LoginManagerProxy::new(conn)
         .await
         .context("LoginManagerProxy::new")?;
 
@@ -249,7 +270,7 @@ async fn run_watcher(conn: Connection, tx: watch::Sender<Option<Session>>) -> Re
             msg = removed_stream.next() => { if msg.is_none() { break; } }
         }
 
-        let session = find_active_session(&conn).await;
+        let session = find_active_session(conn).await;
         apply_session_env(&session);
 
         if let Some(ref s) = session {

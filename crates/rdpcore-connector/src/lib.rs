@@ -6,8 +6,7 @@
 //! point (see [`Acceptor::step`]'s docs on [`AcceptorEvent::TlsUpgrade`]).
 //!
 //! Usage: repeatedly call [`Acceptor::step`] with one already-framed input
-//! PDU (see [`Acceptor::next_read_hint`]) until it reports
-//! [`AcceptorEvent::Accepted`].
+//! PDU until it reports [`AcceptorEvent::Accepted`].
 
 mod error;
 

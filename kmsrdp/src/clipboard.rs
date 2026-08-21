@@ -62,7 +62,7 @@ fn spawn_shared_clipboard_watcher(
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(750)) => {
                     let any = {
-                        let mut subs = subscribers.lock().unwrap();
+                        let mut subs = subscribers.lock().unwrap_or_else(|e| e.into_inner());
                         subs.retain(|s| !s.is_closed());
                         !subs.is_empty()
                     };
@@ -71,7 +71,7 @@ fn spawn_shared_clipboard_watcher(
                     }
                     let current = tokio::task::spawn_blocking(local_text).await.unwrap_or(None);
                     if current != last && matches!(&current, Some(t) if !t.is_empty()) {
-                        let mut subs = subscribers.lock().unwrap();
+                        let mut subs = subscribers.lock().unwrap_or_else(|e| e.into_inner());
                         subs.retain(advertise_unicode_formats);
                     }
                     last = current;
@@ -111,7 +111,7 @@ impl ClipboardMode {
     }
 }
 
-/// Builds per-connection backends that share one process-wide clipboard poller.
+/// Factory for creating local CLIPRDR clipboard backends.
 #[derive(Clone)]
 pub struct LocalClipboardFactory {
     subscribers: Arc<Mutex<Vec<UnboundedSender<ClipboardMessage>>>>,
@@ -122,7 +122,7 @@ impl LocalClipboardFactory {
     pub fn new(session_rx: watch::Receiver<Option<Session>>, mode: ClipboardMode) -> Self {
         let subscribers = Arc::new(Mutex::new(Vec::new()));
         if mode.allows_host_to_client() {
-            spawn_shared_clipboard_watcher(Arc::clone(&subscribers), session_rx);
+            spawn_shared_clipboard_watcher(subscribers.clone(), session_rx);
         }
         Self { subscribers, mode }
     }
@@ -134,7 +134,10 @@ impl CliprdrBackendFactory for LocalClipboardFactory {
         sender: UnboundedSender<ClipboardMessage>,
     ) -> Box<dyn CliprdrBackend> {
         if self.mode.allows_host_to_client() {
-            self.subscribers.lock().unwrap().push(sender.clone());
+            self.subscribers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(sender.clone());
         }
         Box::new(LocalClipboardBackend {
             sender,

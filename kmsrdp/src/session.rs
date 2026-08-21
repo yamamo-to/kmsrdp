@@ -62,7 +62,11 @@ pub fn find_xauthority(username: &str, xdg_runtime_dir: &Path, leader_pid: u32) 
         return Some(path);
     }
 
-    let xauth = PathBuf::from(format!("/home/{username}/.Xauthority"));
+    let xauth = if username == "root" {
+        PathBuf::from("/root/.Xauthority")
+    } else {
+        PathBuf::from(format!("/home/{username}/.Xauthority"))
+    };
     xauth.exists().then_some(xauth)
 }
 

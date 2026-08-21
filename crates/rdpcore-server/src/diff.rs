@@ -63,6 +63,15 @@ pub fn find_dirty_rects(
         return Vec::new();
     }
 
+    let required_len = height.saturating_sub(1) * stride1 + width * bpp;
+    if stride1 == stride2
+        && image1.len() >= required_len
+        && image2.len() >= required_len
+        && image1[..required_len] == image2[..required_len]
+    {
+        return Vec::new();
+    }
+
     let tiles_x = width.div_ceil(TILE_SIZE);
     let tiles_y = height.div_ceil(TILE_SIZE);
     let mut dirty = vec![false; tiles_x * tiles_y];
@@ -190,5 +199,16 @@ mod tests {
     #[test]
     fn zero_sized_frame_yields_no_rects() {
         assert!(find_dirty_rects(&[], 0, &[], 0, 0, 0, 4).is_empty());
+    }
+
+    #[test]
+    fn padded_stride_identical_frames_have_no_dirty_rects() {
+        let width = 64;
+        let height = 64;
+        let bpp = 4;
+        let stride = 300; // Padded stride larger than width * bpp
+        let a = vec![42u8; height * stride];
+        let b = a.clone();
+        assert!(find_dirty_rects(&a, stride, &b, stride, width, height, bpp).is_empty());
     }
 }
