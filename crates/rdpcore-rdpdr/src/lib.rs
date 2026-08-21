@@ -332,10 +332,14 @@ impl RdpdrChannel {
                     .collect();
                 for completion_id in stale {
                     if let Some(pending) = self.pending.remove(&completion_id) {
-                        // Device is gone - any follow-up commands the
-                        // callback returns have nowhere to go, so encode
-                        // nothing for them.
-                        let _ = self.dispatch_completion(pending, pdu::STATUS_UNSUCCESSFUL, &[]);
+                        // Consistent with the DeviceIoCompletion arm below:
+                        // encode whatever follow-up commands the callback
+                        // returns rather than assuming there can't be any
+                        // (e.g. against a still-valid device) just because
+                        // *this* device is gone.
+                        let commands =
+                            self.dispatch_completion(pending, pdu::STATUS_UNSUCCESSFUL, &[])?;
+                        self.encode_commands(commands, &mut out);
                     }
                 }
             }
@@ -485,7 +489,12 @@ impl RdpdrChannel {
     }
 
     fn encode_commands(&mut self, commands: Vec<DriveCommand>, out: &mut Vec<Vec<u8>>) {
-        for command in commands {
+        // A work queue rather than recursing on follow-up commands
+        // (below, when MAX_PENDING_OPS is hit) - a consumer whose error
+        // callback itself returns another command would otherwise recurse
+        // once per command with no depth limit.
+        let mut queue: std::collections::VecDeque<DriveCommand> = commands.into();
+        while let Some(command) = queue.pop_front() {
             if self.pending.len() >= MAX_PENDING_OPS {
                 tracing::warn!(
                     "rdpdr: {MAX_PENDING_OPS} I/O requests already outstanding (client not \
@@ -498,7 +507,7 @@ impl RdpdrChannel {
                 // particular would otherwise leak the handle on the
                 // client for the rest of the session.
                 let follow_up = self.fail_command_without_issuing(command, pdu::STATUS_UNSUCCESSFUL);
-                self.encode_commands(follow_up, out);
+                queue.extend(follow_up);
                 continue;
             }
             let device_id = drive_command_device_id(&command);
@@ -1042,6 +1051,121 @@ mod tests {
         let got = replies.lock().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0], (MAX_PENDING_OPS as u64 + 1, Err(pdu::STATUS_UNSUCCESSFUL)));
+    }
+
+    #[test]
+    fn a_long_chain_of_immediately_failing_follow_ups_does_not_overflow_the_stack() {
+        // A consumer whose error callback itself always returns another
+        // command (a retry loop) used to recurse once per link in
+        // encode_commands - with pending already pinned at the cap, every
+        // one of these fails instantly and chains into the next. Proves
+        // encode_commands' work-queue rewrite handles a long chain without
+        // growing the call stack.
+        const CHAIN_LEN: u64 = 200_000;
+
+        struct RetryingConsumer {
+            remaining: u64,
+        }
+        impl DriveConsumer for RetryingConsumer {
+            fn on_device_ready(
+                &mut self,
+                _device_id: u32,
+                _device_type: u32,
+                _dos_name: &str,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_create_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<irp::CreateReply, u32>,
+            ) -> Vec<DriveCommand> {
+                if self.remaining == 0 {
+                    return Vec::new();
+                }
+                self.remaining -= 1;
+                vec![DriveCommand::Create {
+                    device_id: 1,
+                    path: "\\".to_owned(),
+                    desired_access: irp::GENERIC_READ,
+                    create_disposition: irp::FILE_OPEN,
+                    create_options: irp::FILE_DIRECTORY_FILE,
+                    request_tag: 0,
+                }]
+            }
+            fn on_close_reply(&mut self, _request_tag: u64, _status: u32) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_read_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<Vec<u8>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_write_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<u32, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_query_directory_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<Option<irp::DirectoryEntry>, u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn on_set_information_reply(
+                &mut self,
+                _request_tag: u64,
+                _result: Result<(), u32>,
+            ) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+            fn poll_commands(&mut self) -> Vec<DriveCommand> {
+                Vec::new()
+            }
+        }
+
+        let (mut channel, _initial) = RdpdrChannel::new(
+            1004,
+            1002,
+            pdu::RDPDR_DTYP_FILESYSTEM,
+            Box::new(RetryingConsumer {
+                remaining: CHAIN_LEN,
+            }),
+        );
+        // Fill pending to the cap so the very first command below already
+        // fails and kicks off the chain.
+        let mut fill = Vec::new();
+        for i in 0..MAX_PENDING_OPS as u64 {
+            fill.push(DriveCommand::Create {
+                device_id: 1,
+                path: "\\".to_owned(),
+                desired_access: irp::GENERIC_READ,
+                create_disposition: irp::FILE_OPEN,
+                create_options: irp::FILE_DIRECTORY_FILE,
+                request_tag: i,
+            });
+        }
+        let mut out = Vec::new();
+        channel.encode_commands(fill, &mut out);
+        assert!(!out.is_empty());
+        out.clear();
+        channel.encode_commands(
+            vec![DriveCommand::Create {
+                device_id: 1,
+                path: "\\".to_owned(),
+                desired_access: irp::GENERIC_READ,
+                create_disposition: irp::FILE_OPEN,
+                create_options: irp::FILE_DIRECTORY_FILE,
+                request_tag: 0,
+            }],
+            &mut out,
+        );
+        assert!(out.is_empty());
     }
 
     #[test]
