@@ -179,7 +179,7 @@ impl DvcMux {
     fn handle_incoming_data(
         &mut self,
         channel_id: u32,
-        data: Vec<u8>,
+        mut data: Vec<u8>,
         starts_new: Option<u32>,
     ) -> Result<Vec<Vec<u8>>, DecodeError> {
         let payloads = {
@@ -195,6 +195,13 @@ impl DvcMux {
                         });
                     }
                     if data.len() as u32 >= total_length {
+                        // A client declaring `total_length` but then
+                        // sending more bytes than that in the very same
+                        // PDU is malformed - truncate to what it actually
+                        // promised rather than handing the handler extra,
+                        // unaccounted-for trailing bytes as if they were
+                        // part of the message.
+                        data.truncate(total_length as usize);
                         Some(data)
                     } else {
                         slot.reassembly = Some((total_length, data));
@@ -211,6 +218,10 @@ impl DvcMux {
                         }
                         buffered.extend(data);
                         if buffered.len() as u32 >= total_length {
+                            // Same reasoning as above: don't let a
+                            // continuation overrun the declared total
+                            // silently pass extra bytes through.
+                            buffered.truncate(total_length as usize);
                             Some(buffered)
                         } else {
                             slot.reassembly = Some((total_length, buffered));
@@ -381,5 +392,43 @@ mod tests {
         assert!(
             matches!(result, Err(DecodeError::InvalidValue { field, .. }) if field == "dvc.data_first.total_length")
         );
+    }
+
+    #[derive(Debug)]
+    struct EchoBackHandler;
+    impl DvcHandler for EchoBackHandler {
+        fn channel_name(&self) -> &str {
+            "TEST"
+        }
+        fn on_open(&mut self) -> Vec<Vec<u8>> {
+            Vec::new()
+        }
+        fn on_data(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
+            vec![data.to_vec()]
+        }
+    }
+
+    #[test]
+    fn data_first_overrunning_its_declared_total_length_is_truncated() {
+        let (mut mux, _) = DvcMux::new(1005, 1002);
+        mux.capability_negotiated = true;
+        mux.register_channel(Box::new(EchoBackHandler));
+
+        // DataFirst declares total_length=4 but the PDU actually carries
+        // 8 bytes ("overrun!" truncated to "over") - the extra 4 bytes
+        // must not silently reach the handler as part of the message.
+        let data_first_pdu = pdu::encode_data_first(1, 4, b"overrun!");
+        let wire = svc::chunkify(&data_first_pdu);
+        let replies = mux.on_channel_data(&wire[0]).unwrap();
+        assert_eq!(replies.len(), 1);
+
+        let x224_payload = x224::unwrap_data(&replies[0]).unwrap();
+        let send_data = SendData::decode_indication(x224_payload).unwrap();
+        let (_, _, dvc_pdu) = svc::dechunkify(&send_data.data).unwrap();
+        let pdu::ClientMessage::Data { data, .. } = pdu::decode_client_message(dvc_pdu).unwrap()
+        else {
+            panic!("expected a Data PDU echoed back");
+        };
+        assert_eq!(data, b"over");
     }
 }
