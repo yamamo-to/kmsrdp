@@ -33,7 +33,10 @@ struct CudaCtx {
 impl Drop for CudaCtx {
     fn drop(&mut self) {
         if !self.ctx.is_null() {
-            unsafe { (self.destroy)(self.ctx) };
+            let result = unsafe { (self.destroy)(self.ctx) };
+            if result != 0 {
+                tracing::warn!("cuCtxDestroy failed with CUDA result code {result}");
+            }
             self.ctx = ptr::null_mut();
         }
     }
@@ -86,7 +89,11 @@ struct Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.encoder.is_null() {
-            unsafe { (self.fl.nvenc_destroy_encoder)(self.encoder) };
+            if let Err(e) =
+                unsafe { (self.fl.nvenc_destroy_encoder)(self.encoder) }.into_error()
+            {
+                tracing::warn!("NVENC destroy encoder failed: {e:?}");
+            }
             self.encoder = ptr::null_mut();
         }
     }
@@ -254,6 +261,16 @@ impl Drop for NvencH264Encoder {
     }
 }
 
+/// Minimum `pixels.len()` needed to read a `width`x`height` BGRX32 frame at
+/// `stride` without running off the end of the buffer - the last row only
+/// needs `width * 4` bytes, not a full `stride`.
+fn min_source_len(width: u16, height: u16, stride: usize) -> usize {
+    usize::from(height)
+        .saturating_sub(1)
+        .saturating_mul(stride)
+        .saturating_add(usize::from(width).saturating_mul(4))
+}
+
 impl H264Encoder for NvencH264Encoder {
     fn encode_bgrx(
         &mut self,
@@ -265,6 +282,22 @@ impl H264Encoder for NvencH264Encoder {
     ) -> Result<EncodedAu, String> {
         if width == 0 || height == 0 {
             return Err("empty frame".into());
+        }
+        // The BGRX->ABGR copy loop below reads `pixels` via raw pointer
+        // arithmetic with no bounds check of its own - unlike
+        // `encoder::bgrx_to_i420`'s equivalent (used by the VAAPI/OpenH264
+        // backends), which validates this same invariant before its own
+        // unsafe-free copy. Check it here so a geometry mismatch (capture
+        // bug, resize race) becomes a clean error instead of an
+        // out-of-bounds read.
+        let needed = min_source_len(width, height, stride);
+        if pixels.len() < needed {
+            return Err(format!(
+                "source buffer too small: {}x{} @ stride {stride} needs {needed} bytes, got {}",
+                width,
+                height,
+                pixels.len()
+            ));
         }
         let coded_w = align16(width).max(16);
         let coded_h = align16(height).max(16);
@@ -359,9 +392,13 @@ impl H264Encoder for NvencH264Encoder {
             };
             annex_b.extend_from_slice(slice);
         }
-        let _ = unsafe {
+        if let Err(e) = unsafe {
             (self.session.fl.nvenc_unlock_bit_stream)(self.session.encoder, buffers.output)
-        };
+        }
+        .into_error()
+        {
+            tracing::warn!("NVENC unlock bitstream failed: {e:?}");
+        }
         self.frame_idx = self.frame_idx.wrapping_add(1);
 
         if annex_b.is_empty() {
@@ -376,5 +413,30 @@ impl H264Encoder for NvencH264Encoder {
     fn reset(&mut self) {
         self.destroy_buffers();
         self.frame_idx = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn min_source_len_needs_only_width_bytes_on_the_last_row() {
+        // 4x3 @ stride 16: two full rows of stride, plus width*4 on the
+        // last row - not another full stride.
+        assert_eq!(min_source_len(4, 3, 16), 16 * 2 + 4 * 4);
+    }
+
+    #[test]
+    fn min_source_len_matches_tightly_packed_buffer() {
+        let w = 8u16;
+        let h = 5u16;
+        let stride = usize::from(w) * 4;
+        assert_eq!(min_source_len(w, h, stride), stride * usize::from(h));
+    }
+
+    #[test]
+    fn min_source_len_single_row_needs_only_that_row() {
+        assert_eq!(min_source_len(10, 1, 999), 10 * 4);
     }
 }
