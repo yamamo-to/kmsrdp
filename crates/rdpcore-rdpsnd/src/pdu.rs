@@ -155,6 +155,22 @@ fn decode_client_audio_formats(body: &[u8]) -> Result<ClientAudioFormats, Decode
     let _last_block_confirmed = cursor.read_u8()?;
     let _version = cursor.read_u16_le()?;
     let _pad = cursor.read_u8()?;
+    // Each format is at least 18 bytes (fixed WAVEFORMATEX fields before
+    // its variable-length extra data) - reject counts that can't possibly
+    // fit the remaining bytes before `collect`'s upstream Vec reservation
+    // uses a hostile count to reserve more than the message could ever
+    // back, same reasoning as rdpdr's DeviceCount and rdpeai's
+    // NumFormats checks. `count` is a u16 so the blast radius is already
+    // small, but this keeps the three format-list decoders consistent.
+    const MIN_FORMAT_BYTES: usize = 2 + 2 + 4 + 4 + 2 + 2 + 2;
+    let needed = usize::from(count) * MIN_FORMAT_BYTES;
+    if cursor.remaining() < needed {
+        return Err(rdpcore_pdu::cursor::NotEnoughBytes {
+            needed,
+            remaining: cursor.remaining(),
+        }
+        .into());
+    }
     let formats = (0..count)
         .map(|_| AudioFormat::decode(&mut cursor))
         .collect::<Result<_, _>>()?;
@@ -301,6 +317,27 @@ mod tests {
                 formats: vec![AudioFormat::pcm(2, 44100, 16)],
             })
         );
+    }
+
+    #[test]
+    fn client_audio_formats_rejects_hostile_format_count() {
+        // dwFlags/dwVolume/dwPitch/wDGramPort header, then a count claiming
+        // far more formats than the (empty) remaining body could back.
+        let mut body = Vec::new();
+        body.write_u32_le(0);
+        body.write_u32_le(0);
+        body.write_u32_le(0);
+        body.write_u16_be(0);
+        body.write_u16_le(u16::MAX); // count
+        body.write_u8(0);
+        body.write_u16_le(0);
+        body.write_u8(0);
+
+        let mut pdu = Vec::new();
+        write_header(&mut pdu, SNDC_FORMATS, body.len());
+        pdu.extend_from_slice(&body);
+
+        assert!(decode_client_message(&pdu).is_err());
     }
 
     #[test]
