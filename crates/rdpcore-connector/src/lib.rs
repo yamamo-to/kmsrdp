@@ -46,6 +46,13 @@ pub const IO_CHANNEL_ID: u16 = USER_CHANNEL_ID + 1; // 1003
 
 const SHARE_ID: u32 = 0x0001_0000;
 
+/// Maximum allowed size for the reassembled Confirm Active PDU. Without a
+/// cap, a client sending fragments with `complete = false` indefinitely
+/// could grow `confirm_active_buf` without bound - mirrors the
+/// `MAX_TS_REQUEST_LEN` guard `credssp.rs` already applies to CredSSP's
+/// own fragment reassembly.
+const MAX_CONFIRM_ACTIVE_LEN: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientCredentials {
     pub domain: String,
@@ -678,6 +685,18 @@ impl Acceptor {
             return Ok(StepResult::just(Vec::new()));
         }
 
+        if self
+            .confirm_active_buf
+            .len()
+            .saturating_add(send_data.data.len())
+            > MAX_CONFIRM_ACTIVE_LEN
+        {
+            self.confirm_active_buf.clear();
+            return Err(ConnectorError::Decode(rdpcore_pdu::DecodeError::InvalidValue {
+                field: "confirm_active.reassembly",
+                reason: "exceeded maximum allowed reassembled size",
+            }));
+        }
         self.confirm_active_buf.extend_from_slice(&send_data.data);
         if !send_data.complete {
             self.state = State::WaitConfirmActive;
@@ -938,6 +957,20 @@ mod tests {
         static_channel_names: &[&str],
         with_message_channel: bool,
     ) -> (Acceptor, AcceptedConnection, ClientCredentials) {
+        let (mut acceptor, credentials) =
+            drive_to_wait_confirm_active(static_channel_names, with_message_channel);
+        let accepted = drive_confirm_active_and_finalization(&mut acceptor);
+        (acceptor, accepted, credentials)
+    }
+
+    /// Drives an `Acceptor` up to (but not through) `WaitConfirmActive` -
+    /// the shared prefix of `run_full_handshake_inner`, factored out so
+    /// tests can exercise `WaitConfirmActive`'s own behavior (e.g. Confirm
+    /// Active fragment reassembly) directly.
+    fn drive_to_wait_confirm_active(
+        static_channel_names: &[&str],
+        with_message_channel: bool,
+    ) -> (Acceptor, ClientCredentials) {
         let mut acceptor = Acceptor::new(1024, 768);
 
         let request = ConnectionRequest {
@@ -1008,8 +1041,7 @@ mod tests {
         };
         acceptor.approve_client_info().unwrap();
 
-        let accepted = drive_confirm_active_and_finalization(&mut acceptor);
-        (acceptor, accepted, credentials)
+        (acceptor, credentials)
     }
 
     /// Drives an `Acceptor` from `WaitConfirmActive` through to `Accepted` -
@@ -1159,6 +1191,37 @@ mod tests {
         assert_eq!(accepted.desktop_height, 768);
         assert_eq!(credentials.username, "kmsrdp");
         assert_eq!(credentials.password, "hunter2");
+    }
+
+    #[test]
+    fn confirm_active_reassembly_rejects_fragments_beyond_the_size_cap() {
+        let (mut acceptor, _credentials) = drive_to_wait_confirm_active(&[], false);
+
+        // Feed fragments (never `complete`) past MAX_CONFIRM_ACTIVE_LEN -
+        // must be rejected rather than growing confirm_active_buf without
+        // bound.
+        let chunk = vec![0x41u8; 64 * 1024];
+        let mut sent = 0usize;
+        let mut result = Ok(());
+        while sent <= MAX_CONFIRM_ACTIVE_LEN {
+            let send_data = SendData {
+                initiator: USER_CHANNEL_ID,
+                channel_id: IO_CHANNEL_ID,
+                data: chunk.clone(),
+                complete: false,
+            };
+            result = acceptor
+                .step(&x224::wrap_data(&send_data.encode_request()))
+                .map(|_| ());
+            sent += chunk.len();
+            if result.is_err() {
+                break;
+            }
+        }
+        assert!(
+            matches!(result, Err(ConnectorError::Decode(_))),
+            "expected reassembly to be rejected once past the cap, got {result:?}"
+        );
     }
 
     #[test]
