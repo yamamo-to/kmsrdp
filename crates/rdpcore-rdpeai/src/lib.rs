@@ -19,31 +19,23 @@ pub trait AudioInputBackendFactory: Send + Sync {
     fn build_backend(&self) -> Box<dyn AudioInputBackend>;
 }
 
-/// The comparison MS-RDPEAI negotiation actually needs: tag/channels/
-/// sample-rate/bits/extra-data must match - mirrors RDPSND's own
-/// negotiation equality, since both protocols share the same WAVEFORMATEX-
-/// style format entries.
-fn formats_compatible(a: &AudioFormat, b: &AudioFormat) -> bool {
-    a.format_tag == b.format_tag
-        && a.n_channels == b.n_channels
-        && a.n_samples_per_sec == b.n_samples_per_sec
-        && a.bits_per_sample == b.bits_per_sample
-        && a.extra_data == b.extra_data
-}
-
 /// Server-format-priority order: for each of *our* formats, in order,
 /// look for any match in the client's list, and take the first hit -
 /// matching a real implementation's own negotiation strategy. Returns the
 /// index into `server_formats` (that's what `initialFormat` in the Open
 /// PDU references, per MS-RDPEAI - the client already has this same list
 /// from the preceding Formats PDU).
+///
+/// MS-RDPEAI and RDPSND share the same WAVEFORMATEX-style format entry and
+/// negotiation rule, so this reuses `AudioFormat::negotiation_eq` rather
+/// than re-implementing the comparison.
 fn negotiate(server_formats: &[AudioFormat], client_formats: &[AudioFormat]) -> Option<u32> {
     server_formats
         .iter()
         .position(|server_format| {
             client_formats
                 .iter()
-                .any(|client_format| formats_compatible(server_format, client_format))
+                .any(|client_format| server_format.negotiation_eq(client_format))
         })
         .map(|index| index as u32)
 }

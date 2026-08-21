@@ -106,7 +106,11 @@ impl AudioFormat {
     /// tag/channels/sample-rate/bits/extra-data must match: deliberately
     /// ignoring `n_avg_bytes_per_sec`/`n_block_align`, which are derived
     /// fields some clients recompute slightly differently.
-    fn negotiation_eq(&self, other: &Self) -> bool {
+    ///
+    /// `pub` so `rdpcore-rdpeai` (MS-RDPEAI shares this same WAVEFORMATEX-
+    /// style format entry and negotiation rule) can reuse it instead of
+    /// re-implementing the comparison.
+    pub fn negotiation_eq(&self, other: &Self) -> bool {
         self.format_tag == other.format_tag
             && self.n_channels == other.n_channels
             && self.n_samples_per_sec == other.n_samples_per_sec
