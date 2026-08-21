@@ -4,10 +4,10 @@ use libfuzzer_sys::fuzz_target;
 use rdpcore_pdu::cursor::ReadCursor;
 use rdpcore_pdu::mcs::{
     AttachUserConfirm, AttachUserRequest, ChannelJoinConfirm, ChannelJoinRequest,
-    ConnectInitial, ConnectResponse, ErectDomainRequest, SendData,
+    ConnectInitial, ConnectResponse, DisconnectProviderUltimatum, ErectDomainRequest, SendData,
 };
-use rdpcore_pdu::{finalization, licensing, rdp6, svc, utf16, x224};
-use rdpcore_pdu::{fastpath, tpkt};
+use rdpcore_pdu::{capability_sets, client_info, finalization, gcc, licensing, rdp6, svc, utf16};
+use rdpcore_pdu::{fastpath, tpkt, x224};
 
 fuzz_target!(|data: &[u8]| {
     let mut cursor = ReadCursor::new(data);
@@ -22,6 +22,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = AttachUserConfirm::decode(data);
     let _ = ChannelJoinRequest::decode(data);
     let _ = ChannelJoinConfirm::decode(data);
+    let _ = DisconnectProviderUltimatum::decode(data);
     let _ = SendData::decode_request(data);
     let _ = SendData::decode_indication(data);
     let _ = svc::dechunkify(data);
@@ -31,4 +32,12 @@ fuzz_target!(|data: &[u8]| {
     let _ = finalization::decode_monitor_layout(data);
     let _ = licensing::decode_valid_client(data);
     let _ = rdp6::decode(data, 64, 64);
+    // Client-supplied-bytes decode paths: username/password (ClientInfo),
+    // capability negotiation (ConfirmActive), and the GCC blocks exchanged
+    // during MCS Connect Initial - previously missing from this harness.
+    let _ = client_info::ClientInfoPdu::decode(data);
+    let _ = capability_sets::ConfirmActive::decode(data);
+    let _ = gcc::ClientGccBlocks::decode(data);
+    let _ = gcc::ConferenceCreateRequest::decode(data);
+    let _ = gcc::ConferenceCreateResponse::decode(data);
 });
