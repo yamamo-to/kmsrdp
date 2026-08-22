@@ -1,6 +1,8 @@
 //! Per-IP authentication failure limiter: after too many failed
 //! handshakes from one address, further attempts are dropped until the
-//! lockout expires. Success clears the record.
+//! lockout expires. Success clears the record. Stale and surplus entries
+//! are evicted so a flood of unique source addresses cannot grow the map
+//! without bound.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -9,7 +11,8 @@ use std::time::{Duration, Instant};
 
 const MAX_FAILURES: u32 = 5;
 const WINDOW: Duration = Duration::from_secs(60);
-const LOCKOUT: Duration = Duration::from_secs(60);
+const LOCKOUT: Duration = Duration::from_secs(300);
+const MAX_TRACKED: usize = 4096;
 
 #[derive(Clone, Copy)]
 struct FailureState {
@@ -33,20 +36,33 @@ impl AuthLimiter {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn gc(map: &mut HashMap<IpAddr, FailureState>, now: Instant) {
+        map.retain(|_, state| entry_live(state, now));
+    }
+
+    fn evict_if_full(map: &mut HashMap<IpAddr, FailureState>, incoming: IpAddr) {
+        if map.len() < MAX_TRACKED || map.contains_key(&incoming) {
+            return;
+        }
+        let victim = map
+            .iter()
+            .filter(|(ip, _)| **ip != incoming)
+            .min_by_key(|(_, s)| (s.locked_until.is_some(), s.first))
+            .map(|(ip, _)| *ip);
+        if let Some(ip) = victim {
+            map.remove(&ip);
+        }
+    }
+
     /// Whether this address is currently locked out.
     pub fn is_blocked(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
         let mut map = self.lock();
+        Self::gc(&mut map, now);
         let Some(state) = map.get(&ip).copied() else {
             return false;
         };
-        if let Some(until) = state.locked_until {
-            if now < until {
-                return true;
-            }
-            map.remove(&ip);
-        }
-        false
+        matches!(state.locked_until, Some(until) if now < until)
     }
 
     pub fn record_success(&self, ip: IpAddr) {
@@ -56,6 +72,8 @@ impl AuthLimiter {
     pub fn record_failure(&self, ip: IpAddr) {
         let now = Instant::now();
         let mut map = self.lock();
+        Self::gc(&mut map, now);
+        Self::evict_if_full(&mut map, ip);
         let state = map.entry(ip).or_insert(FailureState {
             count: 0,
             first: now,
@@ -76,6 +94,13 @@ impl AuthLimiter {
             state.locked_until = Some(now + LOCKOUT);
         }
     }
+}
+
+fn entry_live(state: &FailureState, now: Instant) -> bool {
+    if let Some(until) = state.locked_until {
+        return now < until;
+    }
+    now.duration_since(state.first) <= WINDOW
 }
 
 impl Default for AuthLimiter {
@@ -126,5 +151,42 @@ mod tests {
         }
         assert!(limiter.is_blocked(a));
         assert!(!limiter.is_blocked(b));
+    }
+
+    #[test]
+    fn gc_drops_unlocked_entries_outside_the_window() {
+        let mut map = HashMap::new();
+        let now = Instant::now();
+        map.insert(
+            ip(),
+            FailureState {
+                count: 1,
+                first: now - WINDOW - Duration::from_secs(1),
+                locked_until: None,
+            },
+        );
+        AuthLimiter::gc(&mut map, now);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn evict_if_full_drops_an_unlocked_entry() {
+        let mut map = HashMap::new();
+        let now = Instant::now();
+        for i in 0..MAX_TRACKED {
+            let addr = IpAddr::V4(Ipv4Addr::new(198, 51, (i / 256) as u8, (i % 256) as u8));
+            map.insert(
+                addr,
+                FailureState {
+                    count: 1,
+                    first: now,
+                    locked_until: None,
+                },
+            );
+        }
+        let incoming = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+        AuthLimiter::evict_if_full(&mut map, incoming);
+        assert_eq!(map.len(), MAX_TRACKED - 1);
+        assert!(!map.contains_key(&incoming));
     }
 }

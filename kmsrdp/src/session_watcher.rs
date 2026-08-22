@@ -158,10 +158,12 @@ async fn find_active_session(conn: &Connection) -> Option<Session> {
 /// instance in that case.
 ///
 /// # Safety
-/// `set_var`/`remove_var` are unsafe in Rust edition 2024 due to potential
-/// races in multi-threaded programs. We accept this here because we are the
-/// only caller that writes these variables and we do so from a single task
-/// before any child processes that read them are spawned.
+/// `set_var`/`remove_var` are unsafe in Rust edition 2024 because they race
+/// with concurrent `getenv` in other threads (including C libraries:
+/// libpulse, libX11, arboard). This process still uses process-wide env
+/// because those libraries have no other way to pick a session.
+/// Writes are confined to this one watcher task; readers (clipboard poll,
+/// Pulse clients) may observe a torn update across a session switch.
 fn apply_session_env(session: &Option<Session>) {
     unsafe {
         match session {
@@ -297,12 +299,7 @@ async fn run_watcher(conn: &Connection, tx: watch::Sender<Option<Session>>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
+    use crate::test_env::env_lock;
 
     fn sample_session(display: Option<&str>) -> Session {
         Session {

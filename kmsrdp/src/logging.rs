@@ -64,12 +64,7 @@ fn stderr_is_tty() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
+    use crate::test_env::env_lock;
 
     #[test]
     fn init_handles_invalid_kmsrdp_log() {

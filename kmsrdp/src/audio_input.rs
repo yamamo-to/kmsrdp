@@ -173,12 +173,7 @@ impl Drop for VirtualMicBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
+    use crate::test_env::env_lock;
 
     #[test]
     fn current_session_uid_parses_xdg_runtime_dir() {

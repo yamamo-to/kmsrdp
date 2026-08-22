@@ -224,6 +224,15 @@ impl VirtualInput {
     /// Vertical wheel: positive scrolls up, negative scrolls down.
     /// `delta` is typically +/- 120 per notch in RDP, or raw step count.
     pub fn scroll(&self, delta: i32) -> io::Result<()> {
+        self.rel_wheel(sys::REL_WHEEL, delta)
+    }
+
+    /// Horizontal wheel (`REL_HWHEEL`).
+    pub fn hscroll(&self, delta: i32) -> io::Result<()> {
+        self.rel_wheel(sys::REL_HWHEEL, delta)
+    }
+
+    fn rel_wheel(&self, axis: i32, delta: i32) -> io::Result<()> {
         if delta == 0 {
             return Ok(());
         }
@@ -233,7 +242,7 @@ impl VirtualInput {
             delta.signum()
         };
         self.emit(&[
-            (sys::EV_REL, sys::REL_WHEEL, steps),
+            (sys::EV_REL, axis, steps),
             (sys::EV_SYN, sys::SYN_REPORT, 0),
         ])
     }

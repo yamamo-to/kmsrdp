@@ -22,6 +22,8 @@ StartLimitBurst=5
 # environment) live here rather than in this unit file - see
 # kmsrdp.env.example in the package docs.
 EnvironmentFile=-%h/.config/kmsrdp/kmsrdp.env
+# Optional: keep the RDP password out of the environment.
+# LoadCredential=kmsrdp.password:%h/.config/kmsrdp/rdp-password
 # Persisted self-signed TLS cert/key under $XDG_STATE_HOME/kmsrdp (tls.crt / tls.key).
 StateDirectory=kmsrdp
 

@@ -137,7 +137,9 @@ impl RdpServerInputHandler for Input {
             MouseEvent::LeftPressed | MouseEvent::LeftReleased => Some(uinput::BTN_LEFT),
             MouseEvent::RightPressed | MouseEvent::RightReleased => Some(uinput::BTN_RIGHT),
             MouseEvent::MiddlePressed | MouseEvent::MiddleReleased => Some(uinput::BTN_MIDDLE),
-            MouseEvent::Move { .. } | MouseEvent::VerticalScroll { .. } => None,
+            MouseEvent::Move { .. }
+            | MouseEvent::VerticalScroll { .. }
+            | MouseEvent::HorizontalScroll { .. } => None,
         };
         let down = matches!(
             event,
@@ -160,6 +162,7 @@ impl RdpServerInputHandler for Input {
                 self.device.button(uinput::BTN_MIDDLE, down)
             }
             MouseEvent::VerticalScroll { value } => self.device.scroll(value),
+            MouseEvent::HorizontalScroll { value } => self.device.hscroll(value),
         };
         if let Err(e) = result {
             tracing::warn!(error = %e, "mouse injection failed");
@@ -272,7 +275,9 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind {}: {e}", cfg.listen))?;
 
-    let device = VirtualInput::create()?;
+    let device = tokio::task::spawn_blocking(VirtualInput::create)
+        .await
+        .context("uinput create task panicked")??;
     tracing::info!("virtual input device created");
 
     let input = SharedInput::new(Input {
@@ -313,6 +318,12 @@ async fn main() -> Result<()> {
         }
     };
 
+    if cfg.password_generated {
+        tracing::warn!(
+            "using a generated one-shot password; set KMSRDP_PASSWORD_FILE or KMSRDP_PASSWORD \
+             for a stable credential (the secret should not live in the process environment)"
+        );
+    }
     if cfg.require_nla {
         tracing::info!("NLA (Network Level Authentication) is required for all connections");
     } else {
@@ -321,6 +332,13 @@ async fn main() -> Result<()> {
         );
     }
     tracing::info!(max_sessions = cfg.max_sessions, "concurrent session limit");
+    if cfg.max_sessions > 1 {
+        tracing::warn!(
+            max_sessions = cfg.max_sessions,
+            "multiple authenticated sessions share one desktop, one uinput device, \
+             and one FUSE drive mount per DosName — I/O goes through the mount owner"
+        );
+    }
 
     let cliprdr_factory: Option<Box<dyn rdpcore_cliprdr::CliprdrBackendFactory>> =
         if cfg.clipboard.is_disabled() {

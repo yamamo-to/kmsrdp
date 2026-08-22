@@ -31,6 +31,7 @@ pub enum MouseEvent {
     MiddlePressed,
     MiddleReleased,
     VerticalScroll { value: i32 },
+    HorizontalScroll { value: i32 },
 }
 
 pub trait RdpServerInputHandler: Send {

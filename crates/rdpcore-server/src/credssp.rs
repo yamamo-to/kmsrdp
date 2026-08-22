@@ -18,8 +18,35 @@ type CredsspProcessGenerator<'a> =
     Generator<'a, NetworkRequest, sspi::Result<Vec<u8>>, Result<ServerState, ServerError>>;
 
 /// Looks up the single configured account for NTLM verification.
+/// Unknown usernames still return an `AuthIdentity` with a dummy password
+/// so NTLM fails without advertising whether the account exists.
 struct ConfiguredCredentials {
     expected: Credentials,
+    dummy_password: String,
+}
+
+impl ConfiguredCredentials {
+    fn new(expected: Credentials) -> Self {
+        // Strictly longer than `expected.password`, so it can never equal it.
+        let dummy_password = format!("\u{1}kmsrdp-nla-dummy:{}{}", expected.password, '\u{1}');
+        Self {
+            expected,
+            dummy_password,
+        }
+    }
+
+    fn password_for(&self, client_user: &str, client_domain: &str) -> &str {
+        let user_ok = eq_ignore_ascii_case_ct(client_user, &self.expected.username);
+        let domain_ok = match &self.expected.domain {
+            Some(expected_domain) => eq_ignore_ascii_case_ct(client_domain, expected_domain),
+            None => true,
+        };
+        if user_ok && domain_ok {
+            &self.expected.password
+        } else {
+            &self.dummy_password
+        }
+    }
 }
 
 impl CredentialsProxy for ConfiguredCredentials {
@@ -33,25 +60,13 @@ impl CredentialsProxy for ConfiguredCredentials {
             sspi::UsernameParts::UserPrincipalName(parts) => (parts.account_name(), parts.suffix()),
         };
         let (client_domain, client_user) = normalize_client_identity(account, domain);
-
-        if !eq_ignore_ascii_case_ct(&client_user, &self.expected.username) {
-            return Err(io::Error::other(format!(
-                "unknown username {account:?} (domain {domain:?})"
-            )));
-        }
-        if let Some(expected_domain) = &self.expected.domain
-            && !eq_ignore_ascii_case_ct(&client_domain, expected_domain)
-        {
-            return Err(io::Error::other(format!(
-                "domain mismatch for user {account:?}"
-            )));
-        }
+        let password = self.password_for(&client_user, &client_domain);
 
         // Preserve the client's Username (domain form) so NTLM challenge
         // verification uses the same identity the client authenticated as.
         Ok(AuthIdentity {
             username: username.clone(),
-            password: self.expected.password.clone().into(),
+            password: password.to_owned().into(),
         })
     }
 
@@ -77,7 +92,7 @@ pub async fn run_credssp_nla<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let proxy = ConfiguredCredentials { expected };
+    let proxy = ConfiguredCredentials::new(expected);
     let mut server = CredSspServer::new(
         public_key,
         proxy,
@@ -176,13 +191,11 @@ mod tests {
 
     #[test]
     fn proxy_accepts_matching_username_case_insensitive() {
-        let mut proxy = ConfiguredCredentials {
-            expected: Credentials {
-                username: "kmsrdp".into(),
-                password: "secret".into(),
-                domain: None,
-            },
-        };
+        let mut proxy = ConfiguredCredentials::new(Credentials {
+            username: "kmsrdp".into(),
+            password: "secret".into(),
+            domain: None,
+        });
         let user = Username::parse("KMSRDP").unwrap();
         let identity = proxy.auth_data_by_user(&user).unwrap();
         assert_eq!(identity.username.account_name(), "KMSRDP");
@@ -190,15 +203,14 @@ mod tests {
     }
 
     #[test]
-    fn proxy_rejects_unknown_username() {
-        let mut proxy = ConfiguredCredentials {
-            expected: Credentials {
-                username: "kmsrdp".into(),
-                password: "secret".into(),
-                domain: None,
-            },
-        };
+    fn proxy_unknown_username_returns_dummy_password() {
+        let mut proxy = ConfiguredCredentials::new(Credentials {
+            username: "kmsrdp".into(),
+            password: "secret".into(),
+            domain: None,
+        });
         let user = Username::parse("other").unwrap();
-        assert!(proxy.auth_data_by_user(&user).is_err());
+        let identity = proxy.auth_data_by_user(&user).unwrap();
+        assert_ne!(identity.password.as_ref().as_str(), "secret");
     }
 }

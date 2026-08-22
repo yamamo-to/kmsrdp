@@ -3,8 +3,9 @@
 //! Defaults are conservative: loopback listen, NLA required, one
 //! authenticated session. Override explicitly to expose the service.
 
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -13,8 +14,12 @@ use std::os::unix::fs::PermissionsExt as _;
 use crate::clipboard::ClipboardMode;
 use crate::tls;
 
+/// Hard ceiling so `KMSRDP_MAX_SESSIONS` cannot accidentally share one
+/// desktop/uinput/FUSE mount across a huge client count.
+const MAX_SESSIONS_CAP: usize = 32;
+
 /// Runtime configuration gathered once at startup.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub listen: SocketAddr,
     pub require_nla: bool,
@@ -23,6 +28,20 @@ pub struct Config {
     pub password: String,
     pub password_generated: bool,
     pub clipboard: ClipboardMode,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("listen", &self.listen)
+            .field("require_nla", &self.require_nla)
+            .field("max_sessions", &self.max_sessions)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("password_generated", &self.password_generated)
+            .field("clipboard", &self.clipboard)
+            .finish()
+    }
 }
 
 impl Config {
@@ -55,6 +74,11 @@ fn parse_max_sessions() -> Result<usize> {
             if n == 0 {
                 anyhow::bail!("KMSRDP_MAX_SESSIONS must be >= 1");
             }
+            if n > MAX_SESSIONS_CAP {
+                anyhow::bail!(
+                    "KMSRDP_MAX_SESSIONS must be <= {MAX_SESSIONS_CAP} (sessions share one desktop, input device, and drive mount), got {n}"
+                );
+            }
             Ok(n)
         }
         Err(_) => Ok(1),
@@ -74,16 +98,19 @@ fn parse_bool_env(name: &str) -> Option<bool> {
 }
 
 fn parse_clipboard_mode() -> ClipboardMode {
-    match std::env::var("KMSRDP_CLIPBOARD")
-        .unwrap_or_else(|_| "bidirectional".to_string())
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    let raw = std::env::var("KMSRDP_CLIPBOARD").unwrap_or_else(|_| "bidirectional".to_string());
+    match raw.trim().to_ascii_lowercase().as_str() {
         "disabled" | "off" | "0" | "false" => ClipboardMode::Disabled,
         "host-to-client" | "read-only" | "readonly" => ClipboardMode::HostToClient,
         "client-to-host" => ClipboardMode::ClientToHost,
-        _ => ClipboardMode::Bidirectional,
+        "bidirectional" | "on" | "1" | "true" | "" => ClipboardMode::Bidirectional,
+        other => {
+            tracing::warn!(
+                "KMSRDP_CLIPBOARD={other:?} is not a recognized mode \
+                 (disabled, host-to-client, client-to-host, bidirectional); using bidirectional"
+            );
+            ClipboardMode::Bidirectional
+        }
     }
 }
 
@@ -123,6 +150,13 @@ fn load_credentials() -> Result<(String, String, bool)> {
     match std::env::var("KMSRDP_PASSWORD") {
         Ok(password) => Ok((username, password, false)),
         Err(_) => {
+            if let Some((path, password)) = read_password_file()? {
+                tracing::info!(
+                    path = %path.display(),
+                    "loaded RDP password from file (not from KMSRDP_PASSWORD)"
+                );
+                return Ok((username, password, false));
+            }
             use rand::RngExt as _;
             let generated: String = rand::rng()
                 .sample_iter(&rand::distr::Alphanumeric)
@@ -150,6 +184,46 @@ fn load_credentials() -> Result<(String, String, bool)> {
             Ok((username, generated, true))
         }
     }
+}
+
+/// Password file path: `KMSRDP_PASSWORD_FILE`, else systemd
+/// `$CREDENTIALS_DIRECTORY/kmsrdp.password` when that file exists.
+pub fn password_file_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("KMSRDP_PASSWORD_FILE") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    let dir = std::env::var("CREDENTIALS_DIRECTORY").ok()?;
+    let path = PathBuf::from(dir).join("kmsrdp.password");
+    path.is_file().then_some(path)
+}
+
+fn read_password_file() -> Result<Option<(PathBuf, String)>> {
+    let Some(path) = password_file_path() else {
+        return Ok(None);
+    };
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("read password file {}", path.display()))?;
+    let password = trim_password_file(&raw);
+    if password.is_empty() {
+        anyhow::bail!(
+            "password file {} is empty — set a password or unset KMSRDP_PASSWORD_FILE",
+            path.display()
+        );
+    }
+    Ok(Some((path, password)))
+}
+
+fn trim_password_file(raw: &str) -> String {
+    raw.trim_end_matches(['\n', '\r']).to_string()
+}
+
+pub fn password_file_has_content(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .is_some_and(|raw| !trim_password_file(&raw).is_empty())
 }
 
 fn persist_oneshot_password(password: &str) -> Result<PathBuf> {
@@ -183,12 +257,7 @@ fn stderr_is_tty() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
+    use crate::test_env::env_lock;
 
     #[test]
     fn listen_addr_defaults_to_loopback() {
@@ -268,6 +337,58 @@ mod tests {
         assert_eq!(parse_bool_env("KMSRDP_REQUIRE_NLA"), Some(false));
         unsafe {
             std::env::remove_var("KMSRDP_REQUIRE_NLA");
+        }
+    }
+
+    #[test]
+    fn max_sessions_rejects_above_cap() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("KMSRDP_MAX_SESSIONS", "33");
+        }
+        assert!(parse_max_sessions().is_err());
+        unsafe {
+            std::env::remove_var("KMSRDP_MAX_SESSIONS");
+        }
+    }
+
+    #[test]
+    fn config_debug_redacts_password() {
+        let cfg = Config {
+            listen: "127.0.0.1:3389".parse().unwrap(),
+            require_nla: true,
+            max_sessions: 1,
+            username: "admin".to_string(),
+            password: "super_secret_password".to_string(),
+            password_generated: false,
+            clipboard: ClipboardMode::Bidirectional,
+        };
+        let formatted = format!("{cfg:?}");
+        assert!(!formatted.contains("super_secret_password"));
+        assert!(formatted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn trim_password_file_strips_trailing_newlines_only() {
+        assert_eq!(trim_password_file("secret\n"), "secret");
+        assert_eq!(trim_password_file("secret\r\n"), "secret");
+        assert_eq!(trim_password_file(" leading space"), " leading space");
+    }
+
+    #[test]
+    fn password_file_path_prefers_explicit_env() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("KMSRDP_PASSWORD_FILE", "/tmp/kmsrdp-test-password");
+            std::env::set_var("CREDENTIALS_DIRECTORY", "/run/credentials/kmsrdp");
+        }
+        assert_eq!(
+            password_file_path().as_deref(),
+            Some(Path::new("/tmp/kmsrdp-test-password"))
+        );
+        unsafe {
+            std::env::remove_var("KMSRDP_PASSWORD_FILE");
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
         }
     }
 }

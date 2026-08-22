@@ -38,7 +38,9 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
   `KMSRDP_TLS_*`); configurable listen address (`KMSRDP_BIND`, default
   `127.0.0.1` / `KMSRDP_PORT`); NLA required by default
   (`KMSRDP_REQUIRE_NLA=0` to allow TLS-only Client Info auth); one
-  authenticated session by default (`KMSRDP_MAX_SESSIONS`); structured logs
+  authenticated session by default (`KMSRDP_MAX_SESSIONS`); password from
+  `KMSRDP_PASSWORD`, `KMSRDP_PASSWORD_FILE`, or systemd
+  `LoadCredential=kmsrdp.password`; structured logs
   via `tracing` (`KMSRDP_LOG` /
   `KMSRDP_LOG_FORMAT=json`); priority-aware writes so audio is not starved
   by graphics
@@ -98,8 +100,10 @@ or the macOS Windows App. The server listens on `127.0.0.1:3389` and requires
 NLA by default. Optional: `KMSRDP_BIND=0.0.0.0` to listen on all interfaces
 (trusted LAN/VPN only); `KMSRDP_PORT=3390`; `KMSRDP_REQUIRE_NLA=0` to allow
 clients that cannot do CredSSP; `KMSRDP_MAX_SESSIONS=2` to allow a second
-authenticated client (they still share one desktop and one input device);
-`KMSRDP_TLS_HOSTS=host,1.2.3.4`
+authenticated client (they still share one desktop, one input device, and
+one FUSE drive mount; max 32); `KMSRDP_PASSWORD_FILE=/path` (or systemd
+`LoadCredential=kmsrdp.password`) so the password is not in the process
+environment; `KMSRDP_TLS_HOSTS=host,1.2.3.4`
 for certificate SANs (applied when the cert is first created — delete the
 persisted files to regenerate); `KMSRDP_TLS_DIR` / `KMSRDP_TLS_CERT`+`KEY`
 to choose where the identity is stored; `KMSRDP_TLS_EPHEMERAL=1` to skip

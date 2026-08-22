@@ -100,6 +100,7 @@ fn load_or_create_identity(
 
     if cert_path.is_file() && key_path.is_file() {
         let identity = load_identity_files(&cert_path, &key_path)?;
+        warn_if_stale_identity(&identity.0, hostnames, &cert_path);
         tracing::info!(
             "kmsrdp: loaded TLS identity from {} and {}",
             cert_path.display(),
@@ -122,24 +123,17 @@ fn load_or_create_identity(
         rcgen::generate_simple_self_signed(hostnames.to_vec())
             .map_err(|e| TlsError::CertificateGeneration(e.to_string()))?;
 
-    if let Err(e) = persist_identity(
+    persist_identity(
         &cert_path,
         &key_path,
         &cert.pem(),
         &signing_key.serialize_pem(),
-    ) {
-        tracing::info!(
-            "kmsrdp: warning: could not persist TLS identity to {} / {} ({e}); continuing with in-memory cert",
-            cert_path.display(),
-            key_path.display()
-        );
-    } else {
-        tracing::info!(
-            "kmsrdp: persisted TLS identity to {} and {}",
-            cert_path.display(),
-            key_path.display()
-        )
-    }
+    )?;
+    tracing::info!(
+        "kmsrdp: persisted TLS identity to {} and {}",
+        cert_path.display(),
+        key_path.display()
+    );
 
     let public_key = signing_key.public_key_raw().to_vec();
     let cert_der: CertificateDer<'static> = cert.der().clone();
@@ -163,6 +157,80 @@ fn load_identity_files(
         .map_err(|e| TlsError::ParseCredSspPublicKey(e.to_string()))?;
 
     Ok((cert_der, key_der, key_pair.public_key_raw().to_vec()))
+}
+
+struct LoadedCertInfo {
+    not_after_unix: i64,
+    sans: Vec<String>,
+}
+
+fn cert_info(cert_der: &CertificateDer<'_>) -> Option<LoadedCertInfo> {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert_der.as_ref()).ok()?;
+    let not_after_unix = cert.validity().not_after.timestamp();
+    let mut sans = Vec::new();
+    if let Ok(Some(ext)) = cert.subject_alternative_name() {
+        for name in &ext.value.general_names {
+            match name {
+                x509_parser::extensions::GeneralName::DNSName(dns) => {
+                    sans.push((*dns).to_string());
+                }
+                x509_parser::extensions::GeneralName::IPAddress(bytes) => {
+                    if let Some(ip) = ip_from_san_bytes(bytes) {
+                        sans.push(ip);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(LoadedCertInfo {
+        not_after_unix,
+        sans,
+    })
+}
+
+fn ip_from_san_bytes(bytes: &[u8]) -> Option<String> {
+    match bytes.len() {
+        4 => {
+            let addr: [u8; 4] = bytes.try_into().ok()?;
+            Some(std::net::Ipv4Addr::from(addr).to_string())
+        }
+        16 => {
+            let addr: [u8; 16] = bytes.try_into().ok()?;
+            Some(std::net::Ipv6Addr::from(addr).to_string())
+        }
+        _ => None,
+    }
+}
+
+fn warn_if_stale_identity(cert_der: &CertificateDer<'_>, hosts: &[String], cert_path: &Path) {
+    let Some(info) = cert_info(cert_der) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if info.not_after_unix < now {
+        tracing::warn!(
+            path = %cert_path.display(),
+            "persisted TLS certificate has expired; delete it (and the matching key) to regenerate"
+        );
+    }
+    if info.sans.is_empty() {
+        return;
+    }
+    for host in hosts {
+        let covered = info.sans.iter().any(|san| san.eq_ignore_ascii_case(host));
+        if !covered {
+            tracing::warn!(
+                host,
+                path = %cert_path.display(),
+                "KMSRDP_TLS_HOSTS name is not in the persisted certificate SAN list; \
+                 delete the cert/key to regenerate"
+            );
+        }
+    }
 }
 
 fn persist_identity(
@@ -310,12 +378,7 @@ fn tls_hostnames() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
+    use crate::test_env::env_lock;
 
     #[test]
     fn persist_and_reload_keeps_same_public_key() {
@@ -336,6 +399,14 @@ mod tests {
         assert!(key_path.is_file());
         let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        let cert_der = CertificateDer::from_pem_slice(&fs::read(&cert_path).unwrap()).unwrap();
+        let info = cert_info(&cert_der).expect("parse generated cert");
+        assert!(
+            info.sans
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case("localhost"))
+        );
+        assert!(info.not_after_unix > 0);
 
         let (_, _, pk2) = load_or_create_identity(&hosts).expect("reload");
         assert_eq!(pk1, pk2);

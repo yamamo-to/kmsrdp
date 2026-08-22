@@ -141,14 +141,9 @@ fn mainloop_wait(mainloop: &mut Mainloop, waits: &mut u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::env_lock;
     use std::sync::mpsc;
-    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
 
     #[test]
     fn take_wait_budget_exhausts() {

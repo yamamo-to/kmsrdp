@@ -97,14 +97,23 @@ fn check_credentials(report: &mut StartupReport) {
                 password.len()
             ));
         }
-        Err(_) => {
-            report.warnings.push(
-                "KMSRDP_PASSWORD unset — a one-shot password will be written to a 0600 file \
-                 (printed to stderr only if it is a TTY)"
-                    .to_string(),
-            );
-        }
         Ok(_) => {}
+        Err(_) => match crate::config::password_file_path() {
+            Some(path) if crate::config::password_file_has_content(&path) => {}
+            Some(path) => report.errors.push(format!(
+                "password file {} is missing or empty — set a password there, \
+                 or unset KMSRDP_PASSWORD_FILE",
+                path.display()
+            )),
+            None => {
+                report.warnings.push(
+                    "KMSRDP_PASSWORD unset — a one-shot password will be written to a 0600 file \
+                     (printed to stderr only if it is a TTY). Prefer KMSRDP_PASSWORD_FILE or \
+                     systemd LoadCredential=kmsrdp.password so the secret is not in the environment"
+                        .to_string(),
+                );
+            }
+        },
     }
 }
 
@@ -304,12 +313,7 @@ fn capability_set(cap_eff: u64, cap: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
+    use crate::test_env::env_lock;
 
     #[test]
     fn capability_bit_sys_admin() {
@@ -330,6 +334,8 @@ mod tests {
             std::env::remove_var("KMSRDP_DISPLAY");
             std::env::remove_var("KMSRDP_TLS_CERT");
             std::env::remove_var("KMSRDP_TLS_KEY");
+            std::env::remove_var("KMSRDP_PASSWORD_FILE");
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
         }
         let report = validate(3389);
         assert!(
@@ -370,6 +376,8 @@ mod tests {
             std::env::remove_var("KMSRDP_DISPLAY");
             std::env::remove_var("KMSRDP_TLS_CERT");
             std::env::remove_var("KMSRDP_TLS_KEY");
+            std::env::remove_var("KMSRDP_PASSWORD_FILE");
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
         }
         let report = validate(3390);
         assert!(

@@ -15,6 +15,8 @@ pub mod rdpdr_fuse;
 pub mod rdpdr_path;
 pub mod session;
 pub mod session_watcher;
+#[cfg(test)]
+pub(crate) mod test_env;
 pub mod tls;
 pub mod uinput;
 pub mod x11_unicode;

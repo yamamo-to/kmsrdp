@@ -15,6 +15,8 @@ RestartSec=2
 # here rather than in this unit file - see kmsrdp-system.env.example in the
 # package docs.
 EnvironmentFile=-/etc/kmsrdp/kmsrdp.env
+# Optional: keep the RDP password out of the environment.
+# LoadCredential=kmsrdp.password:/etc/kmsrdp/rdp-password
 
 # Keep only the capabilities required for DRM capture, /dev/uinput, and
 # binding privileged listen ports (default 3389; see KMSRDP_PORT). Device

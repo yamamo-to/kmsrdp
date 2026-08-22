@@ -1406,6 +1406,7 @@ dependencies = [
  "tracing-subscriber",
  "uinput-sys",
  "x11rb 0.14.0",
+ "x509-parser",
  "zbus",
 ]
 

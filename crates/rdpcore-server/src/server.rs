@@ -313,11 +313,16 @@ impl RdpServer {
             if let Err(e) = tcp.set_nodelay(true) {
                 warn!(error = %e, "failed to set TCP_NODELAY");
             }
+            if server.auth_limiter.is_blocked(peer.ip()) {
+                warn!(%peer, "dropping connection: too many failed authentication attempts");
+                continue;
+            }
             // Acquired here, before spawning - not inside the connection
             // task - so a flood of TCP connections that never send a byte
             // backpressures accept() itself once MAX_CONCURRENT_HANDSHAKES
             // is in flight, instead of piling up unboundedly as spawned
-            // tasks and open fds all waiting on a permit.
+            // tasks and open fds all waiting on a permit. Locked-out
+            // addresses (above) never take a permit.
             let Ok(permit) = Arc::clone(&server.handshake_permits).acquire_owned().await else {
                 unreachable!("handshake_permits semaphore is never closed");
             };
@@ -531,7 +536,12 @@ impl Session {
                                 &credentials.password,
                                 &credentials.domain,
                             ),
-                            None => true,
+                            None => {
+                                warn!(
+                                    "rejecting Client Info auth: no credential validator configured"
+                                );
+                                false
+                            }
                         }
                     };
                     if !valid {
@@ -1609,6 +1619,7 @@ fn dispatch_input_event(input: &mut dyn RdpServerInputHandler, event: FastPathIn
 fn translate_mouse(pointer_flags: u16, x: u16, y: u16) -> MouseEvent {
     const WHEEL_NEGATIVE: u16 = 0x0100;
     const VERTICAL_WHEEL: u16 = 0x0200;
+    const HORIZONTAL_WHEEL: u16 = 0x0400;
     const LEFT_BUTTON: u16 = 0x1000;
     const RIGHT_BUTTON: u16 = 0x2000;
     const MIDDLE_BUTTON: u16 = 0x4000;
@@ -1622,6 +1633,15 @@ fn translate_mouse(pointer_flags: u16, x: u16, y: u16) -> MouseEvent {
             raw
         };
         return MouseEvent::VerticalScroll { value };
+    }
+    if pointer_flags & HORIZONTAL_WHEEL != 0 {
+        let raw = i32::from(pointer_flags & 0xFF);
+        let value = if pointer_flags & WHEEL_NEGATIVE != 0 {
+            raw - 256
+        } else {
+            raw
+        };
+        return MouseEvent::HorizontalScroll { value };
     }
     let down = pointer_flags & DOWN != 0;
     if pointer_flags & LEFT_BUTTON != 0 {
@@ -1723,5 +1743,17 @@ mod tests {
         assert_eq!(handler.lock().unwrap().reset_calls, 0);
         drop(guard);
         assert_eq!(handler.lock().unwrap().reset_calls, 1);
+    }
+
+    #[test]
+    fn translate_mouse_horizontal_wheel() {
+        match super::translate_mouse(0x0400 | 120, 0, 0) {
+            crate::input::MouseEvent::HorizontalScroll { value } => assert_eq!(value, 120),
+            other => panic!("expected HorizontalScroll, got {other:?}"),
+        }
+        match super::translate_mouse(0x0400 | 0x0100 | 1, 0, 0) {
+            crate::input::MouseEvent::HorizontalScroll { value } => assert_eq!(value, -255),
+            other => panic!("expected negative HorizontalScroll, got {other:?}"),
+        }
     }
 }
