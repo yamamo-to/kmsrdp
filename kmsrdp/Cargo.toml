@@ -45,6 +45,7 @@ libpulse-binding = "2.30.1"
 libpulse-simple-binding = "2.29.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "fmt"] }
+zeroize = { version = "1", features = ["derive"] }
 
 [features]
 default = ["gfx"]

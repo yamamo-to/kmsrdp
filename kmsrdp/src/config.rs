@@ -44,6 +44,13 @@ impl fmt::Debug for Config {
     }
 }
 
+impl Drop for Config {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.password.zeroize();
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let listen = listen_addr()?;

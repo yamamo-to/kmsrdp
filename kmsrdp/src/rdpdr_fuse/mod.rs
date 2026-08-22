@@ -347,10 +347,29 @@ fn ntstatus_to_errno(status: u32) -> Errno {
 }
 
 fn primary_gid(uid: u32) -> u32 {
-    // SAFETY: getpwuid returns a static buffer; we only read pw_gid.
-    unsafe {
-        let pw = libc::getpwuid(uid);
-        if pw.is_null() { uid } else { (*pw).pw_gid }
+    let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+    let mut buf = vec![0; 1024];
+    loop {
+        // SAFETY: pwd, buf, and result point to valid local memory.
+        let ret = unsafe {
+            libc::getpwuid_r(
+                uid,
+                pwd.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if ret == libc::ERANGE && buf.len() <= 65536 {
+            buf.resize(buf.len() * 2, 0);
+        } else if ret == 0 && !result.is_null() {
+            // SAFETY: getpwuid_r succeeded and initialized pwd.
+            let pwd = unsafe { pwd.assume_init() };
+            return pwd.pw_gid;
+        } else {
+            return uid;
+        }
     }
 }
 

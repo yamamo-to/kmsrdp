@@ -114,6 +114,9 @@ pub fn reassemble(
     let (_total_length, flags, chunk) = dechunkify(payload)?;
     if flags & CHANNEL_FLAG_FIRST != 0 {
         buffer.clear();
+    } else if buffer.is_empty() {
+        // Missing the first chunk of a fragmented message - drop orphan continuation
+        return Ok(None);
     }
     if buffer.len().saturating_add(chunk.len()) > max_size {
         buffer.clear();

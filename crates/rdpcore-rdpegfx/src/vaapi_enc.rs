@@ -163,18 +163,40 @@ fn upload_nv12(
     let dest = image.as_mut();
     let w = width as usize;
     let h = height as usize;
+    let y_offset = va_image.offsets[0] as usize;
+    let y_pitch = va_image.pitches[0] as usize;
+    let uv_offset = va_image.offsets[1] as usize;
+    let uv_pitch = va_image.pitches[1] as usize;
+
+    let y_needed = y_offset.saturating_add(h.saturating_mul(y_pitch));
+    let uv_needed = uv_offset.saturating_add((h / 2).saturating_mul(uv_pitch));
+    let nv12_needed = w.saturating_mul(h).saturating_add((h / 2).saturating_mul(w));
+
+    if y_pitch < w
+        || uv_pitch < w
+        || dest.len() < y_needed
+        || dest.len() < uv_needed
+        || nv12.len() < nv12_needed
+    {
+        return Err(format!(
+            "VAAPI image geometry mismatch: dest len {}, needed Y {y_needed}/UV {uv_needed}, nv12 len {}, needed {nv12_needed}",
+            dest.len(),
+            nv12.len()
+        ));
+    }
+
     let mut src = nv12;
-    let mut dst = &mut dest[va_image.offsets[0] as usize..];
+    let mut dst = &mut dest[y_offset..];
     for _ in 0..h {
         dst[..w].copy_from_slice(&src[..w]);
-        dst = &mut dst[va_image.pitches[0] as usize..];
+        dst = &mut dst[y_pitch..];
         src = &src[w..];
     }
     let mut src = &nv12[w * h..];
-    let mut dst = &mut dest[va_image.offsets[1] as usize..];
+    let mut dst = &mut dest[uv_offset..];
     for _ in 0..(h / 2) {
         dst[..w].copy_from_slice(&src[..w]);
-        dst = &mut dst[va_image.pitches[1] as usize..];
+        dst = &mut dst[uv_pitch..];
         src = &src[w..];
     }
     drop(image);

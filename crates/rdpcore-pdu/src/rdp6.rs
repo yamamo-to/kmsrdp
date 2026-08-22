@@ -19,6 +19,8 @@ use crate::cursor::ReadCursor;
 
 pub const FORMAT_HEADER_RLE_NO_ALPHA_ARGB: u8 = 0x30;
 
+const MAX_STACK_PIXELS: usize = 4096;
+
 /// Encodes one BGRX32 tile (4 bytes/pixel, X ignored) into an RDP6 Planar
 /// bitmap stream: `[FormatHeader][R-plane][G-plane][B-plane]`. `bgrx` must
 /// already be in the same row order the caller intends the decoder to
@@ -27,27 +29,45 @@ pub const FORMAT_HEADER_RLE_NO_ALPHA_ARGB: u8 = 0x30;
 /// for, see `rdpcore_server::encode_bitmap_update`).
 pub fn encode(bgrx: &[u8], width: usize, height: usize) -> Vec<u8> {
     let pixel_count = width * height;
-    let mut r = vec![0u8; pixel_count];
-    let mut g = vec![0u8; pixel_count];
-    let mut b = vec![0u8; pixel_count];
-    // Slice-per-pixel via chunks_exact instead of manually indexing
-    // bgrx[i*4 + k] - lets the compiler prove each 4-byte chunk is in
-    // bounds once instead of bounds-checking three separate `i*4+k`
-    // computations per pixel, and vectorizes better.
-    for (px, ((r_i, g_i), b_i)) in bgrx
-        .chunks_exact(4)
-        .zip(r.iter_mut().zip(g.iter_mut()).zip(b.iter_mut()))
-    {
-        *b_i = px[0];
-        *g_i = px[1];
-        *r_i = px[2];
-    }
-
     let mut out = Vec::with_capacity(1 + pixel_count * 3 / 2);
     out.push(FORMAT_HEADER_RLE_NO_ALPHA_ARGB);
-    encode_plane(&r, width, height, &mut out);
-    encode_plane(&g, width, height, &mut out);
-    encode_plane(&b, width, height, &mut out);
+
+    if pixel_count <= MAX_STACK_PIXELS {
+        let mut r = [0u8; MAX_STACK_PIXELS];
+        let mut g = [0u8; MAX_STACK_PIXELS];
+        let mut b = [0u8; MAX_STACK_PIXELS];
+        for (px, ((r_i, g_i), b_i)) in bgrx
+            .chunks_exact(4)
+            .zip(
+                r[..pixel_count]
+                    .iter_mut()
+                    .zip(g[..pixel_count].iter_mut())
+                    .zip(b[..pixel_count].iter_mut()),
+            )
+        {
+            *b_i = px[0];
+            *g_i = px[1];
+            *r_i = px[2];
+        }
+        encode_plane_stack(&r[..pixel_count], width, height, &mut out);
+        encode_plane_stack(&g[..pixel_count], width, height, &mut out);
+        encode_plane_stack(&b[..pixel_count], width, height, &mut out);
+    } else {
+        let mut r = vec![0u8; pixel_count];
+        let mut g = vec![0u8; pixel_count];
+        let mut b = vec![0u8; pixel_count];
+        for (px, ((r_i, g_i), b_i)) in bgrx
+            .chunks_exact(4)
+            .zip(r.iter_mut().zip(g.iter_mut()).zip(b.iter_mut()))
+        {
+            *b_i = px[0];
+            *g_i = px[1];
+            *r_i = px[2];
+        }
+        encode_plane_heap(&r, width, height, &mut out);
+        encode_plane_heap(&g, width, height, &mut out);
+        encode_plane_heap(&b, width, height, &mut out);
+    }
     out
 }
 
@@ -98,7 +118,22 @@ fn zigzag_decode(encoded: u8) -> u8 {
     }
 }
 
-fn encode_plane(plane: &[u8], width: usize, height: usize, out: &mut Vec<u8>) {
+fn encode_plane_stack(plane: &[u8], width: usize, height: usize, out: &mut Vec<u8>) {
+    let mut delta = [0u8; MAX_STACK_PIXELS];
+    delta[..width].copy_from_slice(&plane[..width]); // row 0: literal, unfiltered
+    for row in 1..height {
+        for col in 0..width {
+            let idx = row * width + col;
+            let above = plane[idx - width];
+            delta[idx] = zigzag_encode(plane[idx].wrapping_sub(above));
+        }
+    }
+    for row in 0..height {
+        encode_scanline_rle(&delta[row * width..(row + 1) * width], out);
+    }
+}
+
+fn encode_plane_heap(plane: &[u8], width: usize, height: usize, out: &mut Vec<u8>) {
     let mut delta = vec![0u8; width * height];
     delta[..width].copy_from_slice(&plane[..width]); // row 0: literal, unfiltered
     for row in 1..height {

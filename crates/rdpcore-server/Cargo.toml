@@ -22,6 +22,7 @@ subtle = "2.6.1"
 tokio = { version = "1.52.3", features = ["rt", "net", "io-util", "macros", "sync", "time"] }
 tokio-rustls = "0.26"
 tracing = "0.1.44"
+zeroize = { version = "1", features = ["derive"] }
 
 [features]
 default = []

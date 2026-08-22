@@ -896,44 +896,7 @@ impl Session {
 
         loop {
             tokio::select! {
-                _ = &mut bitmap_gate, if !bitmap_gate_open => {
-                    bitmap_gate_open = true;
-                    if display_updates_allowed
-                        && let Some(bitmap) = deferred_bitmap.take()
-                    {
-                        let full = updates.latest_full_frame();
-                        #[cfg(feature = "gfx")]
-                        let gfx_attempt = Some(
-                            match try_encode_gfx_frame(
-                                gfx_session.as_ref(),
-                                &mut last_gfx_data,
-                                full.as_ref(),
-                                &bitmap,
-                            )
-                            .await
-                            {
-                                Ok(outcome) => {
-                                    apply_gfx_encode_outcome(outcome, dvc.as_ref(), &frame_sender)
-                                }
-                                Err(()) => Err(()),
-                            },
-                        );
-                        if send_outbound_frame(
-                            &bitmap,
-                            &frame_sender,
-                            &bitmap_policy,
-                            &mut frame_id,
-                            full.as_ref(),
-                            #[cfg(feature = "gfx")]
-                            gfx_attempt,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            return Ok(());
-                        }
-                    }
-                }
+                biased;
                 frame = read_steady_state_frame(&mut read_half) => {
                     match frame {
                         Err(e) => return Err(e.into()),
@@ -1074,6 +1037,44 @@ impl Session {
                             {
                                 debug!("dropping malformed slow-path frame: {e}");
                             }
+                        }
+                    }
+                }
+                _ = &mut bitmap_gate, if !bitmap_gate_open => {
+                    bitmap_gate_open = true;
+                    if display_updates_allowed
+                        && let Some(bitmap) = deferred_bitmap.take()
+                    {
+                        let full = updates.latest_full_frame();
+                        #[cfg(feature = "gfx")]
+                        let gfx_attempt = Some(
+                            match try_encode_gfx_frame(
+                                gfx_session.as_ref(),
+                                &mut last_gfx_data,
+                                full.as_ref(),
+                                &bitmap,
+                            )
+                            .await
+                            {
+                                Ok(outcome) => {
+                                    apply_gfx_encode_outcome(outcome, dvc.as_ref(), &frame_sender)
+                                }
+                                Err(()) => Err(()),
+                            },
+                        );
+                        if send_outbound_frame(
+                            &bitmap,
+                            &frame_sender,
+                            &bitmap_policy,
+                            &mut frame_id,
+                            full.as_ref(),
+                            #[cfg(feature = "gfx")]
+                            gfx_attempt,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return Ok(());
                         }
                     }
                 }

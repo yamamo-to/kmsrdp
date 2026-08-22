@@ -1408,6 +1408,7 @@ dependencies = [
  "x11rb 0.14.0",
  "x509-parser",
  "zbus",
+ "zeroize",
 ]
 
 [[package]]
@@ -2361,6 +2362,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

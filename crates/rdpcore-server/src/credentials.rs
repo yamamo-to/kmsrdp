@@ -5,7 +5,7 @@
 
 use subtle::ConstantTimeEq as _;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct Credentials {
     pub username: String,
     pub password: String,

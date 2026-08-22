@@ -387,7 +387,15 @@ fn worker() -> &'static std::sync::mpsc::Sender<std::sync::mpsc::Sender<GrabRepl
                     }
                 }
                 let result = match &capturer {
-                    Some(c) => c.grab(),
+                    Some(c) => match c.grab() {
+                        Ok(frame) => Ok(frame),
+                        Err(e) => {
+                            tracing::warn!("kmsrdp: NvFBC grab failed ({e}); resetting session for retry");
+                            capturer = None;
+                            retry_after = Some(Instant::now() + INIT_RETRY_BACKOFF);
+                            Err(e)
+                        }
+                    },
                     None => Err(io::Error::other(
                         "NvFBC init failed previously; retry backoff active",
                     )),

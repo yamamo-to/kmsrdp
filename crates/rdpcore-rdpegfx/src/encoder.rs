@@ -32,7 +32,7 @@ pub fn align16(v: u16) -> u16 {
     v.saturating_add(15) & !15
 }
 
-fn check_bgrx_geometry(
+pub(crate) fn check_bgrx_geometry(
     width: u16,
     height: u16,
     stride: usize,

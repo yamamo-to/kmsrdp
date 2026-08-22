@@ -128,11 +128,13 @@ gl_fns! {
 
 type EglInstance = egl::DynamicInstance<egl::EGL1_5>;
 type EglImageTargetTexture2dOes = unsafe extern "system" fn(u32, *mut c_void);
+type GbmDeviceDestroy = unsafe extern "C" fn(*mut c_void);
 
 struct GpuDetiler {
     _gles_lib: Library,
     _gbm_lib: Library,
     _gbm_device: *mut c_void,
+    _gbm_device_destroy: Option<GbmDeviceDestroy>,
     // gbm_create_device() does not dup its fd - it must stay open for the
     // device's whole lifetime, so it lives here rather than being dropped
     // once the device is created.
@@ -290,6 +292,8 @@ impl GpuDetiler {
             .or_else(|_| unsafe { Library::new("libgbm.so") })
             .map_err(|e| io::Error::other(format!("failed to load libgbm: {e}")))?;
         let gbm_device = unsafe { gbm_create_device(&gbm_lib, render_fd.as_raw_fd()) }?;
+        let gbm_device_destroy: Option<GbmDeviceDestroy> =
+            unsafe { gbm_lib.get(b"gbm_device_destroy\0") }.ok().map(|s| *s);
 
         let egl: EglInstance = unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required() }
             .map_err(|e| io::Error::other(format!("failed to load libEGL: {e}")))?;
@@ -395,6 +399,7 @@ impl GpuDetiler {
             _gles_lib: gles_lib,
             _gbm_lib: gbm_lib,
             _gbm_device: gbm_device,
+            _gbm_device_destroy: gbm_device_destroy,
             _render_fd: render_fd,
             egl,
             display,
@@ -585,27 +590,33 @@ impl GpuDetiler {
 
 impl Drop for GpuDetiler {
     fn drop(&mut self) {
-        let _ = self.ensure_current();
-        let gl = &self.gl;
-        unsafe {
-            if self.external_tex != 0 {
-                (gl.delete_textures)(1, &self.external_tex);
-            }
-            if self.color_tex != 0 {
-                (gl.delete_textures)(1, &self.color_tex);
-            }
-            if self.fbo != 0 {
-                (gl.delete_framebuffers)(1, &self.fbo);
-            }
-            if self.quad_vbo != 0 {
-                (gl.delete_buffers)(1, &self.quad_vbo);
-            }
-            if self.program != 0 {
-                (gl.delete_program)(self.program);
+        if self.ensure_current().is_ok() {
+            let gl = &self.gl;
+            unsafe {
+                if self.external_tex != 0 {
+                    (gl.delete_textures)(1, &self.external_tex);
+                }
+                if self.color_tex != 0 {
+                    (gl.delete_textures)(1, &self.color_tex);
+                }
+                if self.fbo != 0 {
+                    (gl.delete_framebuffers)(1, &self.fbo);
+                }
+                if self.quad_vbo != 0 {
+                    (gl.delete_buffers)(1, &self.quad_vbo);
+                }
+                if self.program != 0 {
+                    (gl.delete_program)(self.program);
+                }
             }
         }
         let _ = self.egl.destroy_context(self.display, self.context);
         let _ = self.egl.terminate(self.display);
+        if let Some(destroy) = self._gbm_device_destroy
+            && !self._gbm_device.is_null()
+        {
+            unsafe { destroy(self._gbm_device) };
+        }
     }
 }
 
