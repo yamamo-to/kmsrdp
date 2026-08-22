@@ -131,23 +131,49 @@ impl VirtualInput {
     }
 
     fn emit(&self, events: &[(i32, i32, i32)]) -> io::Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
         let fd = self.file.as_raw_fd();
-        for &(kind, code, value) in events {
-            // SAFETY: input_event is a C struct safely zero-initializable for input events.
-            let ev = sys::input_event {
-                time: unsafe { mem::zeroed() },
-                kind: kind as u16,
-                code: code as u16,
-                value,
-            };
-            // SAFETY: ev is a valid local input_event struct.
-            let bytes = unsafe { as_byte_slice(&ev) };
-            // SAFETY: fd is valid and bytes points to valid memory.
+        let mut stack_buf = [sys::input_event {
+            time: unsafe { mem::zeroed() },
+            kind: 0,
+            code: 0,
+            value: 0,
+        }; 8];
+
+        let (buf_ptr, total_bytes) = if events.len() <= stack_buf.len() {
+            for (i, &(kind, code, value)) in events.iter().enumerate() {
+                stack_buf[i].kind = kind as u16;
+                stack_buf[i].code = code as u16;
+                stack_buf[i].value = value;
+            }
+            (
+                stack_buf.as_ptr() as *const libc::c_void,
+                events.len() * mem::size_of::<sys::input_event>(),
+            )
+        } else {
+            let heap_buf: Vec<sys::input_event> = events
+                .iter()
+                .map(|&(kind, code, value)| sys::input_event {
+                    time: unsafe { mem::zeroed() },
+                    kind: kind as u16,
+                    code: code as u16,
+                    value,
+                })
+                .collect();
+            let total_bytes = heap_buf.len() * mem::size_of::<sys::input_event>();
             let written =
-                unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
-            if written != bytes.len() as isize {
+                unsafe { libc::write(fd, heap_buf.as_ptr() as *const libc::c_void, total_bytes) };
+            if written != total_bytes as isize {
                 return Err(io::Error::last_os_error());
             }
+            return Ok(());
+        };
+
+        let written = unsafe { libc::write(fd, buf_ptr, total_bytes) };
+        if written != total_bytes as isize {
+            return Err(io::Error::last_os_error());
         }
         Ok(())
     }
@@ -191,9 +217,18 @@ impl VirtualInput {
     }
 
     /// Vertical wheel: positive scrolls up, negative scrolls down.
+    /// `delta` is typically +/- 120 per notch in RDP, or raw step count.
     pub fn scroll(&self, delta: i32) -> io::Result<()> {
+        if delta == 0 {
+            return Ok(());
+        }
+        let steps = if delta.abs() >= 120 {
+            delta / 120
+        } else {
+            delta.signum()
+        };
         self.emit(&[
-            (sys::EV_REL, sys::REL_WHEEL, delta.signum()),
+            (sys::EV_REL, sys::REL_WHEEL, steps),
             (sys::EV_SYN, sys::SYN_REPORT, 0),
         ])
     }

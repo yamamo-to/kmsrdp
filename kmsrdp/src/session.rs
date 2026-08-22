@@ -62,12 +62,25 @@ pub fn find_xauthority(username: &str, xdg_runtime_dir: &Path, leader_pid: u32) 
         return Some(path);
     }
 
-    let xauth = if username == "root" {
-        PathBuf::from("/root/.Xauthority")
-    } else {
-        PathBuf::from(format!("/home/{username}/.Xauthority"))
-    };
-    xauth.exists().then_some(xauth)
+    if let Ok(home) = std::env::var("HOME") {
+        let xauth = PathBuf::from(home).join(".Xauthority");
+        if xauth.exists() {
+            return Some(xauth);
+        }
+    }
+
+    let candidates = [
+        format!("/home/{username}/.Xauthority"),
+        format!("/var/home/{username}/.Xauthority"),
+        "/root/.Xauthority".to_string(),
+    ];
+    for cand in candidates {
+        let p = PathBuf::from(cand);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Returns true when `display` looks like `:N` and `/tmp/.X11-unix/XN` exists.

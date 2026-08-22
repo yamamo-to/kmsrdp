@@ -85,6 +85,7 @@ impl DisplayHub {
         let mut previous: Option<PrevFrame> = None;
         let mut negotiated_size = *self.size.lock().unwrap();
         let mut consecutive_failures: u32 = 0;
+        let interval = frame_interval();
         loop {
             let task = tokio::task::spawn_blocking(move || {
                 let result = capturer.capture();
@@ -101,7 +102,7 @@ impl DisplayHub {
                     match tokio::task::spawn_blocking(capture::Capturer::new).await {
                         Ok(Ok(replacement)) => {
                             capturer = replacement;
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            tokio::time::sleep(interval).await;
                             continue;
                         }
                         Ok(Err(open_err)) => {
@@ -260,10 +261,26 @@ impl DisplayHub {
                         )
                     }
                 }
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            tokio::time::sleep(interval).await;
         }
     }
+}
+
+fn frame_interval() -> Duration {
+    if let Ok(fps_str) = std::env::var("KMSRDP_FPS")
+        && let Ok(fps) = fps_str.trim().parse::<u32>()
+    {
+        let clamped = fps.clamp(1, 120);
+        return Duration::from_millis((1000 / clamped).max(1) as u64);
+    }
+    if let Ok(ms_str) = std::env::var("KMSRDP_FRAME_INTERVAL_MS")
+        && let Ok(ms) = ms_str.trim().parse::<u64>()
+    {
+        let clamped = ms.clamp(8, 1000);
+        return Duration::from_millis(clamped);
+    }
+    Duration::from_millis(50)
 }
 
 /// Log the 1st failure, then every 20th, so a dead CRTC is obvious without
@@ -397,5 +414,13 @@ mod tests {
     #[test]
     fn empty_dirty_frames_stay_empty() {
         assert!(coalesce_dirty_rects(Vec::new(), 1920, 1080).is_empty());
+    }
+
+    #[test]
+    fn default_frame_interval_is_fifty_millis() {
+        assert_eq!(
+            super::frame_interval(),
+            std::time::Duration::from_millis(50)
+        );
     }
 }

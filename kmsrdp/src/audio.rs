@@ -120,8 +120,6 @@ fn run_capture(publisher: WavePublisher, stop: Arc<AtomicBool>) {
         return;
     }
 
-    hint_low_latency_audio();
-
     let attr = capture_buffer_attr();
     let simple = match psimple::Simple::new(
         None,

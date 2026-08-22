@@ -95,6 +95,7 @@ gl_fns! {
     tex_image_2d: "glTexImage2D" => fn(u32, i32, i32, i32, i32, i32, u32, u32, *const c_void);
     active_texture: "glActiveTexture" => fn(u32);
     gen_framebuffers: "glGenFramebuffers" => fn(i32, *mut u32);
+    delete_framebuffers: "glDeleteFramebuffers" => fn(i32, *const u32);
     bind_framebuffer: "glBindFramebuffer" => fn(u32, u32);
     framebuffer_texture_2d: "glFramebufferTexture2D" => fn(u32, u32, u32, u32, i32);
     check_framebuffer_status: "glCheckFramebufferStatus" => fn(u32) -> u32;
@@ -115,6 +116,7 @@ gl_fns! {
     delete_program: "glDeleteProgram" => fn(u32);
     use_program: "glUseProgram" => fn(u32);
     gen_buffers: "glGenBuffers" => fn(i32, *mut u32);
+    delete_buffers: "glDeleteBuffers" => fn(i32, *const u32);
     bind_buffer: "glBindBuffer" => fn(u32, u32);
     buffer_data: "glBufferData" => fn(u32, isize, *const c_void, u32);
     vertex_attrib_pointer: "glVertexAttribPointer" => fn(u32, i32, u32, u8, i32, *const c_void);
@@ -122,7 +124,6 @@ gl_fns! {
     get_attrib_location: "glGetAttribLocation" => fn(u32, *const i8) -> i32;
     draw_arrays: "glDrawArrays" => fn(u32, i32, i32);
     read_pixels: "glReadPixels" => fn(i32, i32, i32, i32, u32, u32, *mut c_void);
-    finish: "glFinish" => fn();
 }
 
 type EglInstance = egl::DynamicInstance<egl::EGL1_5>;
@@ -143,6 +144,9 @@ struct GpuDetiler {
     image_target_texture_2d_oes: EglImageTargetTexture2dOes,
     program: u32,
     quad_vbo: u32,
+    pos_loc: i32,
+    tex_loc: i32,
+    external_tex: u32,
     fbo: u32,
     color_tex: u32,
     width: u32,
@@ -347,6 +351,19 @@ impl GpuDetiler {
             (gl.delete_shader)(fs);
         }
 
+        let pos_loc = unsafe { (gl.get_attrib_location)(program, c"in_position".as_ptr()) };
+        let tex_loc = unsafe { (gl.get_attrib_location)(program, c"in_texcoord".as_ptr()) };
+
+        let mut external_tex = 0u32;
+        unsafe {
+            (gl.gen_textures)(1, &mut external_tex);
+            (gl.active_texture)(GL_TEXTURE0);
+            (gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, external_tex);
+            (gl.tex_parameteri)(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            (gl.tex_parameteri)(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            (gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, 0);
+        }
+
         // Full-screen triangle strip covering NDC, texture V flipped since
         // the external OES image's (0,0) is the top-left texel (matching
         // the DRM framebuffer's memory layout) while our NDC Y grows
@@ -386,6 +403,9 @@ impl GpuDetiler {
             image_target_texture_2d_oes,
             program,
             quad_vbo,
+            pos_loc,
+            tex_loc,
+            external_tex,
             fbo,
             color_tex: 0,
             width: 0,
@@ -492,13 +512,9 @@ impl GpuDetiler {
 
     fn draw_and_read(&self, image: egl::Image) -> io::Result<Vec<u8>> {
         let gl = &self.gl;
-        let mut texture = 0u32;
         unsafe {
-            (gl.gen_textures)(1, &mut texture);
             (gl.active_texture)(GL_TEXTURE0);
-            (gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, texture);
-            (gl.tex_parameteri)(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            (gl.tex_parameteri)(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            (gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, self.external_tex);
             (self.image_target_texture_2d_oes)(GL_TEXTURE_EXTERNAL_OES, image.as_ptr());
 
             (gl.bind_framebuffer)(GL_FRAMEBUFFER, self.fbo);
@@ -511,7 +527,8 @@ impl GpuDetiler {
             );
             let status = (gl.check_framebuffer_status)(GL_FRAMEBUFFER);
             if status != GL_FRAMEBUFFER_COMPLETE {
-                (gl.delete_textures)(1, &texture);
+                (gl.bind_framebuffer)(GL_FRAMEBUFFER, 0);
+                (gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, 0);
                 return Err(io::Error::other(format!("FBO incomplete: {status:#x}")));
             }
 
@@ -521,27 +538,25 @@ impl GpuDetiler {
 
             (gl.use_program)(self.program);
             (gl.bind_buffer)(GL_ARRAY_BUFFER, self.quad_vbo);
-            let pos_loc = (gl.get_attrib_location)(self.program, c"in_position".as_ptr());
-            let tex_loc = (gl.get_attrib_location)(self.program, c"in_texcoord".as_ptr());
             let stride = 4 * std::mem::size_of::<f32>() as i32;
             (gl.vertex_attrib_pointer)(
-                pos_loc as u32,
+                self.pos_loc as u32,
                 2,
                 GL_FLOAT,
                 GL_FALSE as u8,
                 stride,
                 std::ptr::null(),
             );
-            (gl.enable_vertex_attrib_array)(pos_loc as u32);
+            (gl.enable_vertex_attrib_array)(self.pos_loc as u32);
             (gl.vertex_attrib_pointer)(
-                tex_loc as u32,
+                self.tex_loc as u32,
                 2,
                 GL_FLOAT,
                 GL_FALSE as u8,
                 stride,
                 (2 * std::mem::size_of::<f32>()) as *const c_void,
             );
-            (gl.enable_vertex_attrib_array)(tex_loc as u32);
+            (gl.enable_vertex_attrib_array)(self.tex_loc as u32);
 
             (gl.draw_arrays)(GL_TRIANGLE_STRIP, 0, 4);
 
@@ -555,18 +570,42 @@ impl GpuDetiler {
                 GL_UNSIGNED_BYTE,
                 out.as_mut_ptr() as *mut c_void,
             );
-            (gl.finish)();
 
             let err = (gl.get_error)();
             (gl.bind_framebuffer)(GL_FRAMEBUFFER, 0);
             (gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, 0);
-            (gl.delete_textures)(1, &texture);
 
             if err != 0 {
                 return Err(io::Error::other(format!("GL error {err:#x} during detile")));
             }
             Ok(out)
         }
+    }
+}
+
+impl Drop for GpuDetiler {
+    fn drop(&mut self) {
+        let _ = self.ensure_current();
+        let gl = &self.gl;
+        unsafe {
+            if self.external_tex != 0 {
+                (gl.delete_textures)(1, &self.external_tex);
+            }
+            if self.color_tex != 0 {
+                (gl.delete_textures)(1, &self.color_tex);
+            }
+            if self.fbo != 0 {
+                (gl.delete_framebuffers)(1, &self.fbo);
+            }
+            if self.quad_vbo != 0 {
+                (gl.delete_buffers)(1, &self.quad_vbo);
+            }
+            if self.program != 0 {
+                (gl.delete_program)(self.program);
+            }
+        }
+        let _ = self.egl.destroy_context(self.display, self.context);
+        let _ = self.egl.terminate(self.display);
     }
 }
 

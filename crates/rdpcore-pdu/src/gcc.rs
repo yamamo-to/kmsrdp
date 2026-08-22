@@ -80,7 +80,13 @@ fn for_each_user_data_block<'a>(
     let mut cursor = ReadCursor::new(input);
     while cursor.remaining() >= 4 {
         let header = UserDataHeader::decode(&mut cursor)?;
-        let body_len = usize::from(header.length).saturating_sub(4);
+        if header.length < 4 {
+            return Err(DecodeError::InvalidValue {
+                field: "gcc.userData.length",
+                reason: "block length must be at least 4",
+            });
+        }
+        let body_len = usize::from(header.length) - 4;
         let body = cursor.read_slice(body_len)?;
         f(header.kind, body)?;
     }

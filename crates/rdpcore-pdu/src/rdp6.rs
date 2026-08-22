@@ -154,8 +154,41 @@ fn decode_plane(
 // scanline.
 // ---------------------------------------------------------------------
 
+struct LiteralBuf {
+    buf: [u8; 15],
+    len: usize,
+}
+
+impl LiteralBuf {
+    #[inline]
+    const fn new() -> Self {
+        Self {
+            buf: [0u8; 15],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, byte: u8, out: &mut Vec<u8>) {
+        self.buf[self.len] = byte;
+        self.len += 1;
+        if self.len == 15 {
+            self.flush(out);
+        }
+    }
+
+    #[inline]
+    fn flush(&mut self, out: &mut Vec<u8>) {
+        if self.len > 0 {
+            out.push((self.len as u8) << 4); // run_field = 0
+            out.extend_from_slice(&self.buf[..self.len]);
+            self.len = 0;
+        }
+    }
+}
+
 fn encode_scanline_rle(scanline: &[u8], out: &mut Vec<u8>) {
-    let mut pending: Vec<u8> = Vec::with_capacity(15);
+    let mut pending = LiteralBuf::new();
     let mut i = 0;
     while i < scanline.len() {
         let byte = scanline[i];
@@ -165,27 +198,15 @@ fn encode_scanline_rle(scanline: &[u8], out: &mut Vec<u8>) {
         }
         if count < 4 {
             for _ in 0..count {
-                pending.push(byte);
-                if pending.len() == 15 {
-                    flush_literals(&mut pending, out);
-                }
+                pending.push(byte, out);
             }
         } else {
-            flush_literals(&mut pending, out);
+            pending.flush(out);
             emit_run(byte, count, out);
         }
         i += count;
     }
-    flush_literals(&mut pending, out);
-}
-
-fn flush_literals(pending: &mut Vec<u8>, out: &mut Vec<u8>) {
-    if pending.is_empty() {
-        return;
-    }
-    out.push((pending.len() as u8) << 4); // run_field = 0
-    out.extend_from_slice(pending);
-    pending.clear();
+    pending.flush(out);
 }
 
 /// `count` is always >= 4 here (smaller runs are handled as plain

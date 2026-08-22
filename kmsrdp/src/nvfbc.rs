@@ -313,13 +313,17 @@ impl NvfbcCapturer {
             "NvFBCToSysGrabFrame",
         )?;
 
-        // SAFETY: NvFBC wrote a fresh buffer pointer through `buffer_ptr`
+        let ptr = *self.buffer_ptr as *const u8;
+        if ptr.is_null() || info.dw_byte_size == 0 {
+            return Err(io::Error::other(
+                "NvFBC returned null buffer pointer or zero size",
+            ));
+        }
+
+        // SAFETY: NvFBC wrote a fresh non-null buffer pointer through `buffer_ptr`
         // during setup/grab, valid for `info.dw_byte_size` bytes until the
         // next grab call.
-        let data = unsafe {
-            std::slice::from_raw_parts((*self.buffer_ptr) as *const u8, info.dw_byte_size as usize)
-        }
-        .to_vec();
+        let data = unsafe { std::slice::from_raw_parts(ptr, info.dw_byte_size as usize) }.to_vec();
 
         Ok((info.dw_width, info.dw_height, data))
     }

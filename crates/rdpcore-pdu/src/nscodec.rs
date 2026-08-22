@@ -12,27 +12,31 @@ pub fn encode(
     stride: usize,
     color_loss_level: u8,
 ) -> Vec<u8> {
-    debug_assert!((1..=7).contains(&color_loss_level));
+    let color_loss_level = color_loss_level.clamp(1, 7);
 
     let w = usize::from(width);
     let h = usize::from(height);
-    // Every caller today passes server-owned framebuffer geometry, so this
-    // can't be hit in practice - but width/height/stride aren't validated
-    // against data.len() anywhere else either, and the row loop below
-    // indexes `data` directly. Catch a mismatch here instead of an
-    // out-of-bounds panic in the loop.
-    debug_assert!(
-        h == 0 || w == 0 || (h - 1) * stride + w * 4 <= data.len(),
-        "nscodec::encode: {width}x{height} @ stride {stride} exceeds data.len()={}",
-        data.len()
-    );
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+
+    let required_len = match (h - 1).checked_mul(stride).and_then(|row_offset| {
+        w.checked_mul(4)
+            .and_then(|row_bytes| row_offset.checked_add(row_bytes))
+    }) {
+        Some(len) => len,
+        None => return Vec::new(),
+    };
+    if data.len() < required_len {
+        return Vec::new();
+    }
+
     let pixels = w * h;
     let cll = i32::from(color_loss_level);
 
     let mut y_plane = Vec::with_capacity(pixels);
     let mut co_plane = Vec::with_capacity(pixels);
     let mut cg_plane = Vec::with_capacity(pixels);
-    let mut a_plane = Vec::with_capacity(pixels);
 
     for row in (0..h).rev() {
         let row_off = row * stride;
@@ -45,14 +49,13 @@ pub fn encode(
             y_plane.push(y);
             co_plane.push(co);
             cg_plane.push(cg);
-            a_plane.push(0xFF);
         }
     }
 
     let y_rle = rle_encode(&y_plane);
     let co_rle = rle_encode(&co_plane);
     let cg_rle = rle_encode(&cg_plane);
-    let a_rle = rle_encode(&a_plane);
+    let a_rle = rle_encode_const(0xFF, pixels);
 
     let plane_len = |rle: &[u8]| u32::try_from(rle.len()).unwrap_or(u32::MAX);
 
@@ -123,6 +126,29 @@ fn rle_encode(plane: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Directly encode a plane with uniform constant bytes without intermediate allocation.
+fn rle_encode_const(val: u8, n: usize) -> Vec<u8> {
+    if n <= 4 {
+        return vec![val; n];
+    }
+    let body_end = n - 4;
+    let mut out = Vec::with_capacity(11);
+    if body_end == 1 {
+        out.push(val);
+    } else if body_end <= 255 {
+        out.push(val);
+        out.push(val);
+        out.push(u8::try_from(body_end - 2).unwrap_or(253));
+    } else {
+        out.push(val);
+        out.push(val);
+        out.push(RLE_LONG_ESCAPE);
+        out.extend_from_slice(&u32::try_from(body_end).unwrap_or(u32::MAX).to_le_bytes());
+    }
+    out.extend(std::iter::repeat_n(val, 4));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,8 +156,27 @@ mod tests {
     #[test]
     fn solid_red_tile_has_header_and_body() {
         let data = [0u8, 0, 255, 0xFF].repeat(4);
-        let out = encode(&data, 2, 2, 4, 3);
+        let out = encode(&data, 2, 2, 8, 3);
         assert!(out.len() >= 20);
         assert_eq!(out[16], 3);
+    }
+
+    #[test]
+    fn rle_encode_const_matches_rle_encode() {
+        for n in [0, 1, 2, 3, 4, 5, 6, 10, 255, 258, 259, 300, 1000] {
+            let plane = vec![0xFFu8; n];
+            assert_eq!(
+                rle_encode_const(0xFF, n),
+                rle_encode(&plane),
+                "mismatch for n = {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_handles_insufficient_buffer_gracefully() {
+        let data = vec![0u8; 10];
+        assert!(encode(&data, 10, 10, 40, 3).is_empty());
+        assert!(encode(&[], 0, 0, 0, 3).is_empty());
     }
 }
