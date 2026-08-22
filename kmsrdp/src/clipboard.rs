@@ -11,6 +11,7 @@
 //! Polling is process-wide: one watcher fans out format advertisements to
 //! every live RDP connection, so N sessions do not mean N clipboard polls.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,24 +50,27 @@ fn advertise_unicode_formats(sender: &UnboundedSender<ClipboardMessage>) -> bool
         .is_ok()
 }
 
-/// Process-wide poll of the local clipboard. Subscribers are per-connection
-/// CLIPRDR senders; closed ones are pruned each tick. Idle (no subscribers)
-/// skips `spawn_blocking` so disconnect leaves almost no clipboard cost.
+/// Process-wide clipboard watcher. Prefers XFixes SelectionNotify when an
+/// X11 display is available; otherwise falls back to a slow poll so
+/// Wayland-only sessions still work.
 fn spawn_shared_clipboard_watcher(
     subscribers: Arc<Mutex<Vec<UnboundedSender<ClipboardMessage>>>>,
     mut session_rx: watch::Receiver<Option<Session>>,
 ) {
     tokio::spawn(async move {
         let mut last = local_text();
+        let mut xfixes_stop = Arc::new(AtomicBool::new(false));
+        let mut xfixes_active =
+            start_xfixes_watch(Arc::clone(&subscribers), Arc::clone(&xfixes_stop));
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(750)) => {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {
                     let any = {
                         let mut subs = subscribers.lock().unwrap_or_else(|e| e.into_inner());
                         subs.retain(|s| !s.is_closed());
                         !subs.is_empty()
                     };
-                    if !any {
+                    if !any || xfixes_active.load(Ordering::Relaxed) {
                         continue;
                     }
                     let current = tokio::task::spawn_blocking(local_text).await.unwrap_or(None);
@@ -78,15 +82,112 @@ fn spawn_shared_clipboard_watcher(
                 }
                 changed = session_rx.changed() => {
                     if changed.is_err() {
+                        xfixes_stop.store(true, Ordering::SeqCst);
                         break;
                     }
-                    // Session changed: reset so next poll opens a fresh
-                    // arboard connection to the new session's clipboard.
                     last = None;
+                    xfixes_stop.store(true, Ordering::SeqCst);
+                    xfixes_stop = Arc::new(AtomicBool::new(false));
+                    xfixes_active =
+                        start_xfixes_watch(Arc::clone(&subscribers), Arc::clone(&xfixes_stop));
                 }
             }
         }
     });
+}
+
+fn start_xfixes_watch(
+    subscribers: Arc<Mutex<Vec<UnboundedSender<ClipboardMessage>>>>,
+    stop: Arc<AtomicBool>,
+) -> Arc<AtomicBool> {
+    let active = Arc::new(AtomicBool::new(false));
+    let active_for_thread = Arc::clone(&active);
+    let _ = std::thread::Builder::new()
+        .name("kmsrdp-clip-xfixes".into())
+        .spawn(
+            move || match xfixes_selection_loop(&subscribers, &stop, &active_for_thread) {
+                Ok(()) => {}
+                Err(e) => {
+                    active_for_thread.store(false, Ordering::SeqCst);
+                    tracing::debug!(error = %e, "XFixes clipboard watch unavailable; using poll");
+                }
+            },
+        );
+    active
+}
+
+fn xfixes_selection_loop(
+    subscribers: &Mutex<Vec<UnboundedSender<ClipboardMessage>>>,
+    stop: &AtomicBool,
+    active: &AtomicBool,
+) -> std::io::Result<()> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::Event;
+    use x11rb::protocol::xfixes::{self, SelectionEventMask};
+    use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+
+    let (conn, screen_num) =
+        x11rb::connect(None).map_err(|e| std::io::Error::other(format!("X11 connect: {e}")))?;
+    let screen = &conn.setup().roots[screen_num];
+    xfixes::query_version(&conn, 5, 0)
+        .map_err(|e| std::io::Error::other(format!("XFixes query: {e}")))?
+        .reply()
+        .map_err(|e| std::io::Error::other(format!("XFixes query reply: {e}")))?;
+    let clipboard = conn
+        .intern_atom(false, b"CLIPBOARD")
+        .map_err(|e| std::io::Error::other(format!("intern CLIPBOARD: {e}")))?
+        .reply()
+        .map_err(|e| std::io::Error::other(format!("intern CLIPBOARD reply: {e}")))?
+        .atom;
+    let win = conn.generate_id().map_err(std::io::Error::other)?;
+    conn.create_window(
+        0,
+        win,
+        screen.root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_ONLY,
+        0,
+        &CreateWindowAux::new(),
+    )
+    .map_err(std::io::Error::other)?;
+    xfixes::select_selection_input(
+        &conn,
+        win,
+        clipboard,
+        SelectionEventMask::SET_SELECTION_OWNER
+            | SelectionEventMask::SELECTION_WINDOW_DESTROY
+            | SelectionEventMask::SELECTION_CLIENT_CLOSE,
+    )
+    .map_err(std::io::Error::other)?;
+    conn.flush().map_err(std::io::Error::other)?;
+    active.store(true, Ordering::SeqCst);
+
+    while !stop.load(Ordering::Relaxed) {
+        match conn.poll_for_event() {
+            Ok(Some(Event::XfixesSelectionNotify(_))) => {
+                let mut subs = subscribers.lock().unwrap_or_else(|e| e.into_inner());
+                subs.retain(|s| !s.is_closed());
+                if !subs.is_empty() {
+                    let current = local_text();
+                    if matches!(&current, Some(t) if !t.is_empty()) {
+                        subs.retain(advertise_unicode_formats);
+                    }
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => {
+                active.store(false, Ordering::SeqCst);
+                return Err(std::io::Error::other(e));
+            }
+        }
+    }
+    active.store(false, Ordering::SeqCst);
+    Ok(())
 }
 
 /// Clipboard synchronization mode.
@@ -99,6 +200,8 @@ pub enum ClipboardMode {
     HostToClient,
     /// Client to host only: client can write to host clipboard, but host clipboard is not advertised.
     ClientToHost,
+    /// CLIPRDR is not offered to the client.
+    Disabled,
 }
 
 impl ClipboardMode {
@@ -108,6 +211,10 @@ impl ClipboardMode {
 
     pub fn allows_client_to_host(self) -> bool {
         matches!(self, Self::Bidirectional | Self::ClientToHost)
+    }
+
+    pub fn is_disabled(self) -> bool {
+        matches!(self, Self::Disabled)
     }
 }
 

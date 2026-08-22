@@ -1,12 +1,16 @@
 //! Serve the DRM/KMS-captured live screen over RDP with the from-scratch
 //! `rdpcore-*` stack, and forward RDP input back through the uinput
-//! virtual device. TLS (self-signed, regenerated per run - see `tls.rs`)
-//! plus username/password auth. Connect with e.g. `xfreerdp
-//! /v:<host> /u:<user> /p:<password> /cert:ignore`.
+//! virtual device. TLS uses a persisted self-signed certificate by default
+//! (see `tls.rs`) plus username/password auth. Connect with e.g. `xfreerdp
+//! /v:127.0.0.1 /u:<user> /p:<password> /cert:ignore`.
 //!
 //! Credentials come from `KMSRDP_USER`/`KMSRDP_PASSWORD`; if unset, a
-//! random one-shot password is generated and printed on startup so the
-//! server is never reachable with a guessable default.
+//! random one-shot password is written to a 0600 file (and printed only
+//! when stderr is a TTY).
+//!
+//! Defaults: listen on `127.0.0.1:3389`, require NLA, one authenticated
+//! session. Set `KMSRDP_BIND=0.0.0.0` and `KMSRDP_REQUIRE_NLA=0` only on
+//! a trusted network.
 //!
 //! Session management: at startup the server connects to systemd-logind
 //! via D-Bus and watches for session changes.  When a user logs in or
@@ -15,11 +19,11 @@
 //! session.  Existing RDP connections are not dropped.
 //!
 //! Concurrent clients share one DRM capture loop ([`DisplayHub`]) and one
-//! uinput device ([`SharedInput`]); audio is per-connection. Clipboard
-//! backends are per-connection but share one process-wide local poller.
+//! uinput device ([`SharedInput`]); by default a second authenticated
+//! session is rejected. Audio is per-connection. Clipboard backends are
+//! per-connection but share one process-wide local watcher.
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -64,6 +68,12 @@ impl SharedInput {
         Self {
             inner: Arc::new(Mutex::new(input)),
         }
+    }
+
+    fn shutdown(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.reset();
+        inner.device.destroy();
     }
 }
 
@@ -184,8 +194,8 @@ async fn main() -> Result<()> {
     kmsrdp::audio::hint_low_latency_audio();
 
     // Fail fast on bad env / missing privileges before touching DRM or uinput.
-    let addr = listen_addr()?;
-    kmsrdp::config_check::log_report(&kmsrdp::config_check::validate(addr.port()))
+    let cfg = kmsrdp::config::Config::from_env()?;
+    kmsrdp::config_check::log_report(&kmsrdp::config_check::validate(cfg.listen.port()))
         .context("startup configuration check failed")?;
 
     // Session watcher must start first: it sets DISPLAY/XAUTHORITY/
@@ -247,27 +257,9 @@ async fn main() -> Result<()> {
     let hub = DisplayHub::start(width, height, mouse_scale.clone(), capturer, monitors);
     let display = Display::new(hub);
 
-    let username = std::env::var("KMSRDP_USER").unwrap_or_else(|_| "kmsrdp".to_string());
-    let password = match std::env::var("KMSRDP_PASSWORD") {
-        Ok(password) => password,
-        Err(_) => {
-            use rand::RngExt as _;
-            let generated: String = rand::rng()
-                .sample_iter(&rand::distr::Alphanumeric)
-                .take(20)
-                .map(char::from)
-                .collect();
-            tracing::warn!(
-                user = %username,
-                "KMSRDP_PASSWORD not set; generated a one-shot password (printed once on stderr)"
-            );
-            eprintln!("kmsrdp: one-shot RDP password for user {username}: {generated}");
-            generated
-        }
-    };
     let credentials = Credentials {
-        username: username.clone(),
-        password: password.clone(),
+        username: cfg.username.clone(),
+        password: cfg.password.clone(),
         domain: None,
     };
     let validator = ExactMatchCredentialValidator::new(credentials.clone());
@@ -276,9 +268,9 @@ async fn main() -> Result<()> {
 
     // Bind before creating the uinput device so a busy port fails without
     // spamming `input: kmsrdp as ...` on every systemd restart.
-    let listener = tokio::net::TcpListener::bind(addr)
+    let listener = tokio::net::TcpListener::bind(cfg.listen)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to bind {}: {e}", cfg.listen))?;
 
     let device = VirtualInput::create()?;
     tracing::info!("virtual input device created");
@@ -291,14 +283,21 @@ async fn main() -> Result<()> {
         pressed_buttons: HashSet::new(),
     });
 
-    let drive_factory: Box<dyn rdpcore_rdpdr::DriveConsumerFactory> = {
+    let (drive_factory, fuse_shutdown): (
+        Box<dyn rdpcore_rdpdr::DriveConsumerFactory>,
+        Option<FuseDriveFactory>,
+    ) = {
         #[cfg(feature = "rdpdr-diagnostic")]
         {
             if std::env::var_os("KMSRDP_RDPDR_DIAGNOSTIC").is_some() {
                 tracing::info!("RDPDR diagnostic self-test enabled (KMSRDP_RDPDR_DIAGNOSTIC)");
-                Box::new(kmsrdp::rdpdr_diagnostic::DiagnosticDriveFactory)
+                (
+                    Box::new(kmsrdp::rdpdr_diagnostic::DiagnosticDriveFactory),
+                    None,
+                )
             } else {
-                Box::new(FuseDriveFactory::new(session_rx.clone()))
+                let fuse = FuseDriveFactory::new(session_rx.clone());
+                (Box::new(fuse.clone()), Some(fuse))
             }
         }
         #[cfg(not(feature = "rdpdr-diagnostic"))]
@@ -309,46 +308,41 @@ async fn main() -> Result<()> {
                      the rdpdr-diagnostic feature; using FUSE drives"
                 );
             }
-            Box::new(FuseDriveFactory::new(session_rx.clone()))
+            let fuse = FuseDriveFactory::new(session_rx.clone());
+            (Box::new(fuse.clone()), Some(fuse))
         }
     };
 
-    let require_nla = std::env::var("KMSRDP_REQUIRE_NLA")
-        .or_else(|_| std::env::var("KMSRDP_FORCE_NLA"))
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if require_nla {
+    if cfg.require_nla {
         tracing::info!("NLA (Network Level Authentication) is required for all connections");
+    } else {
+        tracing::warn!(
+            "NLA is optional (KMSRDP_REQUIRE_NLA=0); clients may authenticate with TLS + Client Info only"
+        );
     }
+    tracing::info!(max_sessions = cfg.max_sessions, "concurrent session limit");
 
-    let clipboard_mode_str =
-        std::env::var("KMSRDP_CLIPBOARD").unwrap_or_else(|_| "bidirectional".to_string());
     let cliprdr_factory: Option<Box<dyn rdpcore_cliprdr::CliprdrBackendFactory>> =
-        match clipboard_mode_str.trim().to_ascii_lowercase().as_str() {
-            "disabled" | "off" | "0" | "false" => {
-                tracing::info!("clipboard redirection disabled (KMSRDP_CLIPBOARD=disabled)");
-                None
+        if cfg.clipboard.is_disabled() {
+            tracing::info!("clipboard redirection disabled (KMSRDP_CLIPBOARD=disabled)");
+            None
+        } else {
+            match cfg.clipboard {
+                kmsrdp::clipboard::ClipboardMode::HostToClient => {
+                    tracing::info!("clipboard redirection set to host-to-client (read-only)");
+                }
+                kmsrdp::clipboard::ClipboardMode::ClientToHost => {
+                    tracing::info!("clipboard redirection set to client-to-host");
+                }
+                _ => {}
             }
-            "host-to-client" | "read-only" | "readonly" => {
-                tracing::info!("clipboard redirection set to host-to-client (read-only)");
-                Some(Box::new(LocalClipboardFactory::new(
-                    session_rx.clone(),
-                    kmsrdp::clipboard::ClipboardMode::HostToClient,
-                )))
-            }
-            "client-to-host" => {
-                tracing::info!("clipboard redirection set to client-to-host");
-                Some(Box::new(LocalClipboardFactory::new(
-                    session_rx.clone(),
-                    kmsrdp::clipboard::ClipboardMode::ClientToHost,
-                )))
-            }
-            _ => Some(Box::new(LocalClipboardFactory::new(
+            Some(Box::new(LocalClipboardFactory::new(
                 session_rx.clone(),
-                kmsrdp::clipboard::ClipboardMode::Bidirectional,
-            ))),
+                cfg.clipboard,
+            )))
         };
 
+    let input_for_shutdown = input.clone();
     let server: RdpServer = RdpServer::builder()
         .with_listener(listener)
         .with_tls(tls_identity.acceptor)
@@ -361,30 +355,39 @@ async fn main() -> Result<()> {
         .with_drive_factory(Some(drive_factory))
         .with_credential_validator(Some(Arc::new(validator)))
         .with_nla_credentials(Some(credentials))
-        .with_require_nla(require_nla)
+        .with_require_nla(cfg.require_nla)
+        .with_max_sessions(cfg.max_sessions)
         .build();
 
-    let nla_desc = if require_nla {
+    let nla_desc = if cfg.require_nla {
         "TLS + required NLA"
     } else {
         "TLS + optional NLA"
     };
-    tracing::info!(%addr, "RDP server listening ({nla_desc})");
-    // Exit immediately on stop signals. Tokio graceful shutdown would wait
-    // for DRM `spawn_blocking` / FUSE threads and can hang host shutdown for
-    // the default systemd TimeoutStopSec (~90s). `process::exit` skips that;
-    // the unit also uses a short TimeoutStopSec + SIGKILL as a backstop.
+    tracing::info!(addr = %cfg.listen, "RDP server listening ({nla_desc})");
+    // Clean up FUSE/uinput first, then exit. Tokio graceful shutdown would
+    // wait for DRM `spawn_blocking` / FUSE threads and can hang host
+    // shutdown; `process::exit` after a short cleanup is still the backstop.
     tokio::select! {
         result = server.run() => result,
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("SIGINT, exiting");
+            tracing::info!("SIGINT, shutting down");
+            graceful_shutdown(&input_for_shutdown, fuse_shutdown.as_ref());
             std::process::exit(0);
         }
         _ = sigterm() => {
-            tracing::info!("SIGTERM, exiting");
+            tracing::info!("SIGTERM, shutting down");
+            graceful_shutdown(&input_for_shutdown, fuse_shutdown.as_ref());
             std::process::exit(0);
         }
     }
+}
+
+fn graceful_shutdown(input: &SharedInput, fuse: Option<&FuseDriveFactory>) {
+    if let Some(fuse) = fuse {
+        fuse.unmount_all();
+    }
+    input.shutdown();
 }
 
 async fn sigterm() {
@@ -397,35 +400,4 @@ async fn sigterm() {
             std::future::pending::<()>().await;
         }
     }
-}
-
-/// Listen address from `KMSRDP_BIND` (default `0.0.0.0`) and `KMSRDP_PORT`
-/// (default `3389`). `KMSRDP_BIND` accepts an IPv4/IPv6 address (`127.0.0.1`,
-/// `::`, optional `[::1]` brackets).
-fn listen_addr() -> Result<SocketAddr> {
-    let port: u16 = match std::env::var("KMSRDP_PORT") {
-        Ok(raw) => {
-            let trimmed = raw.trim();
-            trimmed.parse().map_err(|_| {
-                anyhow::anyhow!("KMSRDP_PORT must be an integer port 1-65535, got {raw:?}")
-            })?
-        }
-        Err(_) => 3389,
-    };
-    if port == 0 {
-        anyhow::bail!("KMSRDP_PORT must be non-zero");
-    }
-
-    let bind = std::env::var("KMSRDP_BIND").unwrap_or_else(|_| "0.0.0.0".to_owned());
-    let bind = bind.trim();
-    let bind = bind
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(bind);
-    let ip: std::net::IpAddr = bind.parse().map_err(|_| {
-        anyhow::anyhow!(
-            "KMSRDP_BIND must be an IP address (e.g. 0.0.0.0, 127.0.0.1, ::), got {bind:?}"
-        )
-    })?;
-    Ok(SocketAddr::new(ip, port))
 }

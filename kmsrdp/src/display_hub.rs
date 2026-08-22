@@ -41,7 +41,14 @@ pub struct DisplayHub {
     monitors: Mutex<Vec<MonitorLayoutEntry>>,
 }
 
+fn mutex_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl DisplayHub {
+    fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex_lock(mutex)
+    }
     /// Starts the capture loop immediately and returns a shareable hub.
     pub fn start(
         width: u16,
@@ -67,13 +74,13 @@ impl DisplayHub {
 
     pub fn subscribe(&self) -> DisplayUpdates {
         DisplayUpdates {
-            initial: self.latest_full.lock().unwrap().clone(),
+            initial: Self::lock(&self.latest_full).clone(),
             latest_full: Arc::clone(&self.latest_full),
             rx: self.tx.subscribe(),
         }
     }
 
-    async fn run_capture_loop(self: Arc<Self>, mut capturer: capture::Capturer) {
+    async fn run_capture_loop(self: Arc<Self>, capturer: capture::Capturer) {
         /// Prior frame pixels shared with `latest_full` via [`Arc`] so the
         /// dirty-rect pass does not need a second framebuffer copy.
         struct PrevFrame {
@@ -83,43 +90,57 @@ impl DisplayHub {
             data: Arc<[u8]>,
         }
         let mut previous: Option<PrevFrame> = None;
-        let mut negotiated_size = *self.size.lock().unwrap();
+        let mut negotiated_size = *Self::lock(&self.size);
         let mut consecutive_failures: u32 = 0;
         let interval = frame_interval();
+        let mut capturer = Some(capturer);
         loop {
+            let current = capturer
+                .take()
+                .expect("capturer slot filled each iteration");
             let task = tokio::task::spawn_blocking(move || {
-                let result = capturer.capture();
-                (capturer, result)
+                let mut current = current;
+                let result = current.capture();
+                (current, result)
             })
             .await;
             let result = match task {
                 Ok((returned, result)) => {
-                    capturer = returned;
+                    capturer = Some(returned);
                     result
                 }
                 Err(e) => {
                     tracing::error!("kmsrdp: capture task panicked: {e}");
-                    match tokio::task::spawn_blocking(capture::Capturer::new).await {
-                        Ok(Ok(replacement)) => {
-                            capturer = replacement;
-                            tokio::time::sleep(interval).await;
-                            continue;
-                        }
-                        Ok(Err(open_err)) => {
-                            tracing::error!(
-                                "kmsrdp: failed to reopen capturer: {open_err}; \
-                                 stopping capture loop (clients will stay black);"
-                            );
-                            return;
-                        }
-                        Err(open_err) => {
-                            tracing::error!(
-                                "kmsrdp: capturer reopen task panicked: {open_err}; \
-                                 stopping capture loop"
-                            );
-                            return;
+                    loop {
+                        match tokio::task::spawn_blocking(capture::Capturer::new).await {
+                            Ok(Ok(replacement)) => {
+                                capturer = Some(replacement);
+                                break;
+                            }
+                            Ok(Err(open_err)) => {
+                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                if should_log_capture_failure(consecutive_failures) {
+                                    tracing::error!(
+                                        "kmsrdp: failed to reopen capturer: {open_err}; retrying"
+                                    );
+                                }
+                                tokio::time::sleep(capture_retry_backoff(consecutive_failures))
+                                    .await;
+                            }
+                            Err(open_err) => {
+                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                if should_log_capture_failure(consecutive_failures) {
+                                    tracing::error!(
+                                        "kmsrdp: capturer reopen task panicked: {open_err}; retrying"
+                                    );
+                                }
+                                tokio::time::sleep(capture_retry_backoff(consecutive_failures))
+                                    .await;
+                            }
                         }
                     }
+                    tokio::time::sleep(interval).await;
+                    continue;
                 }
             };
 
@@ -131,7 +152,7 @@ impl DisplayHub {
                         );
                         consecutive_failures = 0;
                     }
-                    *self.monitors.lock().unwrap() = raw
+                    *Self::lock(&self.monitors) = raw
                         .monitors
                         .iter()
                         .map(|m| MonitorLayoutEntry {
@@ -152,8 +173,8 @@ impl DisplayHub {
                         // briefly before sending bitmaps at the new
                         // dimensions. Update the mouse scale now too.
                         negotiated_size = current_size;
-                        *self.size.lock().unwrap() = current_size;
-                        *self.mouse_scale.lock().unwrap() = (
+                        *Self::lock(&self.size) = current_size;
+                        *Self::lock(&self.mouse_scale) = (
                             f64::from(current_size.width),
                             f64::from(current_size.height),
                         );
@@ -161,7 +182,7 @@ impl DisplayHub {
                         // forced through as a full-frame update after the
                         // client confirms the new desktop size.
                         previous = None;
-                        *self.latest_full.lock().unwrap() = None;
+                        *Self::lock(&self.latest_full) = None;
                         let _ = self.tx.send(DisplayUpdate::Resized(current_size));
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
@@ -232,7 +253,7 @@ impl DisplayHub {
                     //
                     // `BitmapUpdate::data` is `Arc<[u8]>`, so this clone is
                     // cheap (no framebuffer memcpy).
-                    *self.latest_full.lock().unwrap() = Some(full.clone());
+                    *Self::lock(&self.latest_full) = Some(full.clone());
                     previous = Some(PrevFrame {
                         width: raw.width,
                         height: raw.height,
@@ -265,6 +286,11 @@ impl DisplayHub {
             tokio::time::sleep(interval).await;
         }
     }
+}
+
+fn capture_retry_backoff(consecutive: u32) -> Duration {
+    let secs = u64::from(consecutive.min(8));
+    Duration::from_secs(secs.max(1))
 }
 
 fn frame_interval() -> Duration {
@@ -348,7 +374,7 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
                 // before broadcasting so a mid-send lag still recovers the
                 // frame that was being sent (not the prior one).
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if let Some(full) = self.latest_full.lock().unwrap().clone() {
+                    if let Some(full) = mutex_lock(&self.latest_full).clone() {
                         return Ok(Some(DisplayUpdate::Bitmap(full)));
                     }
                     continue;
@@ -359,14 +385,14 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
     }
 
     fn latest_full_frame(&self) -> Option<BitmapUpdate> {
-        self.latest_full.lock().unwrap().clone()
+        mutex_lock(&self.latest_full).clone()
     }
 }
 
 #[async_trait::async_trait]
 impl RdpServerDisplay for Display {
     async fn size(&self) -> DesktopSize {
-        *self.hub.size.lock().unwrap()
+        *mutex_lock(&self.hub.size)
     }
 
     async fn updates(&self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
@@ -374,7 +400,7 @@ impl RdpServerDisplay for Display {
     }
 
     fn monitor_layout(&self) -> Vec<MonitorLayoutEntry> {
-        self.hub.monitors.lock().unwrap().clone()
+        mutex_lock(&self.hub.monitors).clone()
     }
 }
 
@@ -422,5 +448,33 @@ mod tests {
             super::frame_interval(),
             std::time::Duration::from_millis(50)
         );
+    }
+
+    #[test]
+    fn capture_retry_backoff_grows_then_caps() {
+        assert_eq!(
+            super::capture_retry_backoff(1),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            super::capture_retry_backoff(8),
+            std::time::Duration::from_secs(8)
+        );
+        assert_eq!(
+            super::capture_retry_backoff(99),
+            std::time::Duration::from_secs(8)
+        );
+    }
+
+    #[test]
+    fn mutex_lock_recovers_from_poison() {
+        let mutex = std::sync::Mutex::new(1u32);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("poison the mutex");
+        });
+        assert!(mutex.lock().is_err());
+        *super::mutex_lock(&mutex) += 1;
+        assert_eq!(*super::mutex_lock(&mutex), 2);
     }
 }

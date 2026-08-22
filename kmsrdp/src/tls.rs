@@ -59,9 +59,12 @@ pub fn build_acceptor() -> Result<TlsIdentity, TlsError> {
         load_or_create_identity(&hostnames)?
     };
 
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)?;
+    let config = rustls::ServerConfig::builder_with_protocol_versions(&[
+        &rustls::version::TLS13,
+        &rustls::version::TLS12,
+    ])
+    .with_no_client_auth()
+    .with_single_cert(vec![cert_der], key_der)?;
 
     Ok(TlsIdentity {
         acceptor: TlsAcceptor::from(Arc::new(config)),
@@ -96,29 +99,23 @@ fn load_or_create_identity(
     let (cert_path, key_path) = tls_paths()?;
 
     if cert_path.is_file() && key_path.is_file() {
-        match load_identity_files(&cert_path, &key_path) {
-            Ok(identity) => {
-                tracing::info!(
-                    "kmsrdp: loaded TLS identity from {} and {}",
-                    cert_path.display(),
-                    key_path.display()
-                );
-                return Ok(identity);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "kmsrdp: failed to load TLS identity from {} / {} ({e}); regenerating",
-                    cert_path.display(),
-                    key_path.display()
-                );
-            }
-        }
-    } else if cert_path.exists() || key_path.exists() {
+        let identity = load_identity_files(&cert_path, &key_path)?;
         tracing::info!(
-            "kmsrdp: incomplete TLS identity (need both {} and {}); regenerating",
+            "kmsrdp: loaded TLS identity from {} and {}",
             cert_path.display(),
             key_path.display()
         );
+        return Ok(identity);
+    }
+    if cert_path.exists() || key_path.exists() {
+        return Err(TlsError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "incomplete TLS identity (need both {} and {}); refusing to regenerate a pinned cert",
+                cert_path.display(),
+                key_path.display()
+            ),
+        )));
     }
 
     let rcgen::CertifiedKey { cert, signing_key } =
@@ -186,6 +183,12 @@ fn persist_identity(
     write_private_file(cert_path, cert_pem.as_bytes(), 0o644)?;
     write_private_file(key_path, key_pem.as_bytes(), 0o600)?;
     Ok(())
+}
+
+/// Atomically write `contents` with the given Unix mode (used for TLS keys
+/// and the one-shot RDP password file).
+pub fn write_secret_file(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    write_private_file(path, contents, mode)
 }
 
 struct TmpFileGuard<'a>(&'a Path, bool);
@@ -337,6 +340,29 @@ mod tests {
         let (_, _, pk2) = load_or_create_identity(&hosts).expect("reload");
         assert_eq!(pk1, pk2);
 
+        unsafe {
+            std::env::remove_var("KMSRDP_TLS_CERT");
+            std::env::remove_var("KMSRDP_TLS_KEY");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_identity_files_do_not_regenerate() {
+        let _guard = env_lock();
+        let dir = tempfile_dir();
+        let cert_path = dir.join(CERT_FILE_NAME);
+        let key_path = dir.join(KEY_FILE_NAME);
+        fs::write(&cert_path, b"not a cert").unwrap();
+        fs::write(&key_path, b"not a key").unwrap();
+        unsafe {
+            std::env::remove_var("KMSRDP_TLS_EPHEMERAL");
+            std::env::set_var("KMSRDP_TLS_CERT", &cert_path);
+            std::env::set_var("KMSRDP_TLS_KEY", &key_path);
+        }
+        let hosts = vec!["localhost".to_owned()];
+        assert!(load_or_create_identity(&hosts).is_err());
+        assert_eq!(fs::read(&cert_path).unwrap(), b"not a cert");
         unsafe {
             std::env::remove_var("KMSRDP_TLS_CERT");
             std::env::remove_var("KMSRDP_TLS_KEY");

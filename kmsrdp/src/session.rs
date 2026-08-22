@@ -62,18 +62,25 @@ pub fn find_xauthority(username: &str, xdg_runtime_dir: &Path, leader_pid: u32) 
         return Some(path);
     }
 
-    if let Ok(home) = std::env::var("HOME") {
+    // Only use this process's HOME when it belongs to the session user.
+    // A system unit running as root must not pick up /root/.Xauthority
+    // for a logged-in desktop user.
+    if std::env::var("USER").ok().as_deref() == Some(username)
+        && let Ok(home) = std::env::var("HOME")
+    {
         let xauth = PathBuf::from(home).join(".Xauthority");
         if xauth.exists() {
             return Some(xauth);
         }
     }
 
-    let candidates = [
+    let mut candidates = vec![
         format!("/home/{username}/.Xauthority"),
         format!("/var/home/{username}/.Xauthority"),
-        "/root/.Xauthority".to_string(),
     ];
+    if username == "root" {
+        candidates.push("/root/.Xauthority".to_string());
+    }
     for cand in candidates {
         let p = PathBuf::from(cand);
         if p.exists() {

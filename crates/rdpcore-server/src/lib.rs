@@ -11,10 +11,12 @@
 //! directly, so a bulk channel (graphics) can't starve a latency-sensitive
 //! one (audio).
 
+mod auth_limit;
 mod credentials;
 mod credssp;
 pub mod diff;
 mod display;
+mod encode;
 mod input;
 mod server;
 mod transport;

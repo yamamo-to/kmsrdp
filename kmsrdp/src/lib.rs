@@ -2,6 +2,7 @@ pub mod audio;
 pub mod audio_input;
 pub mod capture;
 pub mod clipboard;
+pub mod config;
 pub mod config_check;
 pub mod display_hub;
 pub mod gpu_detile;
@@ -11,6 +12,7 @@ pub mod pulse_util;
 #[cfg(feature = "rdpdr-diagnostic")]
 pub mod rdpdr_diagnostic;
 pub mod rdpdr_fuse;
+pub mod rdpdr_path;
 pub mod session;
 pub mod session_watcher;
 pub mod tls;

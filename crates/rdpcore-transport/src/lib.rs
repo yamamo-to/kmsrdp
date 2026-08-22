@@ -7,6 +7,11 @@
 //! delay a latency-sensitive frame (e.g. an audio wave chunk) that arrives
 //! mid-burst - see `scheduler.rs`'s tests for the exact property being
 //! fixed.
+//!
+//! Incoming frames are split across two bounded inboxes so a flood of
+//! graphics cannot grow memory without bound or starve audio: bulk frames
+//! are dropped when their queue is full; latency frames have a dedicated
+//! smaller queue.
 
 mod scheduler;
 
@@ -15,36 +20,60 @@ pub use scheduler::{ChannelKey, Frame, Priority, Scheduler};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+const LATENCY_QUEUE_CAP: usize = 64;
+const BULK_QUEUE_CAP: usize = 256;
+
 /// Cheap to clone - every producer (display updates, rdpsnd, ...) gets its
 /// own handle into the same connection's writer task.
 #[derive(Clone)]
 pub struct FrameSender {
-    tx: mpsc::UnboundedSender<Frame>,
+    latency: mpsc::Sender<Frame>,
+    bulk: mpsc::Sender<Frame>,
 }
 
 impl FrameSender {
-    /// Fails only once the writer task has shut down (connection closed).
+    /// Enqueues a frame. Fails if the writer has shut down, or if the
+    /// corresponding bounded queue is full (callers typically drop bulk
+    /// graphics in that case).
     pub fn send(&self, frame: Frame) -> Result<(), Frame> {
-        self.tx.send(frame).map_err(|e| e.0)
+        let tx = match frame.priority {
+            Priority::Latency => &self.latency,
+            Priority::Bulk => &self.bulk,
+        };
+        tx.try_send(frame).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(frame) | mpsc::error::TrySendError::Closed(frame) => {
+                frame
+            }
+        })
     }
 }
 
 pub struct ConnectionWriter<W> {
     sink: W,
     scheduler: Scheduler,
-    inbox: mpsc::UnboundedReceiver<Frame>,
+    latency: mpsc::Receiver<Frame>,
+    bulk: mpsc::Receiver<Frame>,
+    latency_open: bool,
+    bulk_open: bool,
 }
 
 impl<W: AsyncWrite + Unpin> ConnectionWriter<W> {
     pub fn new(sink: W) -> (Self, FrameSender) {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (latency_tx, latency_rx) = mpsc::channel(LATENCY_QUEUE_CAP);
+        let (bulk_tx, bulk_rx) = mpsc::channel(BULK_QUEUE_CAP);
         (
             Self {
                 sink,
                 scheduler: Scheduler::new(),
-                inbox: rx,
+                latency: latency_rx,
+                bulk: bulk_rx,
+                latency_open: true,
+                bulk_open: true,
             },
-            FrameSender { tx },
+            FrameSender {
+                latency: latency_tx,
+                bulk: bulk_tx,
+            },
         )
     }
 
@@ -52,16 +81,35 @@ impl<W: AsyncWrite + Unpin> ConnectionWriter<W> {
     /// (i.e. for the lifetime of the connection) or a write fails.
     pub async fn run(mut self) -> std::io::Result<()> {
         loop {
-            while let Ok(frame) = self.inbox.try_recv() {
+            while let Ok(frame) = self.latency.try_recv() {
+                self.scheduler.enqueue(frame);
+            }
+            while let Ok(frame) = self.bulk.try_recv() {
                 self.scheduler.enqueue(frame);
             }
 
             match self.scheduler.pop_next() {
                 Some(bytes) => self.sink.write_all(&bytes).await?,
-                None => match self.inbox.recv().await {
-                    Some(frame) => self.scheduler.enqueue(frame),
-                    None => break,
-                },
+                None => {
+                    if !self.latency_open && !self.bulk_open {
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        frame = self.latency.recv(), if self.latency_open => {
+                            match frame {
+                                Some(frame) => self.scheduler.enqueue(frame),
+                                None => self.latency_open = false,
+                            }
+                        }
+                        frame = self.bulk.recv(), if self.bulk_open => {
+                            match frame {
+                                Some(frame) => self.scheduler.enqueue(frame),
+                                None => self.bulk_open = false,
+                            }
+                        }
+                    }
+                }
             }
         }
         self.sink.flush().await?;
@@ -104,5 +152,29 @@ mod tests {
         // Latency frame was enqueued second but must still be written first.
         assert_eq!(received, b"audiographics");
         run_handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn bulk_send_drops_when_queue_is_full() {
+        let (_client_side, server_side) = tokio::io::duplex(4096);
+        let (writer, sender) = ConnectionWriter::new(server_side);
+        // Do not run the writer, so the bulk queue fills.
+        let mut accepted = 0usize;
+        let mut dropped = 0usize;
+        for _ in 0..(BULK_QUEUE_CAP + 8) {
+            let frame = Frame {
+                channel: ChannelKey::Io,
+                priority: Priority::Bulk,
+                bytes: vec![0],
+            };
+            if sender.send(frame).is_ok() {
+                accepted += 1;
+            } else {
+                dropped += 1;
+            }
+        }
+        assert_eq!(accepted, BULK_QUEUE_CAP);
+        assert!(dropped >= 8);
+        drop(writer);
     }
 }

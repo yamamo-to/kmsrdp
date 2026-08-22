@@ -99,7 +99,8 @@ fn check_credentials(report: &mut StartupReport) {
         }
         Err(_) => {
             report.warnings.push(
-                "KMSRDP_PASSWORD unset — a one-shot password will be generated and logged"
+                "KMSRDP_PASSWORD unset — a one-shot password will be written to a 0600 file \
+                 (printed to stderr only if it is a TTY)"
                     .to_string(),
             );
         }

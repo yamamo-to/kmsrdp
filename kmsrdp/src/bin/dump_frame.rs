@@ -1,4 +1,4 @@
-//! Step 1 demo: capture the live screen via DRM/KMS and dump it as a PNG.
+//! Capture the live screen via DRM/KMS and dump it as a PNG.
 
 use kmsrdp::capture;
 

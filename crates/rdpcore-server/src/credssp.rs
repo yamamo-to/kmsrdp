@@ -12,7 +12,7 @@ use sspi::ntlm::NtlmConfig;
 use sspi::{AuthIdentity, Username};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::credentials::{Credentials, normalize_client_identity};
+use crate::credentials::{Credentials, eq_ignore_ascii_case_ct, normalize_client_identity};
 
 type CredsspProcessGenerator<'a> =
     Generator<'a, NetworkRequest, sspi::Result<Vec<u8>>, Result<ServerState, ServerError>>;
@@ -34,13 +34,13 @@ impl CredentialsProxy for ConfiguredCredentials {
         };
         let (client_domain, client_user) = normalize_client_identity(account, domain);
 
-        if !client_user.eq_ignore_ascii_case(&self.expected.username) {
+        if !eq_ignore_ascii_case_ct(&client_user, &self.expected.username) {
             return Err(io::Error::other(format!(
                 "unknown username {account:?} (domain {domain:?})"
             )));
         }
         if let Some(expected_domain) = &self.expected.domain
-            && !client_domain.eq_ignore_ascii_case(expected_domain)
+            && !eq_ignore_ascii_case_ct(&client_domain, expected_domain)
         {
             return Err(io::Error::other(format!(
                 "domain mismatch for user {account:?}"

@@ -45,11 +45,11 @@ impl CredentialValidator for ExactMatchCredentialValidator {
             .as_bytes()
             .ct_eq(password.as_bytes())
             .into();
-        if !client_user.eq_ignore_ascii_case(&self.expected.username) || !password_matches {
+        if !eq_ignore_ascii_case_ct(&client_user, &self.expected.username) || !password_matches {
             return false;
         }
         match &self.expected.domain {
-            Some(expected_domain) => client_domain.eq_ignore_ascii_case(expected_domain),
+            Some(expected_domain) => eq_ignore_ascii_case_ct(&client_domain, expected_domain),
             None => true,
         }
     }
@@ -71,6 +71,22 @@ pub fn normalize_client_identity(username: &str, domain: &str) -> (String, Strin
         return (d.to_owned(), u.to_owned());
     }
     (domain.to_owned(), username.to_owned())
+}
+
+/// ASCII case-insensitive equality that does not short-circuit on the first
+/// differing byte (length is still visible). Used for usernames/domains so
+/// the password `ct_eq` is not preceded by an early `return`.
+pub fn eq_ignore_ascii_case_ct(a: &str, b: &str) -> bool {
+    let a: Vec<u8> = a.bytes().map(|c| c.to_ascii_lowercase()).collect();
+    let b: Vec<u8> = b.bytes().map(|c| c.to_ascii_lowercase()).collect();
+    let n = a.len().max(b.len());
+    let mut pa = vec![0u8; n];
+    let mut pb = vec![0u8; n];
+    pa[..a.len()].copy_from_slice(&a);
+    pb[..b.len()].copy_from_slice(&b);
+    let body: bool = pa.ct_eq(&pb).into();
+    let lens: bool = (a.len() as u64).ct_eq(&(b.len() as u64)).into();
+    body && lens
 }
 
 #[cfg(test)]
@@ -144,5 +160,13 @@ mod tests {
         let formatted = format!("{creds:?}");
         assert!(!formatted.contains("super_secret_password"));
         assert!(formatted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn username_ct_eq_is_case_insensitive_and_rejects_mismatch() {
+        assert!(eq_ignore_ascii_case_ct("kmsrdp", "KMSRDP"));
+        assert!(!eq_ignore_ascii_case_ct("kmsrdp", "kmsrd"));
+        assert!(!eq_ignore_ascii_case_ct("kmsrdp", "kmsrdpx"));
+        assert!(!eq_ignore_ascii_case_ct("abc", "abd"));
     }
 }

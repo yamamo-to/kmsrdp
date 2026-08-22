@@ -5,6 +5,10 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+fn invalid_framing(msg: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
+}
+
 /// Reads one complete TPKT-framed unit (the 4-byte header plus however many
 /// bytes its `packet_length` field declares), header included - this is
 /// exactly the byte slice `rdpcore_connector::Acceptor::step` and
@@ -13,7 +17,10 @@ pub async fn read_tpkt_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::R
     let mut header = [0u8; 4];
     reader.read_exact(&mut header).await?;
     let packet_length = usize::from(u16::from_be_bytes([header[2], header[3]]));
-    let mut rest = vec![0u8; packet_length.saturating_sub(header.len())];
+    if packet_length < header.len() {
+        return Err(invalid_framing("TPKT length shorter than header"));
+    }
+    let mut rest = vec![0u8; packet_length - header.len()];
     reader.read_exact(&mut rest).await?;
     let mut frame = header.to_vec();
     frame.extend(rest);
@@ -42,7 +49,11 @@ async fn read_fastpath_frame_after<R: AsyncRead + Unpin>(
         ((usize::from(buf[1]) & 0x7F) << 8) | usize::from(third[0])
     };
 
-    let mut rest = vec![0u8; total_length.saturating_sub(buf.len())];
+    if total_length < buf.len() {
+        return Err(invalid_framing("fast-path length shorter than header"));
+    }
+
+    let mut rest = vec![0u8; total_length - buf.len()];
     reader.read_exact(&mut rest).await?;
     buf.extend(rest);
     Ok(buf)
@@ -54,7 +65,10 @@ async fn read_tpkt_frame_after<R: AsyncRead + Unpin>(reader: &mut R) -> std::io:
     let mut rest_of_header = [0u8; 3]; // reserved(1) + packet_length(2)
     reader.read_exact(&mut rest_of_header).await?;
     let packet_length = usize::from(u16::from_be_bytes([rest_of_header[1], rest_of_header[2]]));
-    let mut rest = vec![0u8; packet_length.saturating_sub(4)];
+    if packet_length < 4 {
+        return Err(invalid_framing("TPKT length shorter than header"));
+    }
+    let mut rest = vec![0u8; packet_length - 4];
     reader.read_exact(&mut rest).await?;
 
     let mut frame = Vec::with_capacity(packet_length);
@@ -73,6 +87,7 @@ async fn read_tpkt_frame_after<R: AsyncRead + Unpin>(reader: &mut R) -> std::io:
 /// low 2 bits (the `action` field) are `0` for input, and `0x03` can never
 /// occur there in practice (real clients only ever send action `0`) - so
 /// peeking that one byte is enough to dispatch correctly.
+#[derive(Debug)]
 pub enum SteadyStateFrame {
     FastPathInput(Vec<u8>),
     SlowPath(Vec<u8>),
@@ -91,5 +106,34 @@ pub async fn read_steady_state_frame<R: AsyncRead + Unpin>(
         Ok(SteadyStateFrame::FastPathInput(
             read_fastpath_frame_after(reader, header_byte[0]).await?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn tpkt_rejects_length_shorter_than_header() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let mut client = client;
+        tokio::spawn(async move {
+            client.write_all(&[0x03, 0x00, 0x00, 0x02]).await.unwrap();
+        });
+        let err = read_tpkt_frame(&mut server).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn fastpath_rejects_length_shorter_than_header() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let mut client = client;
+        tokio::spawn(async move {
+            // action byte + length 1 (shorter than the 2-byte header already read)
+            client.write_all(&[0x00, 0x01]).await.unwrap();
+        });
+        let err = read_steady_state_frame(&mut server).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

@@ -64,7 +64,7 @@ impl ExtendedClientInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct ClientInfo {
     pub code_page: u32,
     pub flags: ClientInfoFlags,
@@ -74,6 +74,21 @@ pub struct ClientInfo {
     pub alternate_shell: String,
     pub working_dir: String,
     pub extended: ExtendedClientInfo,
+}
+
+impl std::fmt::Debug for ClientInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientInfo")
+            .field("code_page", &self.code_page)
+            .field("flags", &self.flags)
+            .field("domain", &self.domain)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("alternate_shell", &self.alternate_shell)
+            .field("working_dir", &self.working_dir)
+            .field("extended", &self.extended)
+            .finish()
+    }
 }
 
 impl ClientInfo {
@@ -209,36 +224,49 @@ impl ClientInfoPdu {
 mod tests {
     use super::*;
 
-    /// Real bytes captured from `xfreerdp /u:testuser /p:testpass123`
-    /// connecting through the full connection sequence (Xvfb + a raw TCP
-    /// listener standing in for the server, same technique as x224's real-
-    /// capture test). This is the fixture that caught a real bug: the five
-    /// `cbXxx` length fields are packed together as one block *before* any
-    /// of the five strings, not interleaved (length,string,length,...) as
-    /// an initial implementation assumed - a self-consistent encode/decode
-    /// round-trip test alone could never have caught that, since both
-    /// sides agreed with each other under the same wrong assumption.
+    /// Packed-layout fixture (not produced by `ClientInfo::encode`): the five
+    /// `cbXxx` length fields sit together *before* any of the five strings.
+    /// A self-consistent encode/decode round-trip cannot catch a decoder that
+    /// interleaved (length,string,length,...), so this is hand-packed.
     #[test]
-    fn decodes_real_xfreerdp_client_info() {
-        #[rustfmt::skip]
-        let captured: &[u8] = &[
-            0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfb, 0x47, 0x0b, 0x00, 0x00, 0x00, 0x10, 0x00,
-            0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x74, 0x00, 0x65, 0x00, 0x73, 0x00, 0x74, 0x00,
-            0x75, 0x00, 0x73, 0x00, 0x65, 0x00, 0x72, 0x00, 0x00, 0x00, 0x74, 0x00, 0x65, 0x00, 0x73, 0x00,
-            0x74, 0x00, 0x70, 0x00, 0x61, 0x00, 0x73, 0x00, 0x73, 0x00, 0x31, 0x00, 0x32, 0x00, 0x33, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x14, 0x00, 0x31, 0x00, 0x32, 0x00, 0x37, 0x00,
-            0x2e, 0x00, 0x30, 0x00, 0x2e, 0x00, 0x30, 0x00, 0x2e, 0x00, 0x31, 0x00, 0x00, 0x00, 0x40, 0x00,
-            0x43, 0x00, 0x3a, 0x00, 0x5c, 0x00, 0x57, 0x00, 0x69, 0x00, 0x6e, 0x00, 0x64, 0x00, 0x6f, 0x00,
-            0x77, 0x00, 0x73, 0x00, 0x5c, 0x00, 0x53, 0x00, 0x79, 0x00, 0x73, 0x00, 0x74, 0x00, 0x65, 0x00,
-            0x6d, 0x00, 0x33, 0x00, 0x32, 0x00, 0x5c, 0x00, 0x6d, 0x00, 0x73, 0x00, 0x74, 0x00, 0x73, 0x00,
-            0x63, 0x00, 0x61, 0x00, 0x78, 0x00, 0x2e, 0x00, 0x64, 0x00, 0x6c, 0x00, 0x6c, 0x00, 0x00, 0x00,
-            0xe4, 0xfd, 0xff, 0xff, // TimezoneInfo.bias (-540) - not parsed, left as trailing bytes
-        ];
+    fn decodes_packed_client_info_lengths_then_strings() {
+        use crate::cursor::WriteBuf;
+        use crate::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+        use crate::utf16::encode_units;
 
-        let decoded = ClientInfoPdu::decode(captured).unwrap();
+        let domain = encode_units("");
+        let username = encode_units("testuser");
+        let password = encode_units("x");
+        let shell = encode_units("");
+        let working_dir = encode_units("");
+
+        let mut body = Vec::new();
+        body.write_u32_le(0); // code page
+        body.write_u32_le((ClientInfoFlags::MOUSE | ClientInfoFlags::UNICODE).0);
+        body.write_u16_le(domain.len() as u16);
+        body.write_u16_le(username.len() as u16);
+        body.write_u16_le(password.len() as u16);
+        body.write_u16_le(shell.len() as u16);
+        body.write_u16_le(working_dir.len() as u16);
+        for bytes in [&domain, &username, &password, &shell, &working_dir] {
+            body.write_slice(bytes);
+            body.write_u16_le(0); // NUL terminator, not included in cbXxx
+        }
+        body.write_u16_le(0x0002); // AF_INET
+        write_len_included_string(&mut body, "127.0.0.1");
+        write_len_included_string(&mut body, "C:\\Windows\\System32\\mstscax.dll");
+
+        let mut captured = Vec::new();
+        BasicSecurityHeader {
+            flags: BasicSecurityHeaderFlags::INFO_PKT,
+        }
+        .write(&mut captured);
+        captured.write_slice(&body);
+
+        let decoded = ClientInfoPdu::decode(&captured).unwrap();
         assert_eq!(decoded.info.domain, "");
         assert_eq!(decoded.info.username, "testuser");
-        assert_eq!(decoded.info.password, "testpass123");
+        assert_eq!(decoded.info.password, "x");
         assert_eq!(decoded.info.alternate_shell, "");
         assert_eq!(decoded.info.working_dir, "");
         assert_eq!(decoded.info.extended.address_family, 0x0002);
@@ -298,6 +326,18 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn client_info_debug_redacts_password() {
+        let info = ClientInfo {
+            username: "kmsrdp".to_owned(),
+            password: "super_secret_password".to_owned(),
+            ..Default::default()
+        };
+        let formatted = format!("{info:?}");
+        assert!(!formatted.contains("super_secret_password"));
+        assert!(formatted.contains("[REDACTED]"));
     }
 
     #[test]

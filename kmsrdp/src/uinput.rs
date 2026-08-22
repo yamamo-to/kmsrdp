@@ -8,6 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem;
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use uinput_sys as sys;
@@ -26,6 +27,7 @@ pub const BTN_MIDDLE: i32 = sys::BTN_MIDDLE;
 
 pub struct VirtualInput {
     file: File,
+    destroyed: AtomicBool,
 }
 
 fn ioctl_check(ret: libc::c_int, what: &str) -> io::Result<()> {
@@ -127,7 +129,10 @@ impl VirtualInput {
         // before we start sending it events, same as reframe-streamer does.
         std::thread::sleep(Duration::from_secs(1));
 
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            destroyed: AtomicBool::new(false),
+        })
     }
 
     fn emit(&self, events: &[(i32, i32, i32)]) -> io::Result<()> {
@@ -268,11 +273,21 @@ pub fn linux_keycode_from_rdp_scancode(code: u8, extended: bool) -> Option<i32> 
     })
 }
 
-impl Drop for VirtualInput {
-    fn drop(&mut self) {
+impl VirtualInput {
+    /// Destroy the uinput node. Idempotent; also called from [`Drop`].
+    pub fn destroy(&self) {
+        if self.destroyed.swap(true, Ordering::SeqCst) {
+            return;
+        }
         unsafe {
             sys::ui_dev_destroy(self.file.as_raw_fd());
         }
+    }
+}
+
+impl Drop for VirtualInput {
+    fn drop(&mut self) {
+        self.destroy();
     }
 }
 

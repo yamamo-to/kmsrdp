@@ -35,8 +35,11 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
   view only — not the client filesystem)
 - **Auth / transport:** TLS + password; NLA (CredSSP/NTLMv2) when the client
   requests it; persisted self-signed cert by default (`StateDirectory` or
-  `KMSRDP_TLS_*`); configurable listen address (`KMSRDP_BIND` /
-  `KMSRDP_PORT`); structured logs via `tracing` (`KMSRDP_LOG` /
+  `KMSRDP_TLS_*`); configurable listen address (`KMSRDP_BIND`, default
+  `127.0.0.1` / `KMSRDP_PORT`); NLA required by default
+  (`KMSRDP_REQUIRE_NLA=0` to allow TLS-only Client Info auth); one
+  authenticated session by default (`KMSRDP_MAX_SESSIONS`); structured logs
+  via `tracing` (`KMSRDP_LOG` /
   `KMSRDP_LOG_FORMAT=json`); priority-aware writes so audio is not starved
   by graphics
 
@@ -60,7 +63,10 @@ framebuffer). It does **not** create a virtual desktop.
 
 ## Limitations
 
-- Concurrent clients share one (possibly composited) desktop and one input device
+- Concurrent clients: by default only one authenticated session is accepted
+  (`KMSRDP_MAX_SESSIONS`, default 1). Extra clients are disconnected after
+  handshake. When raised, sessions still share one composited desktop and
+  one input device
 - Not true per-monitor RDP windows — multi-head is one virtual desktop canvas
 - Framebuffers: single-plane XRGB8888/ARGB8888 only (tiled modifiers are
   detiled via GBM/EGL when needed)
@@ -87,9 +93,13 @@ sudo setcap cap_sys_admin,cap_dac_override,cap_net_bind_service+ep \
 KMSRDP_USER=myuser KMSRDP_PASSWORD=mypassword ./target/release/rdp_server
 ```
 
-Connect with `xfreerdp /v:<host> /cert:ignore /u:myuser /p:mypassword`, mstsc,
-or the macOS Windows App. Optional: `KMSRDP_BIND=127.0.0.1` /
-`KMSRDP_PORT=3390` to restrict the listen address; `KMSRDP_TLS_HOSTS=host,1.2.3.4`
+Connect with `xfreerdp /v:127.0.0.1 /cert:ignore /u:myuser /p:mypassword`, mstsc,
+or the macOS Windows App. The server listens on `127.0.0.1:3389` and requires
+NLA by default. Optional: `KMSRDP_BIND=0.0.0.0` to listen on all interfaces
+(trusted LAN/VPN only); `KMSRDP_PORT=3390`; `KMSRDP_REQUIRE_NLA=0` to allow
+clients that cannot do CredSSP; `KMSRDP_MAX_SESSIONS=2` to allow a second
+authenticated client (they still share one desktop and one input device);
+`KMSRDP_TLS_HOSTS=host,1.2.3.4`
 for certificate SANs (applied when the cert is first created — delete the
 persisted files to regenerate); `KMSRDP_TLS_DIR` / `KMSRDP_TLS_CERT`+`KEY`
 to choose where the identity is stored; `KMSRDP_TLS_EPHEMERAL=1` to skip

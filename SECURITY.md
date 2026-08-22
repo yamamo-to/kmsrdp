@@ -34,5 +34,7 @@ from `KMSRDP_TLS_*`). Set `KMSRDP_TLS_EPHEMERAL=1` to regenerate every
 start instead.
 
 Do not expose it directly to the public Internet. Restrict the RDP listen
-address (defaults `0.0.0.0:3389`; `KMSRDP_BIND` / `KMSRDP_PORT`) to trusted
-clients and use a trusted LAN, VPN, or SSH tunnel.
+address (defaults `127.0.0.1:3389`; `KMSRDP_BIND` / `KMSRDP_PORT`) to trusted
+clients and use a trusted LAN, VPN, or SSH tunnel. NLA is required by
+default (`KMSRDP_REQUIRE_NLA=0` disables it). Only one authenticated
+session is accepted at a time unless `KMSRDP_MAX_SESSIONS` is raised.
