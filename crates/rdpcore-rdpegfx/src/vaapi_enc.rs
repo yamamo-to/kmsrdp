@@ -170,7 +170,9 @@ fn upload_nv12(
 
     let y_needed = y_offset.saturating_add(h.saturating_mul(y_pitch));
     let uv_needed = uv_offset.saturating_add((h / 2).saturating_mul(uv_pitch));
-    let nv12_needed = w.saturating_mul(h).saturating_add((h / 2).saturating_mul(w));
+    let nv12_needed = w
+        .saturating_mul(h)
+        .saturating_add((h / 2).saturating_mul(w));
 
     if y_pitch < w
         || uv_pitch < w

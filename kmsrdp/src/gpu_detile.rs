@@ -293,7 +293,9 @@ impl GpuDetiler {
             .map_err(|e| io::Error::other(format!("failed to load libgbm: {e}")))?;
         let gbm_device = unsafe { gbm_create_device(&gbm_lib, render_fd.as_raw_fd()) }?;
         let gbm_device_destroy: Option<GbmDeviceDestroy> =
-            unsafe { gbm_lib.get(b"gbm_device_destroy\0") }.ok().map(|s| *s);
+            unsafe { gbm_lib.get(b"gbm_device_destroy\0") }
+                .ok()
+                .map(|s| *s);
 
         let egl: EglInstance = unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required() }
             .map_err(|e| io::Error::other(format!("failed to load libEGL: {e}")))?;

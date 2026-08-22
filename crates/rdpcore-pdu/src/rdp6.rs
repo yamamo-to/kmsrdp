@@ -36,15 +36,12 @@ pub fn encode(bgrx: &[u8], width: usize, height: usize) -> Vec<u8> {
         let mut r = [0u8; MAX_STACK_PIXELS];
         let mut g = [0u8; MAX_STACK_PIXELS];
         let mut b = [0u8; MAX_STACK_PIXELS];
-        for (px, ((r_i, g_i), b_i)) in bgrx
-            .chunks_exact(4)
-            .zip(
-                r[..pixel_count]
-                    .iter_mut()
-                    .zip(g[..pixel_count].iter_mut())
-                    .zip(b[..pixel_count].iter_mut()),
-            )
-        {
+        for (px, ((r_i, g_i), b_i)) in bgrx.chunks_exact(4).zip(
+            r[..pixel_count]
+                .iter_mut()
+                .zip(g[..pixel_count].iter_mut())
+                .zip(b[..pixel_count].iter_mut()),
+        ) {
             *b_i = px[0];
             *g_i = px[1];
             *r_i = px[2];

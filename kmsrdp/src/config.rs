@@ -6,6 +6,7 @@
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -18,6 +19,10 @@ use crate::tls;
 /// desktop/uinput/FUSE mount across a huge client count.
 const MAX_SESSIONS_CAP: usize = 32;
 
+/// Capture loop period when neither `KMSRDP_FPS` nor `KMSRDP_FRAME_INTERVAL_MS`
+/// is set (20 fps).
+pub const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Runtime configuration gathered once at startup.
 #[derive(Clone)]
 pub struct Config {
@@ -28,6 +33,10 @@ pub struct Config {
     pub password: String,
     pub password_generated: bool,
     pub clipboard: ClipboardMode,
+    /// MS-RDPEGFX AVC420. Off by default — the library reads this via
+    /// [`rdpcore_server::RdpServerBuilder::with_gfx`], not `std::env`.
+    pub gfx_enabled: bool,
+    pub frame_interval: Duration,
 }
 
 impl fmt::Debug for Config {
@@ -40,6 +49,8 @@ impl fmt::Debug for Config {
             .field("password", &"[REDACTED]")
             .field("password_generated", &self.password_generated)
             .field("clipboard", &self.clipboard)
+            .field("gfx_enabled", &self.gfx_enabled)
+            .field("frame_interval", &self.frame_interval)
             .finish()
     }
 }
@@ -60,6 +71,8 @@ impl Config {
         let max_sessions = parse_max_sessions()?;
         let (username, password, password_generated) = load_credentials()?;
         let clipboard = parse_clipboard_mode();
+        let gfx_enabled = parse_bool_env("KMSRDP_GFX").unwrap_or(false);
+        let frame_interval = parse_frame_interval();
         Ok(Self {
             listen,
             require_nla,
@@ -68,6 +81,8 @@ impl Config {
             password,
             password_generated,
             clipboard,
+            gfx_enabled,
+            frame_interval,
         })
     }
 }
@@ -92,7 +107,7 @@ fn parse_max_sessions() -> Result<usize> {
     }
 }
 
-fn parse_bool_env(name: &str) -> Option<bool> {
+pub(crate) fn parse_bool_env(name: &str) -> Option<bool> {
     let raw = std::env::var(name).ok()?;
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -102,6 +117,33 @@ fn parse_bool_env(name: &str) -> Option<bool> {
             None
         }
     }
+}
+
+fn parse_frame_interval() -> Duration {
+    if let Ok(fps_str) = std::env::var("KMSRDP_FPS") {
+        match fps_str.trim().parse::<u32>() {
+            Ok(fps) if fps >= 1 => {
+                let clamped = fps.min(120);
+                return Duration::from_millis(u64::from((1000 / clamped).max(1)));
+            }
+            _ => {
+                tracing::warn!("KMSRDP_FPS={fps_str:?} is not an integer 1-120; ignoring");
+            }
+        }
+    }
+    if let Ok(ms_str) = std::env::var("KMSRDP_FRAME_INTERVAL_MS") {
+        match ms_str.trim().parse::<u64>() {
+            Ok(ms) if ms >= 1 => {
+                return Duration::from_millis(ms.clamp(8, 1000));
+            }
+            _ => {
+                tracing::warn!(
+                    "KMSRDP_FRAME_INTERVAL_MS={ms_str:?} is not an integer 8-1000; ignoring"
+                );
+            }
+        }
+    }
+    DEFAULT_FRAME_INTERVAL
 }
 
 fn parse_clipboard_mode() -> ClipboardMode {
@@ -369,6 +411,8 @@ mod tests {
             password: "super_secret_password".to_string(),
             password_generated: false,
             clipboard: ClipboardMode::Bidirectional,
+            gfx_enabled: false,
+            frame_interval: DEFAULT_FRAME_INTERVAL,
         };
         let formatted = format!("{cfg:?}");
         assert!(!formatted.contains("super_secret_password"));
@@ -380,6 +424,44 @@ mod tests {
         assert_eq!(trim_password_file("secret\n"), "secret");
         assert_eq!(trim_password_file("secret\r\n"), "secret");
         assert_eq!(trim_password_file(" leading space"), " leading space");
+    }
+
+    #[test]
+    fn gfx_defaults_off_and_accepts_truthy() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var("KMSRDP_GFX");
+        }
+        assert_eq!(parse_bool_env("KMSRDP_GFX"), None);
+        unsafe {
+            std::env::set_var("KMSRDP_GFX", "1");
+        }
+        assert_eq!(parse_bool_env("KMSRDP_GFX"), Some(true));
+        unsafe {
+            std::env::remove_var("KMSRDP_GFX");
+        }
+    }
+
+    #[test]
+    fn frame_interval_prefers_fps_then_ms() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var("KMSRDP_FPS");
+            std::env::remove_var("KMSRDP_FRAME_INTERVAL_MS");
+        }
+        assert_eq!(parse_frame_interval(), DEFAULT_FRAME_INTERVAL);
+        unsafe {
+            std::env::set_var("KMSRDP_FRAME_INTERVAL_MS", "40");
+        }
+        assert_eq!(parse_frame_interval(), Duration::from_millis(40));
+        unsafe {
+            std::env::set_var("KMSRDP_FPS", "20");
+        }
+        assert_eq!(parse_frame_interval(), Duration::from_millis(50));
+        unsafe {
+            std::env::remove_var("KMSRDP_FPS");
+            std::env::remove_var("KMSRDP_FRAME_INTERVAL_MS");
+        }
     }
 
     #[test]

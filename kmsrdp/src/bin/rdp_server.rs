@@ -257,7 +257,14 @@ async fn main() -> Result<()> {
             primary: m.primary,
         })
         .collect();
-    let hub = DisplayHub::start(width, height, mouse_scale.clone(), capturer, monitors);
+    let hub = DisplayHub::start(
+        width,
+        height,
+        mouse_scale.clone(),
+        capturer,
+        monitors,
+        cfg.frame_interval,
+    );
     let display = Display::new(hub);
 
     let credentials = Credentials {
@@ -331,6 +338,9 @@ async fn main() -> Result<()> {
             "NLA is optional (KMSRDP_REQUIRE_NLA=0); clients may authenticate with TLS + Client Info only"
         );
     }
+    if cfg.gfx_enabled {
+        tracing::info!("GFX AVC420 requested (KMSRDP_GFX); Planar/NSCodec remains the fallback");
+    }
     tracing::info!(max_sessions = cfg.max_sessions, "concurrent session limit");
     if cfg.max_sessions > 1 {
         tracing::warn!(
@@ -375,6 +385,7 @@ async fn main() -> Result<()> {
         .with_nla_credentials(Some(credentials))
         .with_require_nla(cfg.require_nla)
         .with_max_sessions(cfg.max_sessions)
+        .with_gfx(cfg.gfx_enabled)
         .build();
 
     let nla_desc = if cfg.require_nla {

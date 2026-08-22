@@ -390,7 +390,9 @@ fn worker() -> &'static std::sync::mpsc::Sender<std::sync::mpsc::Sender<GrabRepl
                     Some(c) => match c.grab() {
                         Ok(frame) => Ok(frame),
                         Err(e) => {
-                            tracing::warn!("kmsrdp: NvFBC grab failed ({e}); resetting session for retry");
+                            tracing::warn!(
+                                "kmsrdp: NvFBC grab failed ({e}); resetting session for retry"
+                            );
                             capturer = None;
                             retry_after = Some(Instant::now() + INIT_RETRY_BACKOFF);
                             Err(e)

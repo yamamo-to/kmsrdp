@@ -20,7 +20,7 @@ pub mod vaapi_enc;
 pub use encoder::{EncodedAu, H264Encoder, MockH264Encoder};
 pub use pdu::CHANNEL_NAME;
 pub use select::{SelectedEncoder, select_h264_encoder};
-pub use session::{GfxDvcHandler, GfxSession};
+pub use session::{GfxDvcHandler, GfxFrameResult, GfxSession};
 
 #[cfg(feature = "nvenc")]
 pub use nvenc_enc::NvencH264Encoder;

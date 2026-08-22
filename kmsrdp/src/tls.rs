@@ -73,10 +73,7 @@ pub fn build_acceptor() -> Result<TlsIdentity, TlsError> {
 }
 
 fn ephemeral_requested() -> bool {
-    matches!(
-        std::env::var("KMSRDP_TLS_EPHEMERAL").as_deref(),
-        Ok("1" | "true" | "yes" | "on")
-    )
+    crate::config::parse_bool_env("KMSRDP_TLS_EPHEMERAL").unwrap_or(false)
 }
 
 fn generate_identity(

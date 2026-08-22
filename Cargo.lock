@@ -2348,6 +2348,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "rcgen",
  "rdpcore-cliprdr",
  "rdpcore-connector",
  "rdpcore-dvc",

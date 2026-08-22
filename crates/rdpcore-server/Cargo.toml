@@ -27,9 +27,12 @@ zeroize = { version = "1", features = ["derive"] }
 [features]
 default = []
 # MS-RDPEGFX + OpenH264 AVC420 path. Enabled by the kmsrdp binary's
-# default `gfx` feature; opt-in at runtime with KMSRDP_GFX=1.
+# default `gfx` feature; opt-in at runtime via RdpServerBuilder::with_gfx.
 gfx = ["dep:rdpcore-rdpegfx", "rdpcore-rdpegfx/openh264"]
 gfx-vaapi = ["gfx", "rdpcore-rdpegfx/vaapi"]
 gfx-nvenc = ["gfx", "rdpcore-rdpegfx/nvenc"]
 dvc-echo = ["rdpcore-dvc/echo"]
+
+[dev-dependencies]
+rcgen = "0.14.8"
 

@@ -19,6 +19,21 @@ const QUEUE_DEPTH_UNAVAILABLE: u32 = 0xffff_ffff;
 /// Force an IDR at least this often so a lost/corrupt frame cannot leave
 /// the client stuck on a black surface forever.
 const IDR_INTERVAL_FRAMES: u64 = 30;
+/// Consecutive empty/failed encodes before tearing down GFX and letting
+/// the server paint Planar/NSCodec instead of leaving a black surface.
+const ENCODE_FAIL_FALLBACK: u32 = 3;
+
+/// Result of one GFX encode attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GfxFrameResult {
+    /// Wire PDUs to send on the GFX channel.
+    Frames(Vec<Vec<u8>>),
+    /// Transient skip; stay on GFX (do not paint Planar over the surface).
+    Skip,
+    /// Abandon GFX for this connection. `teardown` is DeleteSurface (if any)
+    /// so the client can drop the H.264 surface before Planar resumes.
+    Fallback { teardown: Vec<Vec<u8>> },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -40,6 +55,7 @@ struct Inner {
     encoder: Box<dyn H264Encoder>,
     force_next_idr: bool,
     timestamp_ms: u32,
+    encode_failures: u32,
 }
 
 impl Inner {
@@ -56,6 +72,7 @@ impl Inner {
             encoder,
             force_next_idr: true,
             timestamp_ms: 0,
+            encode_failures: 0,
         }
     }
 
@@ -93,6 +110,7 @@ impl Inner {
         self.force_next_idr = true;
         self.frames_in_flight = 0;
         self.frames_sent = 0;
+        self.encode_failures = 0;
         self.encoder.reset();
         info!(
             version = format_args!("0x{:08x}", selected.version),
@@ -191,30 +209,56 @@ impl Inner {
         Some(out)
     }
 
+    fn abandon(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        if self.surface_configured {
+            out.push(pdu::encode_segmented_single(&pdu::encode_delete_surface(
+                self.surface_id,
+            )));
+            self.surface_configured = false;
+        }
+        self.state = State::Failed;
+        out
+    }
+
+    fn record_encode_failure(&mut self) -> GfxFrameResult {
+        self.encode_failures = self.encode_failures.saturating_add(1);
+        if self.encode_failures >= ENCODE_FAIL_FALLBACK {
+            warn!(
+                failures = self.encode_failures,
+                "GFX H.264 encode failed repeatedly; falling back to Planar/NSCodec"
+            );
+            return GfxFrameResult::Fallback {
+                teardown: self.abandon(),
+            };
+        }
+        GfxFrameResult::Skip
+    }
+
     fn encode_frame(
         &mut self,
         width: u16,
         height: u16,
         stride: usize,
         pixels: &[u8],
-    ) -> Option<Vec<Vec<u8>>> {
+    ) -> GfxFrameResult {
         if self.state != State::Ready {
-            return None;
+            return GfxFrameResult::Skip;
         }
         if width == 0 || height == 0 {
-            return None;
+            return GfxFrameResult::Skip;
         }
 
         let mut prefix = Vec::new();
         if !self.surface_configured || self.width != width || self.height != height {
             match self.resize(width, height) {
                 Some(pdus) => prefix = pdus,
-                None if self.state != State::Ready => return None,
+                None if self.state != State::Ready => return GfxFrameResult::Skip,
                 None => {}
             }
         }
         if !self.surface_configured {
-            return None;
+            return GfxFrameResult::Skip;
         }
 
         if self.frames_in_flight >= MAX_FRAMES_IN_FLIGHT {
@@ -242,15 +286,16 @@ impl Inner {
                     Ok(au) if !au.annex_b.is_empty() => au,
                     Ok(_) => {
                         debug!("GFX H.264 encode skipped (empty bitstream)");
-                        return None;
+                        return self.record_encode_failure();
                     }
                     Err(e) => {
                         warn!(error = %e, "GFX H.264 encode failed");
-                        return None;
+                        return self.record_encode_failure();
                     }
                 }
             }
         };
+        self.encode_failures = 0;
         self.force_next_idr = false;
 
         let frame_id = self.next_frame_id;
@@ -282,7 +327,7 @@ impl Inner {
                 "GFX frame sent"
             );
         }
-        Some(prefix)
+        GfxFrameResult::Frames(prefix)
     }
 }
 
@@ -327,7 +372,7 @@ impl GfxSession {
         height: u16,
         stride: usize,
         pixels: &[u8],
-    ) -> Option<Vec<Vec<u8>>> {
+    ) -> GfxFrameResult {
         self.inner
             .lock()
             .unwrap()
@@ -408,6 +453,13 @@ mod tests {
     use crate::pdu::{CAP_VERSION_81, CAPS_FLAG_AVC420_ENABLED};
     use rdpcore_pdu::cursor::WriteBuf;
 
+    fn expect_frames(result: GfxFrameResult) -> Vec<Vec<u8>> {
+        match result {
+            GfxFrameResult::Frames(frames) => frames,
+            other => panic!("expected Frames, got {other:?}"),
+        }
+    }
+
     fn encode_caps_advertise_for_test(sets: &[RawCapabilitySet]) -> Vec<u8> {
         let mut body = Vec::new();
         body.write_u16_le(sets.len() as u16);
@@ -438,7 +490,7 @@ mod tests {
         assert!(session.is_ready());
 
         let pixels = vec![0u8; 64 * 64 * 4];
-        let frames = session.encode_frame(64, 64, 64 * 4, &pixels).unwrap();
+        let frames = expect_frames(session.encode_frame(64, 64, 64 * 4, &pixels));
         // Start + Wire + End (surface already configured)
         assert_eq!(frames.len(), 3);
         assert!(frames.iter().all(|r| r[0] == 0xe0));
@@ -465,14 +517,14 @@ mod tests {
         )]);
         assert_eq!(handler.on_data(&advertise).len(), 4);
         let pixels = vec![0u8; 64 * 64 * 4];
-        let first = session.encode_frame(64, 64, 64 * 4, &pixels).unwrap();
+        let first = expect_frames(session.encode_frame(64, 64, 64 * 4, &pixels));
         assert_eq!(first.len(), 3); // Start+Wire+End
 
         // Second CapsAdvertise: Delete + CapsConfirm + Reset + Create + Map
         let replies = handler.on_data(&advertise);
         assert_eq!(replies.len(), 5);
 
-        let second = session.encode_frame(64, 64, 64 * 4, &pixels).unwrap();
+        let second = expect_frames(session.encode_frame(64, 64, 64 * 4, &pixels));
         assert_eq!(second.len(), 3);
     }
 
@@ -486,9 +538,9 @@ mod tests {
         )]);
         let _ = handler.on_data(&advertise);
         let pixels = vec![0u8; 64 * 64 * 4];
-        let _ = session.encode_frame(64, 64, 64 * 4, &pixels).unwrap();
+        let _ = expect_frames(session.encode_frame(64, 64, 64 * 4, &pixels));
         let pixels2 = vec![0u8; 80 * 48 * 4];
-        let frames = session.encode_frame(80, 48, 80 * 4, &pixels2).unwrap();
+        let frames = expect_frames(session.encode_frame(80, 48, 80 * 4, &pixels2));
         // Delete + Reset + Create + Map + Start + Wire + End
         assert_eq!(frames.len(), 7);
     }
@@ -517,7 +569,7 @@ mod tests {
         )]);
         let _ = handler.on_data(&advertise);
         let pixels = vec![0u8; 32 * 32 * 4];
-        let frames = session.encode_frame(32, 32, 32 * 4, &pixels).unwrap();
+        let frames = expect_frames(session.encode_frame(32, 32, 32 * 4, &pixels));
         assert_eq!(segmented_cmd_id(&frames[0]), 0x000b); // StartFrame
         assert_eq!(segmented_cmd_id(&frames[1]), 0x0001); // WireToSurface1
         assert_eq!(segmented_cmd_id(&frames[2]), 0x000c); // EndFrame
@@ -533,7 +585,10 @@ mod tests {
     fn encode_before_caps_or_zero_size_returns_none() {
         let session = GfxSession::mock(64, 64);
         let pixels = vec![0u8; 64 * 64 * 4];
-        assert!(session.encode_frame(64, 64, 64 * 4, &pixels).is_none());
+        assert_eq!(
+            session.encode_frame(64, 64, 64 * 4, &pixels),
+            GfxFrameResult::Skip
+        );
 
         let mut handler = session.dvc_handler();
         let advertise = encode_caps_advertise_for_test(&[RawCapabilitySet::flags_only(
@@ -541,8 +596,11 @@ mod tests {
             CAPS_FLAG_AVC420_ENABLED,
         )]);
         let _ = handler.on_data(&advertise);
-        assert!(session.encode_frame(0, 64, 0, &[]).is_none());
-        assert!(session.encode_frame(64, 0, 64 * 4, &pixels).is_none());
+        assert_eq!(session.encode_frame(0, 64, 0, &[]), GfxFrameResult::Skip);
+        assert_eq!(
+            session.encode_frame(64, 0, 64 * 4, &pixels),
+            GfxFrameResult::Skip
+        );
     }
 
     #[test]
@@ -556,7 +614,7 @@ mod tests {
         let _ = handler.on_data(&advertise);
         let pixels = vec![0u8; 16 * 16 * 4];
         for _ in 0..5 {
-            let _ = session.encode_frame(16, 16, 16 * 4, &pixels).unwrap();
+            let _ = expect_frames(session.encode_frame(16, 16, 16 * 4, &pixels));
         }
         // QUEUE_DEPTH_UNAVAILABLE
         let mut ack = Vec::new();
@@ -568,7 +626,10 @@ mod tests {
         ack.write_u32_le(5);
         assert!(handler.on_data(&ack).is_empty());
         // Still able to encode after ack (session not stuck)
-        assert!(session.encode_frame(16, 16, 16 * 4, &pixels).is_some());
+        assert!(matches!(
+            session.encode_frame(16, 16, 16 * 4, &pixels),
+            GfxFrameResult::Frames(_)
+        ));
     }
 
     #[test]
@@ -659,7 +720,7 @@ mod tests {
         )]);
         let _ = handler.on_data(&advertise);
         let pixels = vec![0u8; 16 * 16 * 4];
-        let frames = session.encode_frame(16, 16, 16 * 4, &pixels).unwrap();
+        let frames = expect_frames(session.encode_frame(16, 16, 16 * 4, &pixels));
         assert_eq!(frames.len(), 3);
         let bitmap = wire_bitmap_payload(&frames[1]);
         assert_eq!(bitmap[18], 0x65); // forced IDR on retry
@@ -696,7 +757,32 @@ mod tests {
         )]);
         let _ = handler.on_data(&advertise);
         let pixels = vec![0u8; 16 * 16 * 4];
-        assert!(session.encode_frame(16, 16, 16 * 4, &pixels).is_none());
+        assert_eq!(
+            session.encode_frame(16, 16, 16 * 4, &pixels),
+            GfxFrameResult::Skip
+        );
+        assert!(!session.failed());
+    }
+
+    #[test]
+    fn encode_fallback_teardown_is_delete_surface() {
+        let session = GfxSession::new(Box::new(EmptyEncoder), 16, 16);
+        let mut handler = session.dvc_handler();
+        let advertise = encode_caps_advertise_for_test(&[RawCapabilitySet::flags_only(
+            CAP_VERSION_81,
+            CAPS_FLAG_AVC420_ENABLED,
+        )]);
+        let _ = handler.on_data(&advertise);
+        let pixels = vec![0u8; 16 * 16 * 4];
+        let mut result = GfxFrameResult::Skip;
+        for _ in 0..super::ENCODE_FAIL_FALLBACK {
+            result = session.encode_frame(16, 16, 16 * 4, &pixels);
+        }
+        let GfxFrameResult::Fallback { teardown } = result else {
+            panic!("expected Fallback, got {result:?}");
+        };
+        assert_eq!(teardown.len(), 1);
+        assert_eq!(segmented_cmd_id(&teardown[0]), 0x000a); // DeleteSurface
     }
 
     #[test]

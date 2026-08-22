@@ -56,6 +56,7 @@ impl DisplayHub {
         mouse_scale: MouseScale,
         capturer: capture::Capturer,
         monitors: Vec<MonitorLayoutEntry>,
+        frame_interval: Duration,
     ) -> Arc<Self> {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let hub = Arc::new(Self {
@@ -67,7 +68,7 @@ impl DisplayHub {
         });
         let capture_hub = Arc::clone(&hub);
         tokio::spawn(async move {
-            capture_hub.run_capture_loop(capturer).await;
+            capture_hub.run_capture_loop(capturer, frame_interval).await;
         });
         hub
     }
@@ -80,7 +81,11 @@ impl DisplayHub {
         }
     }
 
-    async fn run_capture_loop(self: Arc<Self>, capturer: capture::Capturer) {
+    async fn run_capture_loop(
+        self: Arc<Self>,
+        capturer: capture::Capturer,
+        frame_interval: Duration,
+    ) {
         /// Prior frame pixels shared with `latest_full` via [`Arc`] so the
         /// dirty-rect pass does not need a second framebuffer copy.
         struct PrevFrame {
@@ -92,7 +97,7 @@ impl DisplayHub {
         let mut previous: Option<PrevFrame> = None;
         let mut negotiated_size = *Self::lock(&self.size);
         let mut consecutive_failures: u32 = 0;
-        let interval = frame_interval();
+        let interval = frame_interval;
         let mut capturer = Some(capturer);
         loop {
             let current = capturer
@@ -293,22 +298,6 @@ fn capture_retry_backoff(consecutive: u32) -> Duration {
     Duration::from_secs(secs.max(1))
 }
 
-fn frame_interval() -> Duration {
-    if let Ok(fps_str) = std::env::var("KMSRDP_FPS")
-        && let Ok(fps) = fps_str.trim().parse::<u32>()
-    {
-        let clamped = fps.clamp(1, 120);
-        return Duration::from_millis((1000 / clamped).max(1) as u64);
-    }
-    if let Ok(ms_str) = std::env::var("KMSRDP_FRAME_INTERVAL_MS")
-        && let Ok(ms) = ms_str.trim().parse::<u64>()
-    {
-        let clamped = ms.clamp(8, 1000);
-        return Duration::from_millis(clamped);
-    }
-    Duration::from_millis(50)
-}
-
 /// Log the 1st failure, then every 20th, so a dead CRTC is obvious without
 /// flooding the journal at ~20 Hz.
 fn should_log_capture_failure(consecutive: u32) -> bool {
@@ -440,14 +429,6 @@ mod tests {
     #[test]
     fn empty_dirty_frames_stay_empty() {
         assert!(coalesce_dirty_rects(Vec::new(), 1920, 1080).is_empty());
-    }
-
-    #[test]
-    fn default_frame_interval_is_fifty_millis() {
-        assert_eq!(
-            super::frame_interval(),
-            std::time::Duration::from_millis(50)
-        );
     }
 
     #[test]

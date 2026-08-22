@@ -25,7 +25,7 @@ use tracing::Instrument as _;
 use tracing::{debug, info, info_span, warn};
 
 use crate::auth_limit::AuthLimiter;
-use crate::credentials::{CredentialValidator, Credentials, eq_ignore_ascii_case_ct};
+use crate::credentials::{CredentialValidator, Credentials};
 use crate::credssp;
 use crate::display::{BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay};
 use crate::encode::{
@@ -54,6 +54,8 @@ pub struct RdpServerBuilder {
     drive_factory: Option<Arc<dyn DriveConsumerFactory>>,
     require_nla: bool,
     max_sessions: usize,
+    #[cfg(feature = "gfx")]
+    gfx_enabled: bool,
     #[cfg(feature = "dvc-echo")]
     echo_smoke_test: bool,
 }
@@ -75,6 +77,8 @@ impl RdpServerBuilder {
             drive_factory: None,
             require_nla: false,
             max_sessions: 1,
+            #[cfg(feature = "gfx")]
+            gfx_enabled: false,
             #[cfg(feature = "dvc-echo")]
             echo_smoke_test: false,
         }
@@ -144,6 +148,23 @@ impl RdpServerBuilder {
         self
     }
 
+    /// Enable MS-RDPEGFX AVC420 when the `gfx` cargo feature is compiled in.
+    /// Callers pass a parsed flag (e.g. from `KMSRDP_GFX`); this crate does
+    /// not read process environment itself.
+    pub fn with_gfx(self, enabled: bool) -> Self {
+        #[cfg(feature = "gfx")]
+        {
+            let mut this = self;
+            this.gfx_enabled = enabled;
+            this
+        }
+        #[cfg(not(feature = "gfx"))]
+        {
+            let _ = enabled;
+            self
+        }
+    }
+
     pub fn with_sound_factory(mut self, factory: Option<Box<dyn SoundServerFactory>>) -> Self {
         self.sound_factory = factory.map(Arc::from);
         self
@@ -196,6 +217,8 @@ impl RdpServerBuilder {
             audio_input_factory: self.audio_input_factory,
             drive_factory: self.drive_factory,
             require_nla: self.require_nla,
+            #[cfg(feature = "gfx")]
+            gfx_enabled: self.gfx_enabled,
             #[cfg(feature = "dvc-echo")]
             echo_smoke_test: self.echo_smoke_test,
             handshake_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES)),
@@ -227,6 +250,8 @@ pub struct RdpServer {
     audio_input_factory: Option<Arc<dyn AudioInputBackendFactory>>,
     drive_factory: Option<Arc<dyn DriveConsumerFactory>>,
     require_nla: bool,
+    #[cfg(feature = "gfx")]
+    gfx_enabled: bool,
     #[cfg(feature = "dvc-echo")]
     echo_smoke_test: bool,
     handshake_permits: Arc<tokio::sync::Semaphore>,
@@ -249,6 +274,8 @@ struct Session {
     audio_input_factory: Option<Arc<dyn AudioInputBackendFactory>>,
     drive_factory: Option<Arc<dyn DriveConsumerFactory>>,
     require_nla: bool,
+    #[cfg(feature = "gfx")]
+    gfx_enabled: bool,
     #[cfg(feature = "dvc-echo")]
     echo_smoke_test: bool,
     session_slots: Arc<tokio::sync::Semaphore>,
@@ -273,6 +300,8 @@ impl RdpServer {
             audio_input_factory: self.audio_input_factory.clone(),
             drive_factory: self.drive_factory.clone(),
             require_nla: self.require_nla,
+            #[cfg(feature = "gfx")]
+            gfx_enabled: self.gfx_enabled,
             #[cfg(feature = "dvc-echo")]
             echo_smoke_test: self.echo_smoke_test,
             session_slots: Arc::clone(&self.session_slots),
@@ -514,41 +543,27 @@ impl Session {
                         // session to that identity: empty ClientInfo
                         // usernames (mstsc after NLA) are filled in as the
                         // NLA account; a non-empty mismatch is rejected.
-                        let (_, client_user) = crate::credentials::normalize_client_identity(
+                        crate::credentials::client_info_is_authorized(
+                            Some(nla_user),
+                            self.credential_validator.as_deref(),
                             &credentials.username,
+                            &credentials.password,
                             &credentials.domain,
-                        );
-                        if client_user.is_empty() {
-                            true
-                        } else if !eq_ignore_ascii_case_ct(&client_user, nla_user) {
-                            warn!(
-                                "ClientInfo username {:?} does not match NLA authenticated user {:?}",
-                                credentials.username, nla_user
-                            );
-                            false
-                        } else {
-                            true
-                        }
+                        )
                     } else {
-                        match &self.credential_validator {
-                            Some(validator) => validator.validate(
-                                &credentials.username,
-                                &credentials.password,
-                                &credentials.domain,
-                            ),
-                            None => {
-                                warn!(
-                                    "rejecting Client Info auth: no credential validator configured"
-                                );
-                                false
-                            }
-                        }
+                        crate::credentials::client_info_is_authorized(
+                            None,
+                            self.credential_validator.as_deref(),
+                            &credentials.username,
+                            &credentials.password,
+                            &credentials.domain,
+                        )
                     };
                     if !valid {
                         let password_hint = if credentials.password.is_empty() {
-                            "password empty (mstsc did not send one - enter the KMSRDP_PASSWORD in the client, or enable NLA)"
+                            "password empty (client did not send one — enter the password in the client, or enable NLA)"
                         } else {
-                            "password non-empty but does not match KMSRDP_PASSWORD"
+                            "password non-empty but does not match"
                         };
                         warn!(
                             "rejecting invalid credentials for user {:?} domain {:?} ({password_hint})",
@@ -751,7 +766,7 @@ impl Session {
         });
 
         #[cfg(feature = "gfx")]
-        let gfx_session = if gfx_env_enabled() {
+        let gfx_session = if self.gfx_enabled {
             match select_h264_encoder() {
                 Ok(selected) => {
                     let session = GfxSession::new(
@@ -778,7 +793,7 @@ impl Session {
                 }
             }
         } else {
-            info!("GFX disabled (KMSRDP_GFX=0); using Planar/NSCodec");
+            info!("GFX disabled; using Planar/NSCodec");
             None
         };
 
@@ -1291,6 +1306,9 @@ enum GfxEncodeOutcome {
     /// OpenH264 RC): keep the GFX path so we do not paint Planar over a
     /// black H.264 surface, but there is nothing to send this tick.
     SoftSkip,
+    /// GFX is abandoned for this connection: send optional teardown PDUs, then
+    /// fall through to Planar/NSCodec without dropping the session.
+    Disable { teardown: Vec<Vec<u8>> },
 }
 
 /// Runs the GFX H.264 encode for one frame, if applicable.
@@ -1331,13 +1349,14 @@ async fn try_encode_gfx_frame(
     .await
     .map_err(|_| ())?;
     match payloads {
-        Some(payloads) => {
+        rdpcore_rdpegfx::GfxFrameResult::Frames(payloads) => {
             *last_gfx_data = Some(source_data);
             Ok(GfxEncodeOutcome::Send(payloads))
         }
-        // Hard encoder init failures never register the GFX channel in the
-        // first place, so reaching here is always the soft-skip case.
-        None => Ok(GfxEncodeOutcome::SoftSkip),
+        rdpcore_rdpegfx::GfxFrameResult::Skip => Ok(GfxEncodeOutcome::SoftSkip),
+        rdpcore_rdpegfx::GfxFrameResult::Fallback { teardown } => {
+            Ok(GfxEncodeOutcome::Disable { teardown })
+        }
     }
 }
 
@@ -1356,6 +1375,14 @@ fn apply_gfx_encode_outcome(
             let mux = dvc.ok_or(())?;
             send_gfx_payloads(mux, frame_sender, payloads)?;
             Ok(true)
+        }
+        GfxEncodeOutcome::Disable { teardown } => {
+            if !teardown.is_empty()
+                && let Some(mux) = dvc
+            {
+                let _ = send_gfx_payloads(mux, frame_sender, teardown);
+            }
+            Ok(false)
         }
     }
 }
@@ -1382,23 +1409,6 @@ fn send_gfx_payloads(
         }
     }
     Ok(())
-}
-
-#[cfg(feature = "gfx")]
-fn gfx_env_enabled() -> bool {
-    // Opt-in until the AVC420 path is stable with mstsc. A GFX protocol
-    // error otherwise drops the session and some clients refuse to reconnect
-    // until the server process is restarted. Set KMSRDP_GFX=1 to enable.
-    match std::env::var("KMSRDP_GFX") {
-        Ok(v) => {
-            let v = v.trim();
-            v == "1"
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("on")
-                || v.eq_ignore_ascii_case("yes")
-        }
-        Err(_) => false,
-    }
 }
 
 /// Awaits the next message from an optional channel - never resolves if
@@ -1758,3 +1768,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "handshake_tests.rs"]
+mod handshake_tests;

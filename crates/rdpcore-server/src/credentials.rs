@@ -89,6 +89,32 @@ pub fn eq_ignore_ascii_case_ct(a: &str, b: &str) -> bool {
     body && lens
 }
 
+/// Whether Client Info credentials are acceptable after TLS (and optional NLA).
+///
+/// When `nla_authenticated_user` is set, CredSSP already proved the account;
+/// an empty Client Info username (mstsc after NLA) is filled in as that
+/// account, and a non-empty mismatch is rejected. Without NLA the optional
+/// [`CredentialValidator`] is consulted; missing validator is a reject.
+pub(crate) fn client_info_is_authorized(
+    nla_authenticated_user: Option<&str>,
+    validator: Option<&dyn CredentialValidator>,
+    username: &str,
+    password: &str,
+    domain: &str,
+) -> bool {
+    if let Some(nla_user) = nla_authenticated_user {
+        let (_, client_user) = normalize_client_identity(username, domain);
+        if client_user.is_empty() {
+            return true;
+        }
+        return eq_ignore_ascii_case_ct(&client_user, nla_user);
+    }
+    match validator {
+        Some(validator) => validator.validate(username, password, domain),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +194,65 @@ mod tests {
         assert!(!eq_ignore_ascii_case_ct("kmsrdp", "kmsrd"));
         assert!(!eq_ignore_ascii_case_ct("kmsrdp", "kmsrdpx"));
         assert!(!eq_ignore_ascii_case_ct("abc", "abd"));
+    }
+
+    #[test]
+    fn client_info_nla_accepts_empty_or_matching_username() {
+        let v = validator("kmsrdp", "hunter2");
+        assert!(client_info_is_authorized(
+            Some("kmsrdp"),
+            Some(&v),
+            "",
+            "",
+            ""
+        ));
+        assert!(client_info_is_authorized(
+            Some("kmsrdp"),
+            Some(&v),
+            "KMSRDP",
+            "ignored",
+            ""
+        ));
+        assert!(client_info_is_authorized(
+            Some("kmsrdp"),
+            Some(&v),
+            r"WORKGROUP\kmsrdp",
+            "",
+            ""
+        ));
+    }
+
+    #[test]
+    fn client_info_nla_rejects_mismatched_username() {
+        let v = validator("kmsrdp", "hunter2");
+        assert!(!client_info_is_authorized(
+            Some("kmsrdp"),
+            Some(&v),
+            "other",
+            "hunter2",
+            ""
+        ));
+    }
+
+    #[test]
+    fn client_info_tls_only_uses_validator() {
+        let v = validator("kmsrdp", "hunter2");
+        assert!(client_info_is_authorized(
+            None,
+            Some(&v),
+            "kmsrdp",
+            "hunter2",
+            ""
+        ));
+        assert!(!client_info_is_authorized(
+            None,
+            Some(&v),
+            "kmsrdp",
+            "wrong",
+            ""
+        ));
+        assert!(!client_info_is_authorized(
+            None, None, "kmsrdp", "hunter2", ""
+        ));
     }
 }
