@@ -102,7 +102,9 @@ mod tests {
         send_to_socket("READY=1", sock_path.as_os_str()).expect("send notification");
 
         let mut buf = [0u8; 64];
-        let (len, _) = server_sock.recv_from(&mut buf).expect("receive notification");
+        let (len, _) = server_sock
+            .recv_from(&mut buf)
+            .expect("receive notification");
         assert_eq!(&buf[..len], b"READY=1");
 
         let _ = std::fs::remove_file(&sock_path);

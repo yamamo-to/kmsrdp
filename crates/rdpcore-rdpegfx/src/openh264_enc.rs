@@ -130,7 +130,9 @@ impl H264Encoder for OpenH264Encoder {
 
         let annex_b = bitstream.to_vec();
         if annex_b.is_empty() {
-            return Err(EncoderError::EncodeFailed("openh264 returned empty bitstream".into()));
+            return Err(EncoderError::EncodeFailed(
+                "openh264 returned empty bitstream".into(),
+            ));
         }
         Ok(EncodedAu {
             annex_b,
