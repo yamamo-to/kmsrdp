@@ -4,30 +4,35 @@
 //! endian throughout except one field noted below); riding directly as the
 //! whole static-channel payload, no extra wrapper.
 //!
-//! Scope: Server/Client Audio Formats (`SNDC_FORMATS`), Training/
-//! TrainingConfirm (`SNDC_TRAINING` - mandatory in practice: a real
-//! server's format negotiation doesn't complete without it, even though
-//! nothing in this exchange is configurable), and Wave2 (`SNDC_WAVE2`, the
-//! modern single-PDU wave-data format, avoiding the legacy split Wave/
-//! WaveInfo two-PDU dance). WaveConfirm (`SNDC_WAVECONFIRM`) is decoded
-//! only enough to skip over it - a real server implementation doesn't wait
-//! for it before sending more audio, so this one doesn't either.
+//! Scope: Server/Client Audio Formats (`SNDC_FORMATS`), Quality Mode
+//! (`SNDC_QUALITYMODE`, required when both sides are ≥ v6), Training/
+//! TrainingConfirm (`SNDC_TRAINING`), Wave2 (`SNDC_WAVE2`, when both sides
+//! are ≥ v8), and the legacy WaveInfo + Wave pair for older clients.
+//! WaveConfirm (`SNDC_WAVECONFIRM`) is decoded only enough to skip over
+//! it - a real server implementation doesn't wait for it before sending
+//! more audio, so this one doesn't either.
 
 use rdpcore_pdu::DecodeError;
 use rdpcore_pdu::cursor::{ReadCursor, WriteBuf};
 
+pub const SNDC_WAVE: u8 = 0x02;
 pub const SNDC_WAVE2: u8 = 0x0D;
 pub const SNDC_WAVECONFIRM: u8 = 0x05;
 pub const SNDC_TRAINING: u8 = 0x06;
 pub const SNDC_FORMATS: u8 = 0x07;
+pub const SNDC_QUALITYMODE: u8 = 0x0C;
 
 pub const CHANNEL_NAME: &str = "rdpsnd";
 
-/// Below `Version::V6` (0x06) in a real implementation's own numbering, so
-/// a real client skips the newer, optional Quality Mode negotiation step
-/// and goes straight from Client Audio Formats to Training - one fewer PDU
-/// type this from-scratch implementation needs to speak.
-const SERVER_VERSION: u16 = 0x02;
+/// MS-RDPEA protocol versions. Wave2 (SNDC_WAVE2) is legal only when
+/// *both* sides advertise at least [`VERSION_V8`]; otherwise the server
+/// must send the legacy WaveInfo + Wave pair. Quality Mode is required
+/// when both sides are at least [`VERSION_V6`].
+pub const VERSION_V2: u16 = 0x02;
+pub const VERSION_V6: u16 = 0x06;
+pub const VERSION_V8: u16 = 0x08;
+
+const SERVER_VERSION: u16 = VERSION_V8;
 
 fn write_header(out: &mut Vec<u8>, msg_type: u8, body_len: usize) {
     out.write_u8(msg_type);
@@ -143,6 +148,7 @@ pub fn encode_server_audio_formats(formats: &[AudioFormat]) -> Vec<u8> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAudioFormats {
     pub formats: Vec<AudioFormat>,
+    pub version: u16,
 }
 
 fn decode_client_audio_formats(body: &[u8]) -> Result<ClientAudioFormats, DecodeError> {
@@ -153,7 +159,7 @@ fn decode_client_audio_formats(body: &[u8]) -> Result<ClientAudioFormats, Decode
     let _dgram_port = cursor.read_u16_be()?; // the one big-endian field in this whole protocol
     let count = cursor.read_u16_le()?;
     let _last_block_confirmed = cursor.read_u8()?;
-    let _version = cursor.read_u16_le()?;
+    let version = cursor.read_u16_le()?;
     let _pad = cursor.read_u8()?;
     // Each format is at least 18 bytes (fixed WAVEFORMATEX fields before
     // its variable-length extra data) - reject counts that can't possibly
@@ -167,7 +173,7 @@ fn decode_client_audio_formats(body: &[u8]) -> Result<ClientAudioFormats, Decode
     let formats = (0..count)
         .map(|_| AudioFormat::decode(&mut cursor))
         .collect::<Result<_, _>>()?;
-    Ok(ClientAudioFormats { formats })
+    Ok(ClientAudioFormats { formats, version })
 }
 
 /// Server -> client, `SNDC_TRAINING`. Every field is a fixed placeholder -
@@ -190,6 +196,44 @@ pub fn encode_training() -> Vec<u8> {
 /// multiple PDUs - `encode_wave2` itself just asserts the invariant rather
 /// than silently truncating the wire length field.
 pub const MAX_WAVE2_CHUNK_BYTES: usize = u16::MAX as usize - 12;
+
+/// Largest `data` that fits in one WaveInfo + Wave pair: WaveInfo's
+/// `BodySize` is `8 + data.len()` and must fit in a `u16`.
+pub const MAX_WAVE_INFO_CHUNK_BYTES: usize = u16::MAX as usize - 8;
+
+/// Pre-v8 WaveInfo PDU (SNDC_WAVE): header + first 4 PCM bytes.
+/// `BodySize` is `8 + pcm.len()` (the Wave PDU that follows is counted
+/// into this field per MS-RDPEA 2.2.3.3). `pcm` must be at least 4 bytes.
+pub fn encode_wave_info(format_no: u16, block_no: u8, timestamp_ms: u16, pcm: &[u8]) -> Vec<u8> {
+    debug_assert!(
+        pcm.len() >= 4,
+        "encode_wave_info: WaveInfo needs the first 4 PCM bytes"
+    );
+    debug_assert!(
+        pcm.len() <= MAX_WAVE_INFO_CHUNK_BYTES,
+        "encode_wave_info: {} bytes exceeds the u16 BodySize field - caller must split",
+        pcm.len()
+    );
+    let body_len = 8 + pcm.len();
+    let mut out = Vec::with_capacity(16);
+    write_header(&mut out, SNDC_WAVE, body_len);
+    out.write_u16_le(timestamp_ms);
+    out.write_u16_le(format_no);
+    out.write_u8(block_no);
+    out.write_slice(&[0u8; 3]);
+    out.write_slice(&pcm[..4]);
+    out
+}
+
+/// Pre-v8 Wave PDU: 4-byte zero pad + the PCM after the 4 bytes already
+/// sent in WaveInfo. No SNDPROLOG header.
+pub fn encode_wave_rest(pcm: &[u8]) -> Vec<u8> {
+    debug_assert!(pcm.len() >= 4);
+    let mut out = Vec::with_capacity(pcm.len());
+    out.write_u32_le(0);
+    out.write_slice(&pcm[4..]);
+    out
+}
 
 pub fn encode_wave2(format_no: u16, block_no: u8, timestamp_ms: u32, data: &[u8]) -> Vec<u8> {
     debug_assert!(
@@ -247,6 +291,7 @@ pub fn negotiate_formats(
 pub enum ClientMessage {
     AudioFormats(ClientAudioFormats),
     TrainingConfirm,
+    QualityMode,
     Other,
 }
 
@@ -262,6 +307,7 @@ pub fn decode_client_message(input: &[u8]) -> Result<ClientMessage, DecodeError>
             body,
         )?)),
         SNDC_TRAINING => Ok(ClientMessage::TrainingConfirm),
+        SNDC_QUALITYMODE => Ok(ClientMessage::QualityMode),
         _ => Ok(ClientMessage::Other),
     }
 }
@@ -308,6 +354,7 @@ mod tests {
             decoded,
             ClientMessage::AudioFormats(ClientAudioFormats {
                 formats: vec![AudioFormat::pcm(2, 44100, 16)],
+                version: VERSION_V6,
             })
         );
     }
@@ -334,6 +381,27 @@ mod tests {
     }
 
     #[test]
+    fn quality_mode_is_recognized() {
+        let mut pdu = Vec::new();
+        write_header(&mut pdu, SNDC_QUALITYMODE, 4);
+        pdu.write_u16_le(0); // DYNAMIC
+        pdu.write_u16_le(0);
+        assert_eq!(
+            decode_client_message(&pdu).unwrap(),
+            ClientMessage::QualityMode
+        );
+    }
+
+    #[test]
+    fn server_audio_formats_advertises_version_8() {
+        let encoded = encode_server_audio_formats(&[AudioFormat::pcm(2, 48000, 16)]);
+        // Header (4) + dwFlags/dwVolume/dwPitch (12) + wDGramPort (2) +
+        // wNumberOfFormats (2) + cLastBlockConfirmed (1) = 21, then wVersion.
+        let version = u16::from_le_bytes([encoded[21], encoded[22]]);
+        assert_eq!(version, VERSION_V8);
+    }
+
+    #[test]
     fn training_confirm_is_recognized() {
         let mut pdu = Vec::new();
         write_header(&mut pdu, SNDC_TRAINING, 4);
@@ -353,6 +421,20 @@ mod tests {
         pdu.write_u8(5); // cConfirmedBlockNo
         pdu.write_u8(0); // pad
         assert_eq!(decode_client_message(&pdu).unwrap(), ClientMessage::Other);
+    }
+
+    #[test]
+    fn wave_info_and_rest_encode_expected_layout() {
+        let pcm = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let info = encode_wave_info(1, 9, 0x1234, &pcm);
+        assert_eq!(info[0], SNDC_WAVE);
+        let body_len = u16::from_le_bytes([info[2], info[3]]) as usize;
+        assert_eq!(body_len, 8 + pcm.len());
+        assert_eq!(&info[12..16], &[0x11, 0x22, 0x33, 0x44]);
+
+        let rest = encode_wave_rest(&pcm);
+        assert_eq!(&rest[..4], &[0, 0, 0, 0]);
+        assert_eq!(&rest[4..], &[0x55, 0x66]);
     }
 
     #[test]

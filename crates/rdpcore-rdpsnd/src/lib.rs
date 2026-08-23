@@ -106,6 +106,7 @@ pub trait SoundServerFactory: Send + Sync {
 
 enum State {
     WaitFormats,
+    WaitQualityMode,
     WaitTrainingConfirm,
     Ready,
 }
@@ -123,6 +124,9 @@ pub struct RdpsndChannel {
     handler: Box<dyn RdpsndServerHandler>,
     state: State,
     negotiated: Option<pdu::NegotiatedFormat>,
+    /// Client `wVersion` from Client Audio Formats. Wave2 is used only
+    /// when this is at least [`pdu::VERSION_V8`].
+    client_version: u16,
     block_no: u8,
 }
 
@@ -146,6 +150,7 @@ impl RdpsndChannel {
                 handler,
                 state: State::WaitFormats,
                 negotiated: None,
+                client_version: 0,
                 block_no: 0,
             },
             initial,
@@ -154,6 +159,14 @@ impl RdpsndChannel {
 
     pub fn channel_id(&self) -> u16 {
         self.channel_id
+    }
+
+    fn training_frames(&self) -> Vec<Vec<u8>> {
+        wrap_indication(
+            self.user_channel_id,
+            self.channel_id,
+            pdu::encode_training(),
+        )
     }
 
     /// `payload` is the raw `"rdpsnd"`-channel bytes carried by an
@@ -171,12 +184,21 @@ impl RdpsndChannel {
                 let negotiated =
                     pdu::negotiate_formats(self.handler.get_formats(), &client_formats.formats);
                 self.negotiated = self.handler.choose_format(&negotiated);
+                self.client_version = client_formats.version;
+                if client_formats.version >= pdu::VERSION_V6 {
+                    // MS-RDPEA 1.3.2.1: both sides ≥ v6 → client sends
+                    // Quality Mode immediately after Client Audio Formats.
+                    // Training follows that PDU, matching IronRDP / mstsc.
+                    self.state = State::WaitQualityMode;
+                    Ok(Vec::new())
+                } else {
+                    self.state = State::WaitTrainingConfirm;
+                    Ok(self.training_frames())
+                }
+            }
+            (pdu::ClientMessage::QualityMode, State::WaitQualityMode) => {
                 self.state = State::WaitTrainingConfirm;
-                Ok(wrap_indication(
-                    self.user_channel_id,
-                    self.channel_id,
-                    pdu::encode_training(),
-                ))
+                Ok(self.training_frames())
             }
             (pdu::ClientMessage::TrainingConfirm, State::WaitTrainingConfirm) => {
                 if let Some(negotiated) = self.negotiated.clone() {
@@ -185,24 +207,23 @@ impl RdpsndChannel {
                 self.state = State::Ready;
                 Ok(Vec::new())
             }
-            // WaveConfirm, or anything arriving out of the expected
-            // sequence - a real implementation ignores WaveConfirm
-            // entirely (no flow control gating on it) and this one does
-            // the same; out-of-sequence messages are likewise dropped
-            // rather than treated as connection-fatal.
+            // WaveConfirm, late Quality Mode, or anything arriving out of
+            // the expected sequence - a real implementation ignores
+            // WaveConfirm entirely (no flow control gating on it) and
+            // this one does the same; out-of-sequence messages are
+            // likewise dropped rather than treated as connection-fatal.
             _ => Ok(Vec::new()),
         }
     }
 
-    /// Encodes one PCM chunk as `Wave2` and wraps it for the wire, or an
-    /// empty `Vec` if nothing has been negotiated/started yet (the caller
-    /// should just drop the chunk - there's no destination format to
-    /// encode it against).
+    /// Encodes one PCM chunk for the wire, or an empty `Vec` if nothing
+    /// has been negotiated/started yet (the caller should just drop the
+    /// chunk - there's no destination format to encode it against).
     ///
-    /// A `pcm` larger than one `Wave2` PDU can carry (its `BodySize` is a
-    /// `u16`) is split across multiple PDUs rather than silently
-    /// truncating the wire length field - normal 20ms-ish chunks never hit
-    /// this, but a backlog drained in one go after a capture stall could.
+    /// MS-RDPEA 1.3.3: Wave2 when both sides are ≥ v8, otherwise the
+    /// legacy WaveInfo + Wave pair. A `pcm` larger than one PDU can carry
+    /// (its `BodySize` is a `u16`) is split across multiple PDUs rather
+    /// than silently truncating the wire length field.
     pub fn encode_wave(&mut self, pcm: Vec<u8>, timestamp_ms: u32) -> Vec<Vec<u8>> {
         if !matches!(self.state, State::Ready) {
             return Vec::new();
@@ -210,6 +231,19 @@ impl RdpsndChannel {
         let Some(format_no) = self.negotiated.as_ref().map(|n| n.format_no) else {
             return Vec::new();
         };
+        if self.client_version >= pdu::VERSION_V8 {
+            self.encode_wave2_frames(pcm, format_no, timestamp_ms)
+        } else {
+            self.encode_wave_info_frames(pcm, format_no, timestamp_ms)
+        }
+    }
+
+    fn encode_wave2_frames(
+        &mut self,
+        pcm: Vec<u8>,
+        format_no: u16,
+        timestamp_ms: u32,
+    ) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         // Preserve the historical behavior of still sending one
         // empty-data Wave2 PDU for an empty `pcm`.
@@ -222,6 +256,40 @@ impl RdpsndChannel {
             let body = pdu::encode_wave2(format_no, self.block_no, timestamp_ms, chunk);
             self.block_no = self.block_no.wrapping_add(1);
             out.extend(wrap_indication(self.user_channel_id, self.channel_id, body));
+        }
+        out
+    }
+
+    fn encode_wave_info_frames(
+        &mut self,
+        mut pcm: Vec<u8>,
+        format_no: u16,
+        timestamp_ms: u32,
+    ) -> Vec<Vec<u8>> {
+        // WaveInfo carries the first 4 PCM bytes; pad a short chunk so
+        // we still emit a well-formed pair (including the empty-pcm case).
+        if pcm.len() < 4 {
+            pcm.resize(4, 0);
+        }
+        let mut out = Vec::new();
+        let ts16 = timestamp_ms as u16;
+        for chunk in pcm.chunks(pdu::MAX_WAVE_INFO_CHUNK_BYTES) {
+            let padded;
+            let chunk = if chunk.len() < 4 {
+                padded = {
+                    let mut v = chunk.to_vec();
+                    v.resize(4, 0);
+                    v
+                };
+                padded.as_slice()
+            } else {
+                chunk
+            };
+            let info = pdu::encode_wave_info(format_no, self.block_no, ts16, chunk);
+            let rest = pdu::encode_wave_rest(chunk);
+            self.block_no = self.block_no.wrapping_add(1);
+            out.extend(wrap_indication(self.user_channel_id, self.channel_id, info));
+            out.extend(wrap_indication(self.user_channel_id, self.channel_id, rest));
         }
         out
     }
@@ -278,7 +346,10 @@ mod tests {
         chunks.remove(0)
     }
 
-    fn client_audio_formats_payload(formats: &[pdu::AudioFormat]) -> Vec<u8> {
+    fn client_audio_formats_payload_with_version(
+        formats: &[pdu::AudioFormat],
+        version: u16,
+    ) -> Vec<u8> {
         // Build a well-formed Client Audio Formats PDU the same way a real
         // client would - reuses the crate's own encoder (there isn't a
         // public client-side encoder, so hand-assemble via the same field
@@ -291,7 +362,7 @@ mod tests {
         body.write_u16_be(0);
         body.write_u16_le(formats.len() as u16);
         body.write_u8(0);
-        body.write_u16_le(6);
+        body.write_u16_le(version);
         body.write_u8(0);
         for f in formats {
             body.write_u16_le(f.format_tag);
@@ -308,6 +379,42 @@ mod tests {
         out.write_u16_le(body.len() as u16);
         out.extend(body);
         as_single_incoming_chunk(&out)
+    }
+
+    fn client_audio_formats_payload(formats: &[pdu::AudioFormat]) -> Vec<u8> {
+        client_audio_formats_payload_with_version(formats, pdu::VERSION_V8)
+    }
+
+    fn quality_mode_payload() -> Vec<u8> {
+        use rdpcore_pdu::cursor::WriteBuf;
+        let mut out = Vec::new();
+        out.write_u8(pdu::SNDC_QUALITYMODE);
+        out.write_u8(0);
+        out.write_u16_le(4);
+        out.write_u16_le(0); // DYNAMIC
+        out.write_u16_le(0);
+        as_single_incoming_chunk(&out)
+    }
+
+    fn complete_v8_negotiation(channel: &mut RdpsndChannel, formats: &[pdu::AudioFormat]) {
+        assert!(
+            channel
+                .on_channel_data(&client_audio_formats_payload(formats))
+                .unwrap()
+                .is_empty(),
+            "v8 client: wait for Quality Mode before Training"
+        );
+        let training = channel.on_channel_data(&quality_mode_payload()).unwrap();
+        assert!(
+            !training.is_empty(),
+            "expects a Training PDU after Quality Mode"
+        );
+        assert!(
+            channel
+                .on_channel_data(&training_confirm_payload())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn training_confirm_payload() -> Vec<u8> {
@@ -334,11 +441,32 @@ mod tests {
         // No wave frames before negotiation completes.
         assert!(channel.encode_wave(vec![0; 10], 0).is_empty());
 
-        let training = channel
-            .on_channel_data(&client_audio_formats_payload(&formats))
-            .unwrap();
-        assert!(!training.is_empty(), "expects a Training PDU in response");
+        complete_v8_negotiation(&mut channel, &formats);
 
+        // Now negotiated and started - a wave chunk should encode.
+        let wave = channel.encode_wave(vec![0xAB; 100], 1234);
+        assert!(!wave.is_empty());
+    }
+
+    #[test]
+    fn v2_client_skips_quality_mode_and_uses_wave_info() {
+        let formats = vec![pdu::AudioFormat::pcm(2, 48000, 16)];
+        let handler = Box::new(FakeHandler {
+            formats: formats.clone(),
+            ..Default::default()
+        });
+        let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
+
+        let training = channel
+            .on_channel_data(&client_audio_formats_payload_with_version(
+                &formats,
+                pdu::VERSION_V2,
+            ))
+            .unwrap();
+        assert!(
+            !training.is_empty(),
+            "v2 client: Training follows Client Audio Formats immediately"
+        );
         assert!(
             channel
                 .on_channel_data(&training_confirm_payload())
@@ -346,9 +474,12 @@ mod tests {
                 .is_empty()
         );
 
-        // Now negotiated and started - a wave chunk should encode.
         let wave = channel.encode_wave(vec![0xAB; 100], 1234);
-        assert!(!wave.is_empty());
+        assert!(
+            wave.len() >= 2,
+            "legacy path emits WaveInfo and Wave as separate SVC messages, got {}",
+            wave.len()
+        );
     }
 
     #[test]
@@ -381,12 +512,7 @@ mod tests {
             ..Default::default()
         });
         let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
-        channel
-            .on_channel_data(&client_audio_formats_payload(&formats))
-            .unwrap();
-        channel
-            .on_channel_data(&training_confirm_payload())
-            .unwrap();
+        complete_v8_negotiation(&mut channel, &formats);
 
         // A 20ms/48kHz/stereo/16-bit chunk is 3840 bytes of PCM - plus the
         // 12-byte Wave2 header, well over the 1600-byte default SVC chunk
@@ -407,12 +533,7 @@ mod tests {
             ..Default::default()
         });
         let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
-        channel
-            .on_channel_data(&client_audio_formats_payload(&formats))
-            .unwrap();
-        channel
-            .on_channel_data(&training_confirm_payload())
-            .unwrap();
+        complete_v8_negotiation(&mut channel, &formats);
 
         // Bigger than any single Wave2 PDU can carry (its BodySize is a
         // u16) - models a backlog drained in one go after a capture
