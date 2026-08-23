@@ -29,6 +29,38 @@ impl Rect {
     }
 }
 
+fn visible_pixels_equal(
+    image1: &[u8],
+    stride1: usize,
+    image2: &[u8],
+    stride2: usize,
+    width: usize,
+    height: usize,
+    bpp: usize,
+) -> bool {
+    let row_bytes = width.saturating_mul(bpp);
+    if row_bytes == 0 {
+        return true;
+    }
+    if stride1 == stride2 && stride1 == row_bytes {
+        let needed = height.saturating_mul(row_bytes);
+        return image1.len() >= needed
+            && image2.len() >= needed
+            && image1[..needed] == image2[..needed];
+    }
+    (0..height).all(|row| {
+        let start1 = row.saturating_mul(stride1);
+        let start2 = row.saturating_mul(stride2);
+        match (
+            image1.get(start1..start1.saturating_add(row_bytes)),
+            image2.get(start2..start2.saturating_add(row_bytes)),
+        ) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    })
+}
+
 fn tile_differs(
     image1: &[u8],
     stride1: usize,
@@ -115,12 +147,11 @@ pub fn find_dirty_rects(
         return Vec::new();
     }
 
-    let required_len = height.saturating_sub(1) * stride1 + width * bpp;
-    if stride1 == stride2
-        && image1.len() >= required_len
-        && image2.len() >= required_len
-        && image1[..required_len] == image2[..required_len]
-    {
+    // Compare only visible pixels. A full-slice memcmp of `height * stride`
+    // would treat DRM pitch padding as part of the image; that padding is
+    // often uninitialized and would force a tile scan (or a full copy) on
+    // an otherwise static desktop.
+    if visible_pixels_equal(image1, stride1, image2, stride2, width, height, bpp) {
         return Vec::new();
     }
 
@@ -265,6 +296,24 @@ mod tests {
         let a = vec![42u8; height * stride];
         let b = a.clone();
         assert!(find_dirty_rects(&a, stride, &b, stride, width, height, bpp).is_empty());
+    }
+
+    #[test]
+    fn padded_stride_ignores_row_padding_differences() {
+        let width = 64;
+        let height = 2;
+        let bpp = 4;
+        let stride = 300;
+        let mut a = vec![0u8; height * stride];
+        let mut b = vec![0u8; height * stride];
+        for row in 0..height {
+            a[row * stride + width * bpp] = 0xAA;
+            b[row * stride + width * bpp] = 0x55;
+        }
+        assert!(find_dirty_rects(&a, stride, &b, stride, width, height, bpp).is_empty());
+        b[4] = 1;
+        let rects = find_dirty_rects(&a, stride, &b, stride, width, height, bpp);
+        assert_eq!(rects, vec![Rect::new(0, 0, 64, 2)]);
     }
 
     #[test]

@@ -4,13 +4,19 @@
 //! / MapSurfaceToOutput using the known capture size (recreated on resize).
 //! H.264 on the wire is Annex B per MS-RDPEGFX `RFX_AVC420_BITMAP_STREAM`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rdpcore_dvc::DvcHandler;
 use tracing::{debug, info, warn};
 
 use crate::encoder::{H264Encoder, MockH264Encoder};
 use crate::pdu::{self, ClientMessage, MonitorDef, RawCapabilitySet, select_avc420_capability};
+
+/// Recover from a poisoned `Mutex` so one panicked encoder/ack path cannot
+/// take down every later GFX frame on this connection.
+fn recover_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 const DEFAULT_SURFACE_ID: u16 = 1;
 /// Soft cap — mstsc often delays FrameAcknowledge.
@@ -356,14 +362,11 @@ impl GfxSession {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_ready()
+        recover_lock(&self.inner).is_ready()
     }
 
     pub fn failed(&self) -> bool {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).state == State::Failed
+        recover_lock(&self.inner).state == State::Failed
     }
 
     pub fn encode_frame(
@@ -373,17 +376,11 @@ impl GfxSession {
         stride: usize,
         pixels: &[u8],
     ) -> GfxFrameResult {
-        self.inner
-            .lock()
-            .unwrap()
-            .encode_frame(width, height, stride, pixels)
+        recover_lock(&self.inner).encode_frame(width, height, stride, pixels)
     }
 
     pub fn resize(&self, width: u16, height: u16) -> Option<Vec<Vec<u8>>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .resize(width, height)
+        recover_lock(&self.inner).resize(width, height)
     }
 
     pub fn dvc_handler(&self) -> GfxDvcHandler {
@@ -428,7 +425,7 @@ impl DvcHandler for GfxDvcHandler {
             }
             rest = &rest[pdu_len..];
 
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inner = recover_lock(&self.inner);
             match msg {
                 ClientMessage::CapsAdvertise { sets } => out.extend(inner.on_caps(&sets)),
                 ClientMessage::FrameAcknowledge {
@@ -802,5 +799,17 @@ mod tests {
         let create = &replies[2][2..];
         assert_eq!(&create[10..12], &64u16.to_le_bytes());
         assert_eq!(&create[12..14], &48u16.to_le_bytes());
+    }
+
+    #[test]
+    fn recover_lock_yields_the_value_after_poison() {
+        let mutex = Mutex::new(7u32);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("poison");
+        });
+        assert!(mutex.lock().is_err());
+        *recover_lock(&mutex) += 1;
+        assert_eq!(*recover_lock(&mutex), 8);
     }
 }

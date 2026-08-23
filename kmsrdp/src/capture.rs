@@ -36,22 +36,23 @@ const DMA_BUF_SYNC_END: u64 = 1 << 2;
 // _IOW('b', 0, struct dma_buf_sync) on Linux = 0x40086200
 const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
 
-fn dma_buf_sync_start(fd: std::os::unix::io::RawFd) {
-    let sync = DmaBufSync {
-        flags: DMA_BUF_SYNC_READ | DMA_BUF_SYNC_START,
-    };
-    unsafe {
-        libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+fn dma_buf_sync(fd: std::os::unix::io::RawFd, flags: u64) {
+    let sync = DmaBufSync { flags };
+    let rc = unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) };
+    if rc != 0 {
+        tracing::debug!(
+            errno = %std::io::Error::last_os_error(),
+            "DMA_BUF_IOCTL_SYNC failed; CPU read may see a stale cache"
+        );
     }
 }
 
+fn dma_buf_sync_start(fd: std::os::unix::io::RawFd) {
+    dma_buf_sync(fd, DMA_BUF_SYNC_READ | DMA_BUF_SYNC_START);
+}
+
 fn dma_buf_sync_end(fd: std::os::unix::io::RawFd) {
-    let sync = DmaBufSync {
-        flags: DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END,
-    };
-    unsafe {
-        libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
-    }
+    dma_buf_sync(fd, DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END);
 }
 
 impl AsFd for Card {
@@ -650,6 +651,7 @@ struct DrmCapturer {
     last_head_refresh: Option<Instant>,
 }
 
+#[derive(Clone)]
 struct CapturedHead {
     x: i32,
     y: i32,
@@ -773,10 +775,18 @@ impl DrmCapturer {
         let heads = self.heads_for_tick(false)?;
         match self.capture_heads(&heads, prev) {
             Ok(frame) => Ok(frame),
-            Err(_) => {
-                let heads = self.heads_for_tick(true)?;
-                self.capture_heads(&heads, prev)
-            }
+            Err(first) => match self.heads_for_tick(true) {
+                Ok(heads) => self.capture_heads(&heads, prev).map_err(|retry| {
+                    io::Error::new(
+                        first.kind(),
+                        format!("{first}; retry after head refresh also failed: {retry}"),
+                    )
+                }),
+                Err(refresh) => Err(io::Error::new(
+                    first.kind(),
+                    format!("{first}; head refresh after capture failure also failed: {refresh}"),
+                )),
+            },
         }
     }
 
@@ -793,7 +803,9 @@ impl DrmCapturer {
         }
 
         if captured.len() == 1 {
-            let c = captured.pop().unwrap();
+            let Some(c) = captured.pop() else {
+                return Err(io::Error::other("single-head capture produced no buffers"));
+            };
             return Ok(RawFrame {
                 width: c.width,
                 height: c.height,
@@ -909,11 +921,17 @@ impl DrmCapturer {
             dma_buf_sync_end(fd.as_raw_fd());
             (pitch, data, unchanged, dirty_rects)
         } else if is_detileable_bgrx {
+            let modifier = modifier.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tiled framebuffer missing DRM modifier",
+                )
+            })?;
             let detiled = gpu_detile::detile_to_bgrx(
                 &card_ctx.path,
                 fd.as_raw_fd(),
                 fourcc,
-                modifier.expect("checked by is_detileable_bgrx"),
+                modifier,
                 width,
                 height,
                 offsets[0],
@@ -1167,6 +1185,46 @@ mod tests {
         assert!(!frame.monitors[1].primary);
         assert_eq!(frame.monitors[1].left, 2);
         assert_eq!(frame.monitors[1].right, 3);
+    }
+
+    #[test]
+    fn compose_heads_marks_unchanged_when_prev_matches() {
+        let left = CapturedHead {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+            stride: 8,
+            data: vec![1, 0, 0, 0, 2, 0, 0, 0].into(),
+            force_full: false,
+            unchanged: false,
+            dirty_rects: None,
+            connector: "A".into(),
+        };
+        let right = CapturedHead {
+            x: 2,
+            y: 0,
+            width: 2,
+            height: 1,
+            stride: 8,
+            data: vec![3, 0, 0, 0, 4, 0, 0, 0].into(),
+            force_full: false,
+            unchanged: false,
+            dirty_rects: None,
+            connector: "B".into(),
+        };
+        let first = compose_heads(&[left.clone(), right.clone()], None);
+        assert!(!first.unchanged);
+        let hint = CaptureCompare {
+            width: first.width,
+            height: first.height,
+            stride: first.stride,
+            data: &first.data,
+        };
+        let second = compose_heads(&[left, right], Some(hint));
+        assert!(second.unchanged);
+        assert!(second.data.is_empty());
+        assert_eq!(second.dirty_rects, Some(Vec::new()));
     }
 
     #[test]

@@ -104,9 +104,10 @@ impl DisplayHub {
         let mut capturer = Some(capturer);
         loop {
             ticker.tick().await;
-            let current = capturer
-                .take()
-                .expect("capturer slot filled each iteration");
+            let Some(current) = capturer.take() else {
+                tracing::error!("kmsrdp: capturer missing from capture loop; stopping");
+                break;
+            };
             let prev_for_capture = previous.clone();
             let task = tokio::task::spawn_blocking(move || {
                 let mut current = current;
