@@ -690,13 +690,16 @@ fn send_wave_frames(
     timestamp_ms: u32,
 ) {
     let channel_id = channel.channel_id();
-    for bytes in channel.encode_wave(pcm, timestamp_ms) {
-        let _ = frame_sender.send(Frame {
+    let frames = channel
+        .encode_wave(pcm, timestamp_ms)
+        .into_iter()
+        .map(|bytes| Frame {
             channel: ChannelKey::Static(channel_id),
             priority: Priority::Latency,
             bytes,
-        });
-    }
+        })
+        .collect();
+    let _ = frame_sender.send_live(frames);
 }
 
 #[allow(clippy::too_many_arguments)]
