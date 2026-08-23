@@ -1,20 +1,20 @@
-# 品質評価（スナップショット）
+# Quality Assessment (Snapshot)
 
-評価日: 2026-08-23  
-対象: 当時の `main`（コミット `5400d9f` 付近。差分検出の pitch パディング無視、キャプチャ／GFX のパニック耐性を入れた直後）
+Date: 2026-08-23  
+Subject: `main` at the time (around commit `5400d9f`, just after dirty diffs started ignoring pitch padding and capture/GFX paths were made panic-free)
 
-満点は「その項目で、本番のリモートデスクトップとしてほぼ完成」とした主観評価です。自動計測や外部監査ではありません。
+A score of 10 means “essentially production-complete for that dimension as a remote-desktop server.” These are subjective ratings, not automated metrics or an external audit.
 
-| 項目 | 点数 | 根拠 |
+| Dimension | Score | Rationale |
 |---|---|---|
-| 正確性 | 8/10 | PDU は `Result` と境界チェックが徹底されていて、dirty 判定も可視画素だけを見るようになった。一方でスタック全体が自前実装で、GFX は実験扱い。実クライアントとの相互運用はテストでは証明しきれていない。 |
-| セキュリティ | 8/10 | 既定で NLA、`127.0.0.1`、認証レート制限、パスのサニタイズ、資格情報の `[REDACTED]` がある。ただし TLS は自己署名、認証は NTLMv2 のみで Kerberos はない。公開インターネット向けではない。 |
-| パフォーマンス | 8/10 | 不要な memcpy・同一フレームの再エンコード・静止画面の Arc 確保を削った。VAAPI の NV12 変換とマルチヘッド合成はまだ CPU 側に残る。 |
-| 並行性 | 9/10 | 重い処理は `spawn_blocking`、Mutex はポイズン回復、入力は接続単位で Drop 時に解放する。残る減点は、共有デスクトップを複数セッションで扱うときの複雑さ。 |
-| テストカバレッジ | 7/10 | ユニットテストは約 470、コア codec に `proptest` がある。足りないのは DRM 実機、HW エンコーダ、実 RDP クライアントまでの結合試験。 |
-| 保守性 | 8/10 | crate 分割と `AGENTS.md` の規則は明確。`server.rs` / `capture.rs` など大きなファイルと、自前プロトコル実装の学習コストが残る。 |
-| ドキュメント | 7/10 | README と SECURITY.md は制限・配備注意まで書いている。rustdoc とアーキテクチャ図、クライアント相互運用表は薄い。 |
+| Correctness | 8/10 | PDUs consistently use `Result` and bounds checks; dirty detection now looks only at visible pixels. The stack is still entirely from-scratch, GFX is experimental, and real-client interoperability is not fully proven by tests. |
+| Security | 8/10 | Defaults include NLA, `127.0.0.1`, auth rate limiting, path sanitization, and `[REDACTED]` credentials. TLS is self-signed; auth is NTLMv2 only (no Kerberos). Not intended for the public Internet. |
+| Performance | 8/10 | Dropped unnecessary memcpy, same-frame re-encodes, and still-frame `Arc` allocations. VAAPI NV12 conversion and multi-head compositing still run on the CPU. |
+| Concurrency | 9/10 | Heavy work uses `spawn_blocking`; mutexes recover from poison; input is connection-scoped and released on drop. Remaining deduction: complexity of sharing one desktop across multiple sessions. |
+| Test coverage | 7/10 | About 470 unit tests and `proptest` on core codecs. Missing: DRM hardware, HW encoders, and end-to-end tests against real RDP clients. |
+| Maintainability | 8/10 | Crate split and `AGENTS.md` rules are clear. Large files such as `server.rs` / `capture.rs` and the cost of learning a from-scratch protocol stack remain. |
+| Documentation | 7/10 | README and SECURITY.md cover limits and deployment. rustdoc, architecture diagrams, and a client interoperability matrix are thin. |
 
-**総合: 8/10**（単純平均 7.9 を四捨五入）
+**Overall: 8/10** (simple average 7.9, rounded)
 
-実験的な Linux RDP サーバーとしては高い水準。10 に近づけるなら、実クライアントとの結合試験、Kerberos / まともな証明書、HW エンコードへの DMA-BUF 直結が次の論点。
+High for an experimental Linux RDP server. Closing the gap to 10 means real-client integration tests, Kerberos / proper certificates, and DMA-BUF passthrough into HW encode.

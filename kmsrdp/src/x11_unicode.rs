@@ -263,7 +263,7 @@ mod tests {
     fn unicode_to_keysym_latin1_and_extended() {
         assert_eq!(unicode_to_keysym(0x41), 0x41); // 'A'
         assert_eq!(unicode_to_keysym(0xE9), 0xE9); // 'é' (Latin-1)
-        assert_eq!(unicode_to_keysym('あ' as u32), 0x0100_0000 + ('あ' as u32));
+        assert_eq!(unicode_to_keysym(0x20AC), 0x0100_0000 + 0x20AC); // '€' (beyond Latin-1)
     }
 
     fn session_rx(session: Option<Session>) -> watch::Receiver<Option<Session>> {
@@ -284,13 +284,13 @@ mod tests {
     #[test]
     fn type_char_without_session_is_noop() {
         let mut typer = X11UnicodeWorker::new(session_rx(None));
-        typer.type_char('あ' as u32);
+        typer.type_char('A' as u32);
     }
 
     #[test]
     fn type_char_wayland_session_without_display_is_noop() {
         let mut typer = X11UnicodeWorker::new(session_rx(Some(sample_session(None))));
-        typer.type_char('あ' as u32);
+        typer.type_char('A' as u32);
     }
 
     #[test]

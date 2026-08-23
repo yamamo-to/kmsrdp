@@ -172,7 +172,9 @@ sudo systemctl enable --now kmsrdp.service
 
 ## Documentation
 
-- [Architecture & Protocol Flow](ARCHITECTURE.md): detailed overview of the DRM capture pipeline, internal crates, and RDP connection sequence diagrams.
+- [Architecture & Protocol Flow](ARCHITECTURE.md): DRM capture pipeline, internal crates, and RDP connection sequence diagrams.
+- [Agent & Developer Guidelines](AGENTS.md): architecture assumptions, safety rules, and verification workflow.
+- [Quality Assessment](QUALITY.md): subjective snapshot scores (not an automated audit).
 - [Security Model & Advisories](SECURITY.md): threat model, deployment recommendations, and vulnerability reporting.
 
 ## Security

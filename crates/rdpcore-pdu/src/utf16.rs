@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn encode_decode_units_round_trip() {
-        let s = "日本語";
+        let s = "naïve";
         let bytes = encode_units(s);
         assert_eq!(decode_units(&bytes), s);
     }
