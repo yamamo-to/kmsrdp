@@ -1,6 +1,7 @@
-use rdpcore_dvc::DvcMux;
 use rdpcore_pdu::fastpath::UPDATE_CODE_SURFACE_COMMANDS;
 use rdpcore_pdu::surface_commands::{FRAME_ACTION_BEGIN, FRAME_ACTION_END, encode_frame_marker};
+#[cfg(feature = "gfx")]
+use rdpcore_dvc::DvcMux;
 #[cfg(feature = "gfx")]
 use rdpcore_rdpegfx::GfxSession;
 use rdpcore_transport::{ChannelKey, Frame, FrameSender, Priority};

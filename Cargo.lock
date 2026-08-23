@@ -1595,7 +1595,7 @@ dependencies = [
  "tracing-subscriber",
  "uinput-sys",
  "x11rb 0.14.0",
- "x509-parser",
+ "x509-parser 0.18.1",
  "zbus",
  "zeroize",
 ]
@@ -2588,7 +2588,7 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "time",
- "x509-parser",
+ "x509-parser 0.18.1",
  "yasna",
 ]
 
@@ -2685,6 +2685,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "x509-parser 0.17.0",
  "zeroize",
 ]
 
@@ -4040,6 +4041,23 @@ dependencies = [
  "curve25519-dalek",
  "rand_core 0.10.1",
  "zeroize",
+]
+
+[[package]]
+name = "x509-parser"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4569f339c0c402346d4a75a9e39cf8dad310e287eef1ff56d4c68e5067f53460"
+dependencies = [
+ "asn1-rs",
+ "data-encoding",
+ "der-parser",
+ "lazy_static",
+ "nom",
+ "oid-registry",
+ "rusticata-macros",
+ "thiserror 2.0.18",
+ "time",
 ]
 
 [[package]]

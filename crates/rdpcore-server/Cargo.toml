@@ -18,7 +18,7 @@ rdpcore-rdpegfx = { path = "../rdpcore-rdpegfx", optional = true }
 rdpcore-transport = { path = "../rdpcore-transport" }
 sspi = { version = "0.21.3", default-features = false, features = ["aws-lc-rs"] }
 subtle = "2.6.1"
-tokio = { version = "1.52.3", features = ["rt", "net", "io-util", "macros", "sync", "time"] }
+tokio = { version = "1.52.3", features = ["rt", "net", "io-util", "macros", "sync", "time", "process"] }
 tokio-rustls = "0.26"
 thiserror = "2.0.17"
 tracing = "0.1.44"
@@ -36,6 +36,7 @@ dvc-echo = ["rdpcore-dvc/echo"]
 [dev-dependencies]
 rcgen = "0.14.8"
 criterion = "0.5"
+x509-parser = "0.17"
 
 [[bench]]
 name = "diff"
