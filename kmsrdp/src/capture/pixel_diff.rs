@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use rdpcore_server::diff::{Rect, find_dirty_rects};
+use std::sync::Arc;
 
 use super::types::CaptureCompare;
 

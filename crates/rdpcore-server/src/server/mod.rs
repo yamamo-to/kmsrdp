@@ -376,13 +376,7 @@ impl Session {
             credential_validator: self.credential_validator.as_deref(),
             auth_limiter: &self.auth_limiter,
         };
-        handshake::negotiate(
-            tcp,
-            peer_ip,
-            params,
-            authenticated,
-        )
-        .await
+        handshake::negotiate(tcp, peer_ip, params, authenticated).await
     }
 
     async fn run_steady_state<S>(

@@ -16,9 +16,9 @@ use rdpcore_rdpegfx::{GfxSession, select_h264_encoder};
 use rdpcore_rdpsnd::{RdpsndChannel, RdpsndServerMessage, SoundServerFactory, wave_channel};
 use rdpcore_transport::{ChannelKey, ConnectionWriter, Frame, Priority};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::{debug, warn};
 #[cfg(any(feature = "gfx", feature = "dvc-echo"))]
 use tracing::info;
+use tracing::{debug, warn};
 
 use crate::display::{BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay};
 use crate::encode::{
@@ -29,11 +29,9 @@ use crate::error::{SessionError, finish_session};
 use crate::input::{ConnectionScopedInput, RdpServerInputHandler};
 use crate::transport::{SteadyStateFrame, read_steady_state_frame};
 
-use super::frame_pump::{
-    flush_pending_resize_bitmap, send_outbound_bitmap, send_outbound_frame,
-};
 #[cfg(feature = "gfx")]
 use super::frame_pump::{apply_gfx_encode_outcome, send_gfx_payloads, try_encode_gfx_frame};
+use super::frame_pump::{flush_pending_resize_bitmap, send_outbound_bitmap, send_outbound_frame};
 use super::input_handler::dispatch_input_event;
 use super::metrics::SessionBitmapMetrics;
 
@@ -115,8 +113,7 @@ where
         (Some(channel), Some(mut audio_rx)) => {
             let sender = frame_sender.clone();
             Some(AbortOnDrop(tokio::spawn(async move {
-                while let Some(RdpsndServerMessage::Wave(pcm, timestamp_ms)) =
-                    audio_rx.recv().await
+                while let Some(RdpsndServerMessage::Wave(pcm, timestamp_ms)) = audio_rx.recv().await
                 {
                     let mut channel = channel.lock().await;
                     // Catch rather than let a panic here silently kill
@@ -181,17 +178,16 @@ where
         }
         #[cfg(feature = "dvc-echo")]
         if params.echo_smoke_test {
-            let echo_frames =
-                mux.register_channel(Box::new(rdpcore_dvc::echo::EchoHandler::new(
-                    b"kmsrdp-dvc-smoketest".to_vec(),
-                    |matched| {
-                        if matched {
-                            info!("DVC echo smoke test: OK, payload round-tripped correctly");
-                        } else {
-                            warn!("DVC echo smoke test: FAILED, echoed payload did not match");
-                        }
-                    },
-                )));
+            let echo_frames = mux.register_channel(Box::new(rdpcore_dvc::echo::EchoHandler::new(
+                b"kmsrdp-dvc-smoketest".to_vec(),
+                |matched| {
+                    if matched {
+                        info!("DVC echo smoke test: OK, payload round-tripped correctly");
+                    } else {
+                        warn!("DVC echo smoke test: FAILED, echoed payload did not match");
+                    }
+                },
+            )));
             info!(
                 "DVC echo smoke test: queued {} follow-up frame(s)",
                 echo_frames.len()

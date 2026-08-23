@@ -40,8 +40,8 @@ pub async fn negotiate(
     )>,
     crate::error::ServerError,
 > {
-    let mut acceptor =
-        Acceptor::new(params.desktop.width, params.desktop.height).with_require_nla(params.require_nla);
+    let mut acceptor = Acceptor::new(params.desktop.width, params.desktop.height)
+        .with_require_nla(params.require_nla);
 
     // Connection Request/Confirm is always cleartext, even under
     // PROTOCOL_SSL / PROTOCOL_HYBRID - the TLS handshake only starts

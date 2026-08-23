@@ -15,12 +15,14 @@ mod drm_discover;
 mod pixel_diff;
 mod types;
 
-pub use display_mode::validate_display_env;
 #[cfg(test)]
 pub(crate) use display_mode::DisplayMode;
+pub use display_mode::validate_display_env;
 pub use drm_capturer::DrmCapturer;
 #[cfg(test)]
-pub(crate) use drm_capturer::{CapturedHead, HEAD_REFRESH_INTERVAL, compose_heads, should_refresh_heads};
+pub(crate) use drm_capturer::{
+    CapturedHead, HEAD_REFRESH_INTERVAL, compose_heads, should_refresh_heads,
+};
 #[cfg(test)]
 pub(crate) use pixel_diff::blit_bgrx;
 pub use types::{CaptureCompare, MonitorGeom, RawFrame};

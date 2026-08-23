@@ -1,11 +1,13 @@
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use rdpcore_server::tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rdpcore_server::tokio_rustls::rustls::{self};
 use rdpcore_server::tokio_rustls::TlsAcceptor;
+use rdpcore_server::tokio_rustls::rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer,
+};
+use rdpcore_server::tokio_rustls::rustls::{self};
 use rdpcore_server::{
     BitmapUpdate, Credentials, DesktopSize, DisplayUpdate, ExactMatchCredentialValidator,
     KeyboardEvent, MouseEvent, PixelFormat, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates,
@@ -86,7 +88,8 @@ impl RdpServerInputHandler for TestInputHandler {
 fn create_tls_acceptor_and_pubkey() -> (TlsAcceptor, Vec<u8>) {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let rcgen::CertifiedKey { cert, signing_key } =
-        rcgen::generate_simple_self_signed(vec!["localhost".to_owned(), "127.0.0.1".to_owned()]).expect("self-signed cert");
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+            .expect("self-signed cert");
     let cert_der = CertificateDer::from(cert.der().to_vec());
     let public_key = signing_key.public_key_raw().to_vec();
     let key_der: PrivateKeyDer<'static> =

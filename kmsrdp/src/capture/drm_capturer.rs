@@ -8,13 +8,13 @@ use drm::control::{Device as ControlDevice, crtc, plane};
 use drm_fourcc::{DrmFourcc, DrmModifier};
 use memmap2::MmapOptions;
 
-use crate::gpu_detile;
 use super::dmabuf::{dma_buf_sync_end, dma_buf_sync_start};
 use super::drm_discover::{
     CardCtx, EnumeratedHead, open_drm_cards_and_heads, plane_type, refresh_heads,
 };
 use super::pixel_diff::{blit_bgrx, take_pixels};
 use super::types::{CaptureCompare, MonitorGeom, RawFrame};
+use crate::gpu_detile;
 
 pub(crate) const HEAD_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 

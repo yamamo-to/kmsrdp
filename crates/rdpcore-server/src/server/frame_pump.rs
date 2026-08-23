@@ -1,18 +1,18 @@
-use rdpcore_pdu::fastpath::UPDATE_CODE_SURFACE_COMMANDS;
-use rdpcore_pdu::surface_commands::{FRAME_ACTION_BEGIN, FRAME_ACTION_END, encode_frame_marker};
 #[cfg(feature = "gfx")]
 use rdpcore_dvc::DvcMux;
+use rdpcore_pdu::fastpath::UPDATE_CODE_SURFACE_COMMANDS;
+use rdpcore_pdu::surface_commands::{FRAME_ACTION_BEGIN, FRAME_ACTION_END, encode_frame_marker};
 #[cfg(feature = "gfx")]
 use rdpcore_rdpegfx::GfxSession;
 use rdpcore_transport::{ChannelKey, Frame, FrameSender, Priority};
 
+use super::metrics::SessionBitmapMetrics;
 use crate::display::BitmapUpdate;
 use crate::encode::{
     BitmapEncodePolicy, EncodeScratch, encode_bitmap_update, encode_nscodec_update,
     encode_update_to_wire_frames,
 };
 use crate::error::SessionError;
-use super::metrics::SessionBitmapMetrics;
 
 pub async fn send_outbound_bitmap(
     bitmap: &BitmapUpdate,

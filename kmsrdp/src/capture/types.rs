@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use rdpcore_server::diff::Rect;
+use std::sync::Arc;
 
 /// Inclusive monitor rectangle in the composited virtual desktop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
