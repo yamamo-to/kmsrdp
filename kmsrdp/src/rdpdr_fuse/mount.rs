@@ -261,16 +261,23 @@ fn spawn_shared_mount(
 }
 
 fn detach_umount(session: BackgroundSession, mount_point: PathBuf) {
-    std::thread::Builder::new()
+    let mp = mount_point.clone();
+    let res = std::thread::Builder::new()
         .name("kmsrdp-fuse-umount".into())
         .spawn(move || {
             if let Err(e) = session.umount_and_join() {
                 tracing::warn!(
                     "kmsrdp: rdpdr FUSE umount/join failed for {} ({e}); trying lazy unmount",
-                    mount_point.display()
+                    mp.display()
                 );
-                try_unmount(&mount_point);
+                try_unmount(&mp);
             }
-        })
-        .expect("spawn fuse umount thread");
+        });
+    if let Err(e) = res {
+        tracing::warn!(
+            "kmsrdp: failed to spawn fuse umount thread ({e}); trying synchronous lazy unmount for {}",
+            mount_point.display()
+        );
+        try_unmount(&mount_point);
+    }
 }

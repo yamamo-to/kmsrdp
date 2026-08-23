@@ -258,13 +258,24 @@ impl VirtualInput {
 /// only the common navigation/modifier keys; anything else returns `None`.
 pub fn linux_keycode_from_rdp_scancode(code: u8, extended: bool) -> Option<i32> {
     if !extended {
-        return Some(code as i32);
+        return Some(match code {
+            0x79 => 92,  // KEY_HENKAN (Convert)
+            0x7b => 94,  // KEY_MUHENKAN (Non-convert)
+            0x70 => 93,  // KEY_KATAKANAHIRAGANA (Hiragana/Katakana)
+            0x77 => 85,  // KEY_ZENKAKUHANKAKU (Zenkaku/Hankaku)
+            0x73 => 89,  // KEY_RO (\ / _)
+            0x7d => 124, // KEY_YEN (| / ¥)
+            0x54 => 99,  // KEY_SYSRQ (SysRq / Alt+PrintScreen)
+            c => c as i32,
+        });
     }
     Some(match code {
         0x1d => 97,  // Right Ctrl
         0x38 => 100, // Right Alt (AltGr)
         0x1c => 96,  // Numpad Enter
         0x35 => 98,  // Numpad /
+        0x37 => 99,  // Print Screen (KEY_SYSRQ / KEY_PRINT)
+        0x46 => 119, // KEY_PAUSE (Pause/Break)
         0x48 => 103, // Up
         0x4b => 105, // Left
         0x4d => 106, // Right
@@ -278,6 +289,15 @@ pub fn linux_keycode_from_rdp_scancode(code: u8, extended: bool) -> Option<i32> 
         0x5b => 125, // Left Meta/GUI
         0x5c => 126, // Right Meta/GUI
         0x5d => 127, // Menu
+        0x20 => 113, // KEY_MUTE
+        0x2e => 114, // KEY_VOLUMEDOWN
+        0x30 => 115, // KEY_VOLUMEUP
+        0x22 => 164, // KEY_PLAYPAUSE
+        0x24 => 166, // KEY_STOPCD
+        0x10 => 165, // KEY_PREVIOUSSONG
+        0x19 => 163, // KEY_NEXTSONG
+        0x21 => 140, // KEY_CALC
+        0x5f => 142, // KEY_SLEEP
         _ => return None,
     })
 }
@@ -310,9 +330,19 @@ mod tests {
     }
 
     #[test]
+    fn japanese_scancodes_map_to_linux_codes() {
+        assert_eq!(linux_keycode_from_rdp_scancode(0x79, false), Some(92)); // KEY_HENKAN
+        assert_eq!(linux_keycode_from_rdp_scancode(0x7b, false), Some(94)); // KEY_MUHENKAN
+        assert_eq!(linux_keycode_from_rdp_scancode(0x70, false), Some(93)); // KEY_KATAKANAHIRAGANA
+        assert_eq!(linux_keycode_from_rdp_scancode(0x77, false), Some(85)); // KEY_ZENKAKUHANKAKU
+    }
+
+    #[test]
     fn extended_arrow_keys_map_to_linux_codes() {
         assert_eq!(linux_keycode_from_rdp_scancode(0x48, true), Some(103)); // Up
         assert_eq!(linux_keycode_from_rdp_scancode(0x50, true), Some(108)); // Down
+        assert_eq!(linux_keycode_from_rdp_scancode(0x37, true), Some(99));  // PrintScreen
+        assert_eq!(linux_keycode_from_rdp_scancode(0x20, true), Some(113)); // Mute
     }
 
     #[test]

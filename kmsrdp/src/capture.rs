@@ -21,6 +21,36 @@ use crate::gpu_detile;
 #[derive(Debug)]
 struct Card(fs::File);
 
+#[repr(C)]
+struct DmaBufSync {
+    flags: u64,
+}
+
+const DMA_BUF_SYNC_READ: u64 = 1 << 0;
+const DMA_BUF_SYNC_START: u64 = 0 << 2;
+const DMA_BUF_SYNC_END: u64 = 1 << 2;
+
+// _IOW('b', 0, struct dma_buf_sync) on Linux = 0x40086200
+const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
+
+fn dma_buf_sync_start(fd: std::os::unix::io::RawFd) {
+    let sync = DmaBufSync {
+        flags: DMA_BUF_SYNC_READ | DMA_BUF_SYNC_START,
+    };
+    unsafe {
+        libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+    }
+}
+
+fn dma_buf_sync_end(fd: std::os::unix::io::RawFd) {
+    let sync = DmaBufSync {
+        flags: DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END,
+    };
+    unsafe {
+        libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+    }
+}
+
 impl AsFd for Card {
     fn as_fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
         self.0.as_fd()
@@ -744,6 +774,7 @@ impl DrmCapturer {
                     .map(fd.as_raw_fd())
                     .map_err(|e| io::Error::other(format!("mmap failed: {e}")))?
             };
+            dma_buf_sync_start(fd.as_raw_fd());
             // Copy straight from the mmap into the Arc<[u8]> RawFrame/
             // CapturedHead ultimately need, instead of an intermediate
             // Vec that a later Vec -> Arc<[u8]> conversion would have to
@@ -751,7 +782,9 @@ impl DrmCapturer {
             // Vec's buffer doesn't, so that conversion can never just
             // reuse the allocation) - halves the memcpy bandwidth for
             // this, the most common (non-tiled) capture path.
-            (pitch, Arc::from(&mmap[..]))
+            let data = Arc::from(&mmap[..]);
+            dma_buf_sync_end(fd.as_raw_fd());
+            (pitch, data)
         } else if is_detileable_bgrx {
             let data: Arc<[u8]> = gpu_detile::detile_to_bgrx(
                 &card_ctx.path,

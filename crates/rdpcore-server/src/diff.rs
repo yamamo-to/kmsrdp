@@ -42,7 +42,10 @@ fn tile_differs(
         let end1 = start1 + tile.width * bpp;
         let start2 = row * stride2 + tile.x * bpp;
         let end2 = start2 + tile.width * bpp;
-        image1[start1..end1] != image2[start2..end2]
+        match (image1.get(start1..end1), image2.get(start2..end2)) {
+            (Some(s1), Some(s2)) => s1 != s2,
+            _ => true,
+        }
     })
 }
 

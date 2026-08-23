@@ -95,7 +95,7 @@ impl<'a> ReadCursor<'a> {
     /// Slices the underlying buffer by absolute offsets (as returned by
     /// [`Self::pos`]), independent of the current cursor position.
     pub fn slice_from_to(&self, start: usize, end: usize) -> &'a [u8] {
-        &self.buf[start..end]
+        self.buf.get(start..end).unwrap_or(&[])
     }
 
     pub fn read_u8(&mut self) -> Result<u8, NotEnoughBytes> {
@@ -137,7 +137,16 @@ impl<'a> ReadCursor<'a> {
 
     pub fn read_u64_le(&mut self) -> Result<u64, NotEnoughBytes> {
         self.ensure(8)?;
-        let v = u64::from_le_bytes(self.buf[self.pos..self.pos + 8].try_into().unwrap());
+        let v = u64::from_le_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+            self.buf[self.pos + 3],
+            self.buf[self.pos + 4],
+            self.buf[self.pos + 5],
+            self.buf[self.pos + 6],
+            self.buf[self.pos + 7],
+        ]);
         self.pos += 8;
         Ok(v)
     }

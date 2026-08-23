@@ -83,6 +83,9 @@ pub fn encode_rgba_pointer(
 ) -> Vec<u8> {
     let w = usize::from(width);
     let h = usize::from(height);
+    if w == 0 || h == 0 || bgra_top_down.len() < w * h * 4 {
+        return single_update(UPDATE_CODE_PTR_DEFAULT, Vec::new());
+    }
     let mut xor_bottom_up = vec![0u8; w * h * 4];
     for y in 0..h {
         let src_row = y * w * 4;

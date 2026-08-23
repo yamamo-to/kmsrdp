@@ -387,9 +387,10 @@ impl Filesystem for FuseFs {
                         (device_id, path.clone()),
                         CachedMeta::fresh(false, bridge.uid, bridge.gid, mode),
                     );
-                let attr = bridge
-                    .attr_for(device_id, &path)
-                    .expect("meta just inserted");
+                let Some(attr) = bridge.attr_for(device_id, &path) else {
+                    reply.error(Errno::EIO);
+                    return;
+                };
                 let fh = bridge.next_fh.fetch_add(1, Ordering::Relaxed);
                 bridge
                     .opens

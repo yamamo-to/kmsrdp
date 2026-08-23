@@ -99,8 +99,14 @@ pub fn write_integer(out: &mut Vec<u8>, value: u32) {
         write_length(out, 3);
         out.write_u8((value >> 16) as u8);
         out.write_u16_be(value as u16);
-    } else {
+    } else if value < 0x8000_0000 {
         write_length(out, 4);
+        out.write_u16_be((value >> 16) as u16);
+        out.write_u16_be(value as u16);
+    } else {
+        // High bit is set; ASN.1 BER requires leading 0x00 to denote a positive integer
+        write_length(out, 5);
+        out.write_u8(0x00);
         out.write_u16_be((value >> 16) as u16);
         out.write_u16_be(value as u16);
     }
@@ -110,17 +116,20 @@ pub fn read_integer(cursor: &mut ReadCursor<'_>) -> Result<u32, DecodeError> {
     expect_tag(cursor, TAG_INTEGER, "ber.integer")?;
     let length = read_length(cursor)?;
     let bytes = cursor.read_slice(length)?;
-    if bytes.is_empty() || bytes.len() > 4 {
+    if bytes.is_empty() || bytes.len() > 5 || (bytes.len() == 5 && bytes[0] != 0) {
         return Err(DecodeError::InvalidValue {
             field: "ber.integer",
-            reason: "unsupported INTEGER length (expected 1-4 bytes)",
+            reason: "unsupported INTEGER length (expected 1-4 bytes or 5 bytes with 0x00 pad)",
         });
     }
-    let mut value = 0u32;
+    let mut value = 0u64;
     for &b in bytes {
-        value = (value << 8) | u32::from(b);
+        value = (value << 8) | u64::from(b);
     }
-    Ok(value)
+    u32::try_from(value).map_err(|_| DecodeError::InvalidValue {
+        field: "ber.integer",
+        reason: "integer value exceeds u32",
+    })
 }
 
 pub fn write_boolean(out: &mut Vec<u8>, value: bool) {

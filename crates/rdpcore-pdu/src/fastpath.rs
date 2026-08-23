@@ -151,7 +151,7 @@ impl FastPathInput {
         }
 
         let count = self.events.len();
-        let (num_events_nibble, extra_count_byte) = if count < 15 {
+        let (num_events_nibble, extra_count_byte) = if count > 0 && count < 15 {
             (count as u8, false)
         } else {
             (0, true)
@@ -630,5 +630,29 @@ mod tests {
         };
         let encoded = output.encode();
         assert_eq!(FastPathOutput::decode(&encoded).unwrap(), output);
+    }
+
+    #[test]
+    fn fastpath_input_zero_events_round_trip() {
+        let input = FastPathInput { events: Vec::new() };
+        let encoded = input.encode();
+        let decoded = FastPathInput::decode(&encoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn fastpath_input_many_events_round_trip() {
+        let input = FastPathInput {
+            events: vec![
+                FastPathInputEvent::Scancode {
+                    flags: 0,
+                    code: 0x1E,
+                };
+                20
+            ],
+        };
+        let encoded = input.encode();
+        let decoded = FastPathInput::decode(&encoded).unwrap();
+        assert_eq!(decoded, input);
     }
 }

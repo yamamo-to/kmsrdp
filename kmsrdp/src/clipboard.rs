@@ -358,21 +358,25 @@ impl CliprdrBackend for LocalClipboardBackend {
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
-        if !self.mode.allows_host_to_client() {
+        if !self.mode.allows_host_to_client() || request.format != CF_UNICODETEXT {
             let _ = self.sender.send(ClipboardMessage::SendFormatData(
                 FormatDataResponse::new_error(),
             ));
             return;
         }
-        let response = if request.format == CF_UNICODETEXT {
-            match local_text() {
+        let sender = self.sender.clone();
+        let execute = move || {
+            let response = match local_text() {
                 Some(text) => FormatDataResponse::new_unicode_string(&text),
                 None => FormatDataResponse::new_error(),
-            }
-        } else {
-            FormatDataResponse::new_error()
+            };
+            let _ = sender.send(ClipboardMessage::SendFormatData(response));
         };
-        let _ = self.sender.send(ClipboardMessage::SendFormatData(response));
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(execute);
+        } else {
+            std::thread::spawn(execute);
+        }
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse) {
@@ -380,7 +384,14 @@ impl CliprdrBackend for LocalClipboardBackend {
             return;
         }
         if let Some(text) = response.to_unicode_string() {
-            set_local_text(text);
+            let execute = move || {
+                set_local_text(text);
+            };
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn_blocking(execute);
+            } else {
+                std::thread::spawn(execute);
+            }
         }
     }
 }

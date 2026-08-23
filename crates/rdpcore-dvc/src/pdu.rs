@@ -64,7 +64,7 @@ fn read_variable(cursor: &mut ReadCursor<'_>, selector: u8) -> Result<u32, Decod
 }
 
 pub fn encode_capability_request() -> Vec<u8> {
-    let mut out = Vec::with_capacity(11);
+    let mut out = Vec::with_capacity(12);
     out.write_u8(CMD_CAPABILITY << 4); // sp=0, cb_id=0: no channel ID on this PDU
     out.write_u8(0); // pad
     out.write_u16_le(2); // CapsVersion 2

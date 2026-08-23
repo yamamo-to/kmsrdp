@@ -147,6 +147,9 @@ fn decode_plane(
     width: usize,
     height: usize,
 ) -> Result<Vec<u8>, DecodeError> {
+    if width == 0 || height == 0 {
+        return Ok(Vec::new());
+    }
     let mut delta = vec![0u8; width * height];
     for row in 0..height {
         decode_scanline_rle(cursor, &mut delta[row * width..(row + 1) * width])?;

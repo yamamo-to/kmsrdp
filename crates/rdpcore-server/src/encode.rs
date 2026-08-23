@@ -84,7 +84,7 @@ pub(crate) fn encode_bitmap_update(
 ) -> (Vec<Vec<Vec<u8>>>, BitmapWireStats) {
     let width = bitmap.width.get();
     let height = bitmap.height.get();
-    let row_bytes = usize::from(width) * 4;
+    let row_bytes = bitmap.stride.get();
 
     let mut rectangles = Vec::new();
     let mut stats = BitmapWireStats::default();
@@ -162,7 +162,11 @@ fn push_bitmap_rect(
     for row in (0..tile_height).rev() {
         let src_row = usize::from(tile_y + row);
         let src_start = src_row * row_bytes + usize::from(tile_x) * 4;
-        tile_data.extend_from_slice(&bitmap.data[src_start..src_start + tile_row_bytes]);
+        if let Some(slice) = bitmap.data.get(src_start..src_start + tile_row_bytes) {
+            tile_data.extend_from_slice(slice);
+        } else {
+            tile_data.extend(std::iter::repeat_n(0u8, tile_row_bytes));
+        }
     }
 
     let planar_ok = policy.use_rdp6_planar && tile_width.is_multiple_of(4);
