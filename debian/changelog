@@ -1,3 +1,16 @@
+kmsrdp (0.1.48) unstable; urgency=medium
+
+  * Clear KMSRDP_PASSWORD from environment after reading to reduce memory exposure.
+  * Add automatic recovery and backoff for GPU detiler on render failure.
+  * Use poison-tolerant Mutex recovery in audio input initialization.
+  * Use libc::poll in XFixes clipboard event loop to avoid 50ms busy sleep.
+  * Optimize Planar RDP 6.0 zigzag delta filtering to be branchless and SIMD-friendly.
+  * Direct map Latin-1 codepoints to standard X11 keysyms.
+  * Sanitize odd-length UTF-16 strings in ClientInfo PDU decoding.
+  * Support 32bpp RGBA cursor encoding and sync default pointer on connect.
+
+ -- kmsrdp contributors <noreply@example.com>  Sun, 23 Aug 2026 10:45:00 +0900
+
 kmsrdp (0.1.47) unstable; urgency=medium
 
   * Parse GFX/FPS in Config and pass them through the server builder

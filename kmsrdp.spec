@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.47
+Version:        0.1.48
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,16 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Sun Aug 23 2026 kmsrdp contributors <noreply@example.com> - 0.1.48-1
+- Clear KMSRDP_PASSWORD from environment after reading to reduce memory exposure
+- Add automatic recovery and backoff for GPU detiler on render failure
+- Use poison-tolerant Mutex recovery in audio input initialization
+- Use libc::poll in XFixes clipboard event loop to avoid 50ms busy sleep
+- Optimize Planar RDP 6.0 zigzag delta filtering to be branchless and SIMD-friendly
+- Direct map Latin-1 codepoints to standard X11 keysyms
+- Sanitize odd-length UTF-16 strings in ClientInfo PDU decoding
+- Support 32bpp RGBA cursor encoding and sync default pointer on connect
+
 * Sun Aug 23 2026 kmsrdp contributors <noreply@example.com> - 0.1.47-1
 - Parse GFX/FPS in Config and pass them through the server builder
   (rdpcore-server no longer reads KMSRDP_* itself)
