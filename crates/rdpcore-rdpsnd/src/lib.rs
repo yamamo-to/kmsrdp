@@ -7,6 +7,7 @@
 pub mod pdu;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use rdpcore_pdu::DecodeError;
 use rdpcore_pdu::svc::wrap_indication;
@@ -128,6 +129,14 @@ pub struct RdpsndChannel {
     /// when this is at least [`pdu::VERSION_V8`].
     client_version: u16,
     block_no: u8,
+    /// Blocks sent and not yet WaveConfirmed. MS-RDPEA confirms after the
+    /// client has finished emitting the sample, so this is the play queue.
+    outstanding: u8,
+    last_send: Option<Instant>,
+    sent_at_ms: [u32; 256],
+    clock: Instant,
+    best_confirm_rtt_ms: Option<u32>,
+    last_confirm_rtt_ms: Option<u32>,
 }
 
 impl RdpsndChannel {
@@ -152,6 +161,12 @@ impl RdpsndChannel {
                 negotiated: None,
                 client_version: 0,
                 block_no: 0,
+                outstanding: 0,
+                last_send: None,
+                sent_at_ms: [0; 256],
+                clock: Instant::now(),
+                best_confirm_rtt_ms: None,
+                last_confirm_rtt_ms: None,
             },
             initial,
         )
@@ -159,6 +174,56 @@ impl RdpsndChannel {
 
     pub fn channel_id(&self) -> u16 {
         self.channel_id
+    }
+
+    /// Spec: confirm after the client has *finished emitting* the sample.
+    /// Four unacked 20 ms blocks is 80 ms of play-queue — enough jitter,
+    /// not enough to accumulate seconds of lag. xrdp uses the same
+    /// confirm-RTT vs best-RTT idea (they drop when RTT is 250 ms worse).
+    const MAX_UNACKED_BLOCKS: u8 = 4;
+    const CONFIRM_SLACK_MS: u32 = 80;
+    const CONFIRM_STALL_MS: u32 = 500;
+
+    fn now_ms(&self) -> u32 {
+        self.clock.elapsed().as_millis() as u32
+    }
+
+    fn on_wave_confirm(&mut self, block_no: u8) {
+        let rtt = self
+            .now_ms()
+            .saturating_sub(self.sent_at_ms[block_no as usize]);
+        self.last_confirm_rtt_ms = Some(rtt);
+        self.best_confirm_rtt_ms = Some(match self.best_confirm_rtt_ms {
+            Some(best) => best.min(rtt),
+            None => rtt,
+        });
+        self.outstanding = self.outstanding.saturating_sub(1);
+    }
+
+    fn should_skip_send(&mut self) -> bool {
+        if self.outstanding >= Self::MAX_UNACKED_BLOCKS {
+            if self
+                .last_send
+                .is_some_and(|t| t.elapsed().as_millis() as u32 > Self::CONFIRM_STALL_MS)
+            {
+                // Client is not confirming (or confirms were lost). Do not
+                // deadlock the stream open-loop; the next confirm window
+                // can tighten again.
+                self.outstanding = 0;
+                return false;
+            }
+            return true;
+        }
+        matches!(
+            (self.best_confirm_rtt_ms, self.last_confirm_rtt_ms),
+            (Some(best), Some(last)) if last > best.saturating_add(Self::CONFIRM_SLACK_MS)
+        )
+    }
+
+    fn note_send(&mut self, block_no: u8) {
+        self.sent_at_ms[block_no as usize] = self.now_ms();
+        self.last_send = Some(Instant::now());
+        self.outstanding = self.outstanding.saturating_add(1);
     }
 
     fn training_frames(&self) -> Vec<Vec<u8>> {
@@ -207,11 +272,12 @@ impl RdpsndChannel {
                 self.state = State::Ready;
                 Ok(Vec::new())
             }
-            // WaveConfirm, late Quality Mode, or anything arriving out of
-            // the expected sequence - a real implementation ignores
-            // WaveConfirm entirely (no flow control gating on it) and
-            // this one does the same; out-of-sequence messages are
-            // likewise dropped rather than treated as connection-fatal.
+            (pdu::ClientMessage::WaveConfirm { block_no, .. }, _) => {
+                self.on_wave_confirm(block_no);
+                Ok(Vec::new())
+            }
+            // Late Quality Mode or anything arriving out of the expected
+            // sequence is dropped rather than treated as connection-fatal.
             _ => Ok(Vec::new()),
         }
     }
@@ -226,6 +292,9 @@ impl RdpsndChannel {
     /// than silently truncating the wire length field.
     pub fn encode_wave(&mut self, pcm: Vec<u8>, timestamp_ms: u32) -> Vec<Vec<u8>> {
         if !matches!(self.state, State::Ready) {
+            return Vec::new();
+        }
+        if self.should_skip_send() {
             return Vec::new();
         }
         let Some(format_no) = self.negotiated.as_ref().map(|n| n.format_no) else {
@@ -253,6 +322,10 @@ impl RdpsndChannel {
             pcm.chunks(pdu::MAX_WAVE2_CHUNK_BYTES).collect()
         };
         for chunk in chunks {
+            if self.should_skip_send() {
+                break;
+            }
+            self.note_send(self.block_no);
             let body = pdu::encode_wave2(format_no, self.block_no, timestamp_ms, chunk);
             self.block_no = self.block_no.wrapping_add(1);
             out.extend(wrap_indication(self.user_channel_id, self.channel_id, body));
@@ -274,6 +347,9 @@ impl RdpsndChannel {
         let mut out = Vec::new();
         let ts16 = timestamp_ms as u16;
         for chunk in pcm.chunks(pdu::MAX_WAVE_INFO_CHUNK_BYTES) {
+            if self.should_skip_send() {
+                break;
+            }
             let padded;
             let chunk = if chunk.len() < 4 {
                 padded = {
@@ -285,6 +361,7 @@ impl RdpsndChannel {
             } else {
                 chunk
             };
+            self.note_send(self.block_no);
             let info = pdu::encode_wave_info(format_no, self.block_no, ts16, chunk);
             let rest = pdu::encode_wave_rest(chunk);
             self.block_no = self.block_no.wrapping_add(1);
@@ -482,25 +559,63 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wave_confirm_is_ignored_without_erroring() {
+    fn wave_confirm_payload(block_no: u8) -> Vec<u8> {
         use rdpcore_pdu::cursor::WriteBuf;
-        let handler = Box::<FakeHandler>::default();
-        let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
-
         let mut wave_confirm = Vec::new();
         wave_confirm.write_u8(pdu::SNDC_WAVECONFIRM);
         wave_confirm.write_u8(0);
         wave_confirm.write_u16_le(4);
         wave_confirm.write_u16_le(0);
+        wave_confirm.write_u8(block_no);
         wave_confirm.write_u8(0);
-        wave_confirm.write_u8(0);
+        as_single_incoming_chunk(&wave_confirm)
+    }
 
+    #[test]
+    fn wave_confirm_is_accepted_without_erroring() {
+        let handler = Box::<FakeHandler>::default();
+        let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
         assert!(
             channel
-                .on_channel_data(&as_single_incoming_chunk(&wave_confirm))
+                .on_channel_data(&wave_confirm_payload(0))
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn encode_wave_stops_when_wave_confirms_fall_behind() {
+        let formats = vec![pdu::AudioFormat::pcm(2, 48000, 16)];
+        let handler = Box::new(FakeHandler {
+            formats: formats.clone(),
+            ..Default::default()
+        });
+        let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
+        complete_v8_negotiation(&mut channel, &formats);
+
+        let mut sent = 0usize;
+        for _ in 0..10 {
+            if !channel.encode_wave(vec![0x11; 64], 0).is_empty() {
+                sent += 1;
+            }
+        }
+        assert_eq!(
+            sent,
+            usize::from(RdpsndChannel::MAX_UNACKED_BLOCKS),
+            "open-loop send must stop at the confirm window"
+        );
+
+        for block in 0..sent {
+            assert!(
+                channel
+                    .on_channel_data(&wave_confirm_payload(block as u8))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(
+            !channel.encode_wave(vec![0x11; 64], 1).is_empty(),
+            "confirming the window must allow another wave"
         );
     }
 

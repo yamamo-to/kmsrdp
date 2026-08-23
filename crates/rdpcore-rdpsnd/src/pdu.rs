@@ -8,9 +8,8 @@
 //! (`SNDC_QUALITYMODE`, required when both sides are ≥ v6), Training/
 //! TrainingConfirm (`SNDC_TRAINING`), Wave2 (`SNDC_WAVE2`, when both sides
 //! are ≥ v8), and the legacy WaveInfo + Wave pair for older clients.
-//! WaveConfirm (`SNDC_WAVECONFIRM`) is decoded only enough to skip over
-//! it - a real server implementation doesn't wait for it before sending
-//! more audio, so this one doesn't either.
+//! WaveConfirm (`SNDC_WAVECONFIRM`) is decoded so the server can bound
+//! unplayed audio on the client (MS-RDPEA 1.3.2.2 / 3.2.5.2.1.6).
 
 use rdpcore_pdu::DecodeError;
 use rdpcore_pdu::cursor::{ReadCursor, WriteBuf};
@@ -186,10 +185,10 @@ pub fn encode_training() -> Vec<u8> {
     out
 }
 
-/// Server -> client, `SNDC_WAVE2`: `wTimeStamp`(unused, always 0) +
-/// `wFormatNo` + `cBlockNo` + 3 bytes padding + `dwAudioTimestamp` (the
-/// real per-chunk timestamp) + raw audio data running to the end of the
-/// PDU.
+/// Server -> client, `SNDC_WAVE2`: `wTimeStamp` (low 16 bits of the
+/// sample clock, as MS-RDPEA 2.2.3.13 requires for PDU-build time) +
+/// `wFormatNo` + `cBlockNo` + 3 bytes padding + `dwAudioTimestamp` +
+/// raw audio data running to the end of the PDU.
 /// Largest `data` that fits in one `Wave2` PDU: `BodySize` is a `u16` and
 /// the fixed header ahead of `data` is 12 bytes. Callers with more than
 /// this (see [`crate::RdpsndChannel::encode_wave`]) must split across
@@ -244,7 +243,7 @@ pub fn encode_wave2(format_no: u16, block_no: u8, timestamp_ms: u32, data: &[u8]
     let body_len = 12 + data.len();
     let mut out = Vec::with_capacity(body_len + 4);
     write_header(&mut out, SNDC_WAVE2, body_len);
-    out.write_u16_le(0); // wTimeStamp (legacy, unused in Wave2)
+    out.write_u16_le(timestamp_ms as u16);
     out.write_u16_le(format_no);
     out.write_u8(block_no);
     out.write_slice(&[0u8; 3]); // padding
@@ -284,14 +283,13 @@ pub fn negotiate_formats(
 }
 
 /// What the server needs to react to from an incoming `"rdpsnd"` channel
-/// payload; `WaveConfirm` and anything else this crate doesn't act on
-/// still decodes far enough to be safely skipped (correct framing matters
-/// even for messages whose content is ignored).
+/// payload. Unknown messages still decode far enough to be skipped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientMessage {
     AudioFormats(ClientAudioFormats),
     TrainingConfirm,
     QualityMode,
+    WaveConfirm { timestamp: u16, block_no: u8 },
     Other,
 }
 
@@ -308,6 +306,15 @@ pub fn decode_client_message(input: &[u8]) -> Result<ClientMessage, DecodeError>
         )?)),
         SNDC_TRAINING => Ok(ClientMessage::TrainingConfirm),
         SNDC_QUALITYMODE => Ok(ClientMessage::QualityMode),
+        SNDC_WAVECONFIRM => {
+            let mut body = ReadCursor::new(body);
+            let timestamp = body.read_u16_le()?;
+            let block_no = body.read_u8()?;
+            Ok(ClientMessage::WaveConfirm {
+                timestamp,
+                block_no,
+            })
+        }
         _ => Ok(ClientMessage::Other),
     }
 }
@@ -414,12 +421,25 @@ mod tests {
     }
 
     #[test]
-    fn wave_confirm_and_unknown_messages_decode_as_other_without_erroring() {
+    fn wave_confirm_decodes_block_no() {
         let mut pdu = Vec::new();
         write_header(&mut pdu, SNDC_WAVECONFIRM, 4);
         pdu.write_u16_le(0x1234); // wTimeStamp
         pdu.write_u8(5); // cConfirmedBlockNo
         pdu.write_u8(0); // pad
+        assert_eq!(
+            decode_client_message(&pdu).unwrap(),
+            ClientMessage::WaveConfirm {
+                timestamp: 0x1234,
+                block_no: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_messages_decode_as_other_without_erroring() {
+        let mut pdu = Vec::new();
+        write_header(&mut pdu, 0x7F, 0);
         assert_eq!(decode_client_message(&pdu).unwrap(), ClientMessage::Other);
     }
 
@@ -446,6 +466,7 @@ mod tests {
         assert_eq!(body_len, 12 + data.len());
         // wFormatNo at body offset 2, cBlockNo at offset 4, dwAudioTimestamp at offset 8.
         let body = &encoded[4..];
+        assert_eq!(u16::from_le_bytes([body[0], body[1]]), 0x1000);
         assert_eq!(u16::from_le_bytes([body[2], body[3]]), 3);
         assert_eq!(body[4], 7);
         assert_eq!(
