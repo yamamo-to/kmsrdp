@@ -184,6 +184,8 @@ fn xfixes_selection_loop(
     conn.flush().map_err(std::io::Error::other)?;
     active.store(true, Ordering::SeqCst);
 
+    use std::os::unix::io::AsRawFd as _;
+
     while !stop.load(Ordering::Relaxed) {
         match conn.poll_for_event() {
             Ok(Some(Event::XfixesSelectionNotify(_))) => {
@@ -197,7 +199,18 @@ fn xfixes_selection_loop(
                 }
             }
             Ok(Some(_)) => {}
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                // Wait on the X11 connection fd with a timeout so we don't busy-loop/wake every 50ms,
+                // while still periodically checking the `stop` flag.
+                let mut pfd = libc::pollfd {
+                    fd: conn.stream().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                unsafe {
+                    libc::poll(&mut pfd, 1, 500);
+                }
+            }
             Err(e) => {
                 active.store(false, Ordering::SeqCst);
                 return Err(std::io::Error::other(e));

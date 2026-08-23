@@ -62,6 +62,16 @@ fn scratch_keycode_pool(min: u8, max: u8) -> [u8; SCRATCH_KEYCODE_POOL_SIZE as u
     pool
 }
 
+pub fn unicode_to_keysym(codepoint: u32) -> u32 {
+    // Standard X11 keysym conversion: Latin-1 (0x20..=0xFF) map 1:1,
+    // while higher Unicode codepoints use the 0x01000000 + codepoint offset.
+    if codepoint <= 0x00ff {
+        codepoint
+    } else {
+        0x0100_0000 + codepoint
+    }
+}
+
 impl X11Connection {
     fn open(display: &str) -> io::Result<Self> {
         let (conn, screen_num) = x11rb::connect(Some(display))
@@ -78,9 +88,7 @@ impl X11Connection {
     }
 
     fn type_char(&mut self, codepoint: u32) -> io::Result<()> {
-        // ICCCM/XKB convention: keysyms for codepoints outside Latin-1 are
-        // `0x01000000 + codepoint`.
-        let keysym = 0x0100_0000 + codepoint;
+        let keysym = unicode_to_keysym(codepoint);
         let keycode = self.scratch_keycodes[self.next_slot];
         self.next_slot = (self.next_slot + 1) % self.scratch_keycodes.len();
 
@@ -249,6 +257,13 @@ mod tests {
     fn scratch_keycode_pool_handles_a_single_free_keycode() {
         let pool = scratch_keycode_pool(255, 255);
         assert!(pool.iter().all(|&k| k == 255));
+    }
+
+    #[test]
+    fn unicode_to_keysym_latin1_and_extended() {
+        assert_eq!(unicode_to_keysym(0x41), 0x41); // 'A'
+        assert_eq!(unicode_to_keysym(0xE9), 0xE9); // 'é' (Latin-1)
+        assert_eq!(unicode_to_keysym('あ' as u32), 0x0100_0000 + ('あ' as u32));
     }
 
     fn session_rx(session: Option<Session>) -> watch::Receiver<Option<Session>> {

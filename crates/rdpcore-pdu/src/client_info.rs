@@ -170,7 +170,9 @@ impl ClientInfo {
 /// (which excludes the terminator, per the field's own convention) plus
 /// the 2-byte NUL terminator that's still on the wire after it.
 fn read_string_body(cursor: &mut ReadCursor<'_>, len: usize) -> Result<String, DecodeError> {
-    let s = decode_units(cursor.read_slice(len)?);
+    let raw = cursor.read_slice(len)?;
+    let even_len = len & !1;
+    let s = decode_units(&raw[..even_len]);
     cursor.ensure(2).map_err(DecodeError::NotEnoughBytes)?;
     cursor.advance(2); // NUL terminator, not part of `len`
     Ok(s)

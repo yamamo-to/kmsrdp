@@ -99,30 +99,27 @@ pub fn decode(data: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Decod
 // Per-plane vertical delta filter (zigzag-packed)
 // ---------------------------------------------------------------------
 
+#[inline(always)]
 fn zigzag_encode(raw_delta: u8) -> u8 {
-    if raw_delta < 128 {
-        raw_delta << 1
-    } else {
-        ((255 - raw_delta) << 1) + 1
-    }
+    let signed = raw_delta as i8 as i16;
+    ((signed << 1) ^ (signed >> 15)) as u8
 }
 
+#[inline(always)]
 fn zigzag_decode(encoded: u8) -> u8 {
-    if encoded & 1 != 0 {
-        255 - ((encoded - 1) >> 1)
-    } else {
-        encoded >> 1
-    }
+    let half = (encoded >> 1) as i16;
+    let mask = (encoded as i16 & 1).wrapping_neg();
+    (half ^ mask) as u8
 }
 
 fn encode_plane_stack(plane: &[u8], width: usize, height: usize, out: &mut Vec<u8>) {
     let mut delta = [0u8; MAX_STACK_PIXELS];
     delta[..width].copy_from_slice(&plane[..width]); // row 0: literal, unfiltered
     for row in 1..height {
-        for col in 0..width {
-            let idx = row * width + col;
-            let above = plane[idx - width];
-            delta[idx] = zigzag_encode(plane[idx].wrapping_sub(above));
+        let (above_row, curr_row) = plane[(row - 1) * width..(row + 1) * width].split_at(width);
+        let dst_row = &mut delta[row * width..(row + 1) * width];
+        for ((dst, &curr), &above) in dst_row.iter_mut().zip(curr_row).zip(above_row) {
+            *dst = zigzag_encode(curr.wrapping_sub(above));
         }
     }
     for row in 0..height {
@@ -134,10 +131,10 @@ fn encode_plane_heap(plane: &[u8], width: usize, height: usize, out: &mut Vec<u8
     let mut delta = vec![0u8; width * height];
     delta[..width].copy_from_slice(&plane[..width]); // row 0: literal, unfiltered
     for row in 1..height {
-        for col in 0..width {
-            let idx = row * width + col;
-            let above = plane[idx - width];
-            delta[idx] = zigzag_encode(plane[idx].wrapping_sub(above));
+        let (above_row, curr_row) = plane[(row - 1) * width..(row + 1) * width].split_at(width);
+        let dst_row = &mut delta[row * width..(row + 1) * width];
+        for ((dst, &curr), &above) in dst_row.iter_mut().zip(curr_row).zip(above_row) {
+            *dst = zigzag_encode(curr.wrapping_sub(above));
         }
     }
     for row in 0..height {
