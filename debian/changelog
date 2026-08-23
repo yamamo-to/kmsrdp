@@ -1,3 +1,16 @@
+kmsrdp (0.1.49) unstable; urgency=medium
+
+  * Add DMA_BUF_IOCTL_SYNC cache synchronization around CPU mmap reads in KMS capture.
+  * Handle FUSE inode metadata lookup failures and thread spawn gracefully without panicking.
+  * Fix ASN.1 BER INTEGER positive sign bit encoding for values >= 0x8000_0000.
+  * Fix FastPathInput encoding for zero events to include explicit count byte per MS-RDPBCGR.
+  * Add Japanese keyboard (Henkan/Muhenkan/Kana/Zenkaku) and media keycodes mapping in uinput.
+  * Offload synchronous clipboard IPC to spawn_blocking in LocalClipboardBackend.
+  * Guard buffer slicing in bitmap diff, tile encoding, pointer, and rdp6 decode_plane.
+  * Eliminate unchecked unwraps in ReadCursor::read_u64_le.
+
+ -- kmsrdp contributors <noreply@example.com>  Sun, 23 Aug 2026 11:08:00 +0900
+
 kmsrdp (0.1.48) unstable; urgency=medium
 
   * Clear KMSRDP_PASSWORD from environment after reading to reduce memory exposure.

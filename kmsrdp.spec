@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.48
+Version:        0.1.49
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,16 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Sun Aug 23 2026 kmsrdp contributors <noreply@example.com> - 0.1.49-1
+- Add DMA_BUF_IOCTL_SYNC cache synchronization around CPU mmap reads in KMS capture
+- Handle FUSE inode metadata lookup failures and thread spawn gracefully without panicking
+- Fix ASN.1 BER INTEGER positive sign bit encoding for values >= 0x8000_0000
+- Fix FastPathInput encoding for zero events to include explicit count byte per MS-RDPBCGR
+- Add Japanese keyboard (Henkan/Muhenkan/Kana/Zenkaku) and media keycodes mapping in uinput
+- Offload synchronous clipboard IPC to spawn_blocking in LocalClipboardBackend
+- Guard buffer slicing in bitmap diff, tile encoding, pointer, and rdp6 decode_plane
+- Eliminate unchecked unwraps in ReadCursor::read_u64_le
+
 * Sun Aug 23 2026 kmsrdp contributors <noreply@example.com> - 0.1.48-1
 - Clear KMSRDP_PASSWORD from environment after reading to reduce memory exposure
 - Add automatic recovery and backoff for GPU detiler on render failure
