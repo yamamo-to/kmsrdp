@@ -1,3 +1,11 @@
+kmsrdp (0.1.51) unstable; urgency=medium
+
+  * Replace anyhow with structured thiserror types (DisplayError, ServerError) in rdpcore-server.
+  * Optimize bitmap encode and avoid blocking Tokio worker threads.
+  * Enforce codebase formatting consistency with cargo fmt.
+
+ -- kmsrdp contributors <noreply@example.com>  Mon, 24 Aug 2026 01:28:00 +0900
+
 kmsrdp (0.1.50) unstable; urgency=medium
 
   * Replace encoder String errors with structured EncoderError (thiserror).

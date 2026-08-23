@@ -51,8 +51,12 @@ impl RdpServerDisplay for StaticDisplay {
         }
     }
 
-    async fn updates(&self) -> Result<Box<dyn RdpServerDisplayUpdates>, crate::error::DisplayError> {
-        Err(crate::error::DisplayError::Other("unused during negotiate".into()))
+    async fn updates(
+        &self,
+    ) -> Result<Box<dyn RdpServerDisplayUpdates>, crate::error::DisplayError> {
+        Err(crate::error::DisplayError::Other(
+            "unused during negotiate".into(),
+        ))
     }
 }
 
@@ -491,7 +495,9 @@ impl RdpServerDisplay for IdleDisplay {
         }
     }
 
-    async fn updates(&self) -> Result<Box<dyn RdpServerDisplayUpdates>, crate::error::DisplayError> {
+    async fn updates(
+        &self,
+    ) -> Result<Box<dyn RdpServerDisplayUpdates>, crate::error::DisplayError> {
         Ok(Box::new(IdleUpdates))
     }
 }

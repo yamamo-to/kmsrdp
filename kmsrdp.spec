@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.50
+Version:        0.1.51
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,11 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Mon Aug 24 2026 kmsrdp contributors <noreply@example.com> - 0.1.51-1
+- Replace anyhow with structured thiserror types (DisplayError, ServerError) in rdpcore-server
+- Optimize bitmap encode and avoid blocking Tokio worker threads
+- Enforce codebase formatting consistency with cargo fmt
+
 * Sun Aug 23 2026 kmsrdp contributors <noreply@example.com> - 0.1.50-1
 - Replace encoder String errors with structured EncoderError (thiserror)
 - Optimize BGRX-to-YUV420 color conversion by pre-slicing row pointers

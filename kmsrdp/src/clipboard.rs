@@ -53,7 +53,6 @@ fn set_local_text(text: String) {
     }
 }
 
-
 fn advertise_unicode_formats(sender: &UnboundedSender<ClipboardMessage>) -> bool {
     sender
         .send(ClipboardMessage::SendInitiateCopy(vec![
@@ -70,7 +69,9 @@ fn spawn_shared_clipboard_watcher(
     mut session_rx: watch::Receiver<Option<Session>>,
 ) {
     tokio::spawn(async move {
-        let mut last = tokio::task::spawn_blocking(local_text).await.unwrap_or(None);
+        let mut last = tokio::task::spawn_blocking(local_text)
+            .await
+            .unwrap_or(None);
         let mut xfixes_stop = Arc::new(AtomicBool::new(false));
         let mut xfixes_active =
             start_xfixes_watch(Arc::clone(&subscribers), Arc::clone(&xfixes_stop));

@@ -405,7 +405,9 @@ impl RdpServerDisplay for Display {
         *mutex_lock(&self.hub.size)
     }
 
-    async fn updates(&self) -> Result<Box<dyn RdpServerDisplayUpdates>, rdpcore_server::DisplayError> {
+    async fn updates(
+        &self,
+    ) -> Result<Box<dyn RdpServerDisplayUpdates>, rdpcore_server::DisplayError> {
         Ok(Box::new(self.hub.subscribe()))
     }
 

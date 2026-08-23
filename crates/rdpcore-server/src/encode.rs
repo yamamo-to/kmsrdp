@@ -147,7 +147,9 @@ pub(crate) fn encode_bitmap_update(
         }
     }
 
-    let max_rects = policy.max_rects_per_update.min(scratch.rectangles.len().max(1));
+    let max_rects = policy
+        .max_rects_per_update
+        .min(scratch.rectangles.len().max(1));
     for chunk in scratch.rectangles.chunks(max_rects) {
         let wire = encode_rectangles_to_wire_frames(chunk, policy.max_request_size);
         stats.encoded_bytes += chunk.iter().map(|r| r.data.len()).sum::<usize>();
