@@ -25,9 +25,12 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
   (`KMSRDP_DISPLAY=all` / unset) or one connector (`KMSRDP_DISPLAY=DP-1` /
   `card1:DP-1`); Save Session Info (PLAINNOTIFY) on connect; Monitor Layout
   when two or more CRTCs are composited
-- **Input:** `uinput` mouse/keyboard; CJK IME text on X11 (XTest)
+- **Input:** `uinput` mouse/keyboard with Japanese 106/109 key mapping
+  (Henkan, Muhenkan, Kana, Zenkaku/Hankaku) and media keys; CJK IME text on
+  X11 (XTest)
 - **Clipboard:** text-only CLIPRDR; one process-wide local poller shared by
-  all sessions
+  all sessions; configurable mode (`KMSRDP_CLIPBOARD=bidirectional`,
+  `host-to-client`, `client-to-host`, `disabled`)
 - **Audio:** output (RDPSND) and mic input (RDPEAI) via libpulse; per connection
 - **Drives:** RDPDR → FUSE at `$XDG_RUNTIME_DIR/kmsrdp/drives/<DosName>`
   (list/read/write/create/mkdir/unlink/rmdir/rename/setattr size & times;
@@ -103,7 +106,10 @@ clients that cannot do CredSSP; `KMSRDP_MAX_SESSIONS=2` to allow a second
 authenticated client (they still share one desktop, one input device, and
 one FUSE drive mount; max 32); `KMSRDP_PASSWORD_FILE=/path` (or systemd
 `LoadCredential=kmsrdp.password`) so the password is not in the process
-environment; `KMSRDP_TLS_HOSTS=host,1.2.3.4`
+environment; `KMSRDP_CLIPBOARD=host-to-client` (or `client-to-host`,
+`disabled`) to restrict clipboard sync direction; `KMSRDP_FPS=30` (or
+`KMSRDP_FRAME_INTERVAL_MS=33`) for custom capture rates (default 20 fps);
+`KMSRDP_TLS_HOSTS=host,1.2.3.4`
 for certificate SANs (applied when the cert is first created — delete the
 persisted files to regenerate); `KMSRDP_TLS_DIR` / `KMSRDP_TLS_CERT`+`KEY`
 to choose where the identity is stored; `KMSRDP_TLS_EPHEMERAL=1` to skip
