@@ -38,11 +38,18 @@ fn ensure_null_sink_loaded(uid: u32) {
 }
 
 fn ensure_null_sink_loaded_with(uid: u32, ensure: impl FnOnce() -> bool) {
-    if INITIALIZED_UIDS.lock().unwrap().contains(&uid) {
+    if INITIALIZED_UIDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&uid)
+    {
         return;
     }
     let _ = ensure();
-    INITIALIZED_UIDS.lock().unwrap().insert(uid);
+    INITIALIZED_UIDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(uid);
 }
 
 pub struct VirtualMicFactory;

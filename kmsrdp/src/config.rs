@@ -197,7 +197,14 @@ pub fn listen_addr() -> Result<SocketAddr> {
 fn load_credentials() -> Result<(String, String, bool)> {
     let username = std::env::var("KMSRDP_USER").unwrap_or_else(|_| "kmsrdp".to_string());
     match std::env::var("KMSRDP_PASSWORD") {
-        Ok(password) => Ok((username, password, false)),
+        Ok(password) => {
+            // Safety: Single-threaded startup phase before multithreading begins.
+            // Minimizes the window where the secret is visible in /proc/<pid>/environ.
+            unsafe {
+                std::env::remove_var("KMSRDP_PASSWORD");
+            }
+            Ok((username, password, false))
+        }
         Err(_) => {
             if let Some((path, password)) = read_password_file()? {
                 tracing::info!(

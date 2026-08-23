@@ -679,5 +679,14 @@ pub fn detile_to_bgrx(
         }
     }
     let detiler = slot.detiler.as_mut().expect("just initialized above");
-    detiler.detile(fd, fourcc, modifier, width, height, offset, pitch)
+    match detiler.detile(fd, fourcc, modifier, width, height, offset, pitch) {
+        Ok(data) => Ok(data),
+        Err(e) => {
+            // EGL/GL context might be left in an inconsistent state; drop the detiler
+            // so a clean context is recreated on the next attempt after backoff.
+            slot.detiler = None;
+            slot.retry_after = Some(Instant::now() + DETILER_RETRY_BACKOFF);
+            Err(e)
+        }
+    }
 }
