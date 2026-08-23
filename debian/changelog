@@ -1,3 +1,11 @@
+kmsrdp (0.1.54) unstable; urgency=medium
+
+  * Keep RDPSND live: cap Pulse capture, drain to the live edge, and pace sends.
+  * Overwrite unread waves on a slow socket instead of queueing PCM.
+  * Bound outstanding Wave2 blocks to WaveConfirm so client play-queue lag cannot grow.
+
+ -- kmsrdp contributors <noreply@example.com>  Mon, 24 Aug 2026 03:29:00 +0900
+
 kmsrdp (0.1.53) unstable; urgency=medium
 
   * Advertise RDPSND v8 so clients accept Wave2 instead of dropping audio.

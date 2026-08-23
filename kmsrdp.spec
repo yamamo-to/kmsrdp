@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.53
+Version:        0.1.54"
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,11 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Mon Aug 24 2026 kmsrdp contributors <noreply@example.com> - 0.1.54-1
+- Keep RDPSND live: cap Pulse capture, drain to the live edge, pace sends
+- Overwrite unread waves on a slow socket instead of queueing PCM
+- Bound outstanding Wave2 blocks to WaveConfirm so client lag cannot grow
+
 * Mon Aug 24 2026 kmsrdp contributors <noreply@example.com> - 0.1.53-1
 - Advertise RDPSND v8 so clients accept Wave2 instead of dropping audio
 - Wait for Quality Mode on v6+ clients and fall back to WaveInfo+Wave for older ones
