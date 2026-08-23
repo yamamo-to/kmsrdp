@@ -14,7 +14,7 @@ use rdpcore_server::{
 };
 use tokio::sync::broadcast;
 
-use crate::capture;
+use crate::capture::{self, CaptureCompare};
 
 /// Desktop dimensions mouse coordinates are normalized against - shared
 /// with input so a resize updates both sides together.
@@ -88,6 +88,7 @@ impl DisplayHub {
     ) {
         /// Prior frame pixels shared with `latest_full` via [`Arc`] so the
         /// dirty-rect pass does not need a second framebuffer copy.
+        #[derive(Clone)]
         struct PrevFrame {
             width: u32,
             height: u32,
@@ -98,14 +99,24 @@ impl DisplayHub {
         let mut negotiated_size = *Self::lock(&self.size);
         let mut consecutive_failures: u32 = 0;
         let interval = frame_interval;
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut capturer = Some(capturer);
         loop {
+            ticker.tick().await;
             let current = capturer
                 .take()
                 .expect("capturer slot filled each iteration");
+            let prev_for_capture = previous.clone();
             let task = tokio::task::spawn_blocking(move || {
                 let mut current = current;
-                let result = current.capture();
+                let hint = prev_for_capture.as_ref().map(|p| CaptureCompare {
+                    width: p.width,
+                    height: p.height,
+                    stride: p.stride,
+                    data: p.data.as_ref(),
+                });
+                let result = current.capture_with_hint(hint);
                 (current, result)
             })
             .await;
@@ -144,7 +155,6 @@ impl DisplayHub {
                             }
                         }
                     }
-                    tokio::time::sleep(interval).await;
                     continue;
                 }
             };
@@ -193,6 +203,10 @@ impl DisplayHub {
                         continue;
                     }
 
+                    if raw.unchanged {
+                        continue;
+                    }
+
                     let (Some(width), Some(height), Some(stride)) = (
                         NonZeroU16::new(raw.width as u16),
                         NonZeroU16::new(raw.height as u16),
@@ -227,27 +241,32 @@ impl DisplayHub {
                         src_y: 0,
                     };
 
-                    let dirty_rects = match &previous {
-                        Some(prev)
-                            if !raw.force_full
-                                && prev.width == raw.width
-                                && prev.height == raw.height =>
-                        {
-                            coalesce_dirty_rects(
-                                find_dirty_rects(
-                                    prev.data.as_ref(),
-                                    prev.stride,
-                                    data.as_ref(),
-                                    raw.stride,
+                    let dirty_rects = match raw.dirty_rects {
+                        Some(rects) => {
+                            coalesce_dirty_rects(rects, raw.width as usize, raw.height as usize)
+                        }
+                        None => match &previous {
+                            Some(prev)
+                                if !raw.force_full
+                                    && prev.width == raw.width
+                                    && prev.height == raw.height =>
+                            {
+                                coalesce_dirty_rects(
+                                    find_dirty_rects(
+                                        prev.data.as_ref(),
+                                        prev.stride,
+                                        data.as_ref(),
+                                        raw.stride,
+                                        raw.width as usize,
+                                        raw.height as usize,
+                                        4,
+                                    ),
                                     raw.width as usize,
                                     raw.height as usize,
-                                    4,
-                                ),
-                                raw.width as usize,
-                                raw.height as usize,
-                            )
-                        }
-                        _ => vec![Rect::new(0, 0, raw.width as usize, raw.height as usize)],
+                                )
+                            }
+                            _ => vec![Rect::new(0, 0, raw.width as usize, raw.height as usize)],
+                        },
                     };
 
                     // Publish `latest_full` *before* broadcasting. A slow
@@ -290,7 +309,6 @@ impl DisplayHub {
                     }
                 }
             };
-            tokio::time::sleep(interval).await;
         }
     }
 }

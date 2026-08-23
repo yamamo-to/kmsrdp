@@ -10,6 +10,9 @@ use std::fs;
 use std::io;
 use std::os::unix::io::{AsFd, AsRawFd};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use rdpcore_server::diff::{Rect, find_dirty_rects};
 
 use drm::Device;
 use drm::control::{Device as ControlDevice, connector, crtc, plane, property};
@@ -190,6 +193,7 @@ struct CardCtx {
     name: String,
 }
 
+#[derive(Clone)]
 struct EnumeratedHead {
     card_idx: usize,
     crtc: crtc::Handle,
@@ -411,6 +415,65 @@ pub struct RawFrame {
     pub force_full: bool,
     /// Monitor layout relative to this frame's origin (always ≥1 entry).
     pub monitors: Vec<MonitorGeom>,
+    /// True when pixels match [`Capturer::capture_with_hint`]'s previous
+    /// frame; `data` is empty and the caller should keep its last buffer.
+    pub unchanged: bool,
+    /// Dirty rectangles computed while comparing against the previous
+    /// frame (so the display hub does not scan again). `None` means the
+    /// caller should treat the frame as a full-desktop update.
+    pub dirty_rects: Option<Vec<Rect>>,
+}
+
+/// Previous-frame pixels the capturer can compare against before copying.
+#[derive(Clone, Copy)]
+pub struct CaptureCompare<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub stride: usize,
+    pub data: &'a [u8],
+}
+
+/// Compare `src` to `prev` *before* allocating. Identical frames return an
+/// empty `Arc` plus `unchanged = true` so the caller can keep the last buffer.
+fn take_pixels(
+    src: &[u8],
+    src_stride: usize,
+    width: u32,
+    height: u32,
+    force_full: bool,
+    prev: Option<CaptureCompare<'_>>,
+) -> (Arc<[u8]>, bool, Option<Vec<Rect>>) {
+    if !force_full
+        && let Some(prev) = prev
+        && prev.width == width
+        && prev.height == height
+    {
+        let dirty = find_dirty_rects(
+            prev.data,
+            prev.stride,
+            src,
+            src_stride,
+            width as usize,
+            height as usize,
+            4,
+        );
+        if dirty.is_empty() {
+            return (Arc::from(&[][..]), true, Some(Vec::new()));
+        }
+        return (Arc::from(src), false, Some(dirty));
+    }
+    (Arc::from(src), false, None)
+}
+
+const HEAD_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+
+fn should_refresh_heads(
+    last: Option<Instant>,
+    now: Instant,
+    cached_empty: bool,
+    force: bool,
+) -> bool {
+    force || cached_empty || last.is_none_or(|t| now.duration_since(t) >= HEAD_REFRESH_INTERVAL)
 }
 
 /// Stateful screen capturer. The DRM card fd stays open for this object's
@@ -448,8 +511,14 @@ impl Capturer {
     }
 
     pub fn capture(&mut self) -> io::Result<RawFrame> {
+        self.capture_with_hint(None)
+    }
+
+    /// Like [`capture`](Self::capture), but skips the framebuffer `Arc`
+    /// allocation when `prev` is the same pixels (static desktop).
+    pub fn capture_with_hint(&mut self, prev: Option<CaptureCompare<'_>>) -> io::Result<RawFrame> {
         let drm_error = match &mut self.drm {
-            Some(drm) => match drm.capture() {
+            Some(drm) => match drm.capture(prev) {
                 Ok(frame) => {
                     self.note_backend("DRM/KMS");
                     return Ok(frame);
@@ -469,14 +538,19 @@ impl Capturer {
         };
 
         match crate::nvfbc::capture_bgrx() {
-            Ok((width, height, data)) => {
+            Ok((width, height, grabbed)) => {
                 self.note_backend("NvFBC");
+                let stride = width as usize * 4;
+                let (data, unchanged, dirty_rects) =
+                    take_pixels(&grabbed, stride, width, height, false, prev);
                 Ok(RawFrame {
                     width,
                     height,
-                    stride: width as usize * 4,
-                    data: data.into(),
+                    stride,
+                    data,
                     force_full: false,
+                    unchanged,
+                    dirty_rects,
                     monitors: vec![MonitorGeom {
                         left: 0,
                         top: 0,
@@ -572,6 +646,8 @@ struct DrmCapturer {
     /// (unlike the framebuffer attached to it, which is re-checked via
     /// `fb_handle`/`force_full` on every call regardless).
     primary_plane_cache: std::collections::HashMap<(usize, crtc::Handle), plane::Handle>,
+    cached_heads: Vec<EnumeratedHead>,
+    last_head_refresh: Option<Instant>,
 }
 
 struct CapturedHead {
@@ -582,6 +658,8 @@ struct CapturedHead {
     stride: usize,
     data: Arc<[u8]>,
     force_full: bool,
+    unchanged: bool,
+    dirty_rects: Option<Vec<Rect>>,
     connector: String,
 }
 
@@ -609,7 +687,46 @@ impl DrmCapturer {
             cards,
             head_fb,
             primary_plane_cache: std::collections::HashMap::new(),
+            cached_heads: heads,
+            last_head_refresh: Some(Instant::now()),
         })
+    }
+
+    fn sync_head_fb(&mut self, heads: &[EnumeratedHead]) {
+        self.head_fb
+            .retain(|s| heads.iter().any(|h| h.connector == s.connector));
+        for h in heads {
+            if !self.head_fb.iter().any(|s| s.connector == h.connector) {
+                self.head_fb.push(HeadFbState {
+                    connector: h.connector.clone(),
+                    last_fb: None,
+                });
+            }
+        }
+    }
+
+    fn heads_for_tick(&mut self, force: bool) -> io::Result<Vec<EnumeratedHead>> {
+        if !should_refresh_heads(
+            self.last_head_refresh,
+            Instant::now(),
+            self.cached_heads.is_empty(),
+            force,
+        ) {
+            return Ok(self.cached_heads.clone());
+        }
+        match refresh_heads(&self.cards) {
+            Ok(heads) => {
+                self.sync_head_fb(&heads);
+                self.cached_heads = heads.clone();
+                self.last_head_refresh = Some(Instant::now());
+                Ok(heads)
+            }
+            Err(e) if !force && !self.cached_heads.is_empty() => {
+                tracing::debug!("kmsrdp: head refresh failed, using cached heads: {e}");
+                Ok(self.cached_heads.clone())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// A CRTC's primary-plane assignment is fixed by the driver at
@@ -652,24 +769,27 @@ impl DrmCapturer {
         Ok(info)
     }
 
-    fn capture(&mut self) -> io::Result<RawFrame> {
-        let heads = refresh_heads(&self.cards)?;
-        // Drop FB state for connectors that disappeared; keep known ones.
-        self.head_fb
-            .retain(|s| heads.iter().any(|h| h.connector == s.connector));
-        for h in &heads {
-            if !self.head_fb.iter().any(|s| s.connector == h.connector) {
-                self.head_fb.push(HeadFbState {
-                    connector: h.connector.clone(),
-                    last_fb: None,
-                });
+    fn capture(&mut self, prev: Option<CaptureCompare<'_>>) -> io::Result<RawFrame> {
+        let heads = self.heads_for_tick(false)?;
+        match self.capture_heads(&heads, prev) {
+            Ok(frame) => Ok(frame),
+            Err(_) => {
+                let heads = self.heads_for_tick(true)?;
+                self.capture_heads(&heads, prev)
             }
         }
+    }
 
+    fn capture_heads(
+        &mut self,
+        heads: &[EnumeratedHead],
+        prev: Option<CaptureCompare<'_>>,
+    ) -> io::Result<RawFrame> {
+        let single = heads.len() == 1;
         let mut captured = Vec::with_capacity(heads.len());
-        for head in &heads {
-            let piece = self.capture_head(head)?;
-            captured.push(piece);
+        for head in heads {
+            let hint = if single { prev } else { None };
+            captured.push(self.capture_head(head, hint)?);
         }
 
         if captured.len() == 1 {
@@ -680,6 +800,8 @@ impl DrmCapturer {
                 stride: c.stride,
                 data: c.data,
                 force_full: c.force_full,
+                unchanged: c.unchanged,
+                dirty_rects: c.dirty_rects,
                 monitors: vec![MonitorGeom {
                     left: 0,
                     top: 0,
@@ -690,10 +812,14 @@ impl DrmCapturer {
             });
         }
 
-        Ok(compose_heads(&captured))
+        Ok(compose_heads(&captured, prev))
     }
 
-    fn capture_head(&mut self, head: &EnumeratedHead) -> io::Result<CapturedHead> {
+    fn capture_head(
+        &mut self,
+        head: &EnumeratedHead,
+        hint: Option<CaptureCompare<'_>>,
+    ) -> io::Result<CapturedHead> {
         let plane_info = self.primary_plane_for(head.card_idx, head.crtc)?;
         let card_ctx = &self.cards[head.card_idx];
 
@@ -765,7 +891,7 @@ impl DrmCapturer {
         let is_detileable_bgrx =
             matches!(fourcc, DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888) && modifier.is_some();
 
-        let (stride, data) = if is_plain_bgrx {
+        let (stride, data, unchanged, dirty_rects) = if is_plain_bgrx {
             let pitch = pitches[0] as usize;
             let map_len = pitch * height as usize;
             let mmap = unsafe {
@@ -775,18 +901,15 @@ impl DrmCapturer {
                     .map_err(|e| io::Error::other(format!("mmap failed: {e}")))?
             };
             dma_buf_sync_start(fd.as_raw_fd());
-            // Copy straight from the mmap into the Arc<[u8]> RawFrame/
-            // CapturedHead ultimately need, instead of an intermediate
-            // Vec that a later Vec -> Arc<[u8]> conversion would have to
-            // copy *again* (Arc<[u8]>'s layout has a refcount header a
-            // Vec's buffer doesn't, so that conversion can never just
-            // reuse the allocation) - halves the memcpy bandwidth for
-            // this, the most common (non-tiled) capture path.
-            let data = Arc::from(&mmap[..]);
+            // Compare the mapped FB to the previous frame *before*
+            // allocating. A static desktop then costs one memcmp, not a
+            // full framebuffer copy into a new Arc<[u8]>.
+            let (data, unchanged, dirty_rects) =
+                take_pixels(&mmap, pitch, width, height, force_full, hint);
             dma_buf_sync_end(fd.as_raw_fd());
-            (pitch, data)
+            (pitch, data, unchanged, dirty_rects)
         } else if is_detileable_bgrx {
-            let data: Arc<[u8]> = gpu_detile::detile_to_bgrx(
+            let detiled = gpu_detile::detile_to_bgrx(
                 &card_ctx.path,
                 fd.as_raw_fd(),
                 fourcc,
@@ -795,9 +918,11 @@ impl DrmCapturer {
                 height,
                 offsets[0],
                 pitches[0],
-            )?
-            .into();
-            (width as usize * 4, data)
+            )?;
+            let stride = width as usize * 4;
+            let (data, unchanged, dirty_rects) =
+                take_pixels(&detiled, stride, width, height, force_full, hint);
+            (stride, data, unchanged, dirty_rects)
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -816,13 +941,15 @@ impl DrmCapturer {
             stride,
             data,
             force_full,
+            unchanged,
+            dirty_rects,
             connector: head.connector.clone(),
         })
     }
 }
 
 /// Compose multiple head captures into one bounding-box canvas.
-fn compose_heads(heads: &[CapturedHead]) -> RawFrame {
+fn compose_heads(heads: &[CapturedHead], prev: Option<CaptureCompare<'_>>) -> RawFrame {
     let min_x = heads.iter().map(|h| h.x).min().unwrap_or(0);
     let min_y = heads.iter().map(|h| h.y).min().unwrap_or(0);
     let max_x = heads
@@ -838,7 +965,7 @@ fn compose_heads(heads: &[CapturedHead]) -> RawFrame {
     let canvas_w = (max_x - min_x).max(1) as u32;
     let canvas_h = (max_y - min_y).max(1) as u32;
     let stride = canvas_w as usize * 4;
-    let mut data = vec![0u8; stride * canvas_h as usize];
+    let mut canvas = vec![0u8; stride * canvas_h as usize];
     let force_full = heads.iter().any(|h| h.force_full);
 
     // Primary: head closest to origin (then first).
@@ -854,7 +981,7 @@ fn compose_heads(heads: &[CapturedHead]) -> RawFrame {
         let dx = head.x - min_x;
         let dy = head.y - min_y;
         blit_bgrx(
-            &mut data,
+            &mut canvas,
             stride,
             canvas_w,
             canvas_h,
@@ -874,12 +1001,16 @@ fn compose_heads(heads: &[CapturedHead]) -> RawFrame {
         });
     }
 
+    let (data, unchanged, dirty_rects) =
+        take_pixels(&canvas, stride, canvas_w, canvas_h, force_full, prev);
     RawFrame {
         width: canvas_w,
         height: canvas_h,
         stride,
-        data: data.into(),
+        data,
         force_full,
+        unchanged,
+        dirty_rects,
         monitors,
     }
 }
@@ -1008,6 +1139,8 @@ mod tests {
             stride: 8,
             data: vec![1, 0, 0, 0, 2, 0, 0, 0].into(),
             force_full: false,
+            unchanged: false,
+            dirty_rects: None,
             connector: "A".into(),
         };
         let right = CapturedHead {
@@ -1018,9 +1151,11 @@ mod tests {
             stride: 8,
             data: vec![3, 0, 0, 0, 4, 0, 0, 0].into(),
             force_full: true,
+            unchanged: false,
+            dirty_rects: None,
             connector: "B".into(),
         };
-        let frame = compose_heads(&[left, right]);
+        let frame = compose_heads(&[left, right], None);
         assert_eq!((frame.width, frame.height), (4, 1));
         assert!(frame.force_full);
         assert_eq!(frame.data[0], 1);
@@ -1090,5 +1225,72 @@ mod tests {
         let mut dst = vec![0u8; 8];
         blit_bgrx(&mut dst, 4, 1, 1, &src, 4, 1, 1, 0, 5);
         assert_eq!(dst, vec![0u8; 8]);
+    }
+
+    #[test]
+    fn take_pixels_reuses_nothing_when_frames_match() {
+        let frame = vec![7u8; 16];
+        let prev = CaptureCompare {
+            width: 2,
+            height: 2,
+            stride: 8,
+            data: &frame,
+        };
+        let (data, unchanged, dirty) = take_pixels(&frame, 8, 2, 2, false, Some(prev));
+        assert!(unchanged);
+        assert!(data.is_empty());
+        assert_eq!(dirty, Some(Vec::new()));
+    }
+
+    #[test]
+    fn take_pixels_copies_when_a_pixel_changes() {
+        let prev_bytes = vec![0u8; 16];
+        let mut src = prev_bytes.clone();
+        src[0] = 1;
+        let prev = CaptureCompare {
+            width: 2,
+            height: 2,
+            stride: 8,
+            data: &prev_bytes,
+        };
+        let (data, unchanged, dirty) = take_pixels(&src, 8, 2, 2, false, Some(prev));
+        assert!(!unchanged);
+        assert_eq!(&data[..], &src[..]);
+        assert!(dirty.as_ref().is_some_and(|r| !r.is_empty()));
+    }
+
+    #[test]
+    fn take_pixels_force_full_always_copies() {
+        let frame = vec![3u8; 16];
+        let prev = CaptureCompare {
+            width: 2,
+            height: 2,
+            stride: 8,
+            data: &frame,
+        };
+        let (data, unchanged, dirty) = take_pixels(&frame, 8, 2, 2, true, Some(prev));
+        assert!(!unchanged);
+        assert_eq!(&data[..], &frame[..]);
+        assert!(dirty.is_none());
+    }
+
+    #[test]
+    fn head_refresh_throttles_until_interval_elapses() {
+        let t0 = Instant::now();
+        assert!(!should_refresh_heads(
+            Some(t0),
+            t0 + Duration::from_millis(10),
+            false,
+            false
+        ));
+        assert!(should_refresh_heads(
+            Some(t0),
+            t0 + HEAD_REFRESH_INTERVAL,
+            false,
+            false
+        ));
+        assert!(should_refresh_heads(Some(t0), t0, true, false));
+        assert!(should_refresh_heads(Some(t0), t0, false, true));
+        assert!(should_refresh_heads(None, t0, false, false));
     }
 }

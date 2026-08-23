@@ -95,10 +95,10 @@ fn bt601_uv(samples: [(u32, u32, u32); 4]) -> (u8, u8) {
 fn for_each_block(
     w: usize,
     h: usize,
-    ow: usize,
+    _ow: usize,
     stride: usize,
     pixels: &[u8],
-    mut emit_y: impl FnMut(usize, u8),
+    mut emit_y: impl FnMut(usize, usize, u8),
     mut emit_uv: impl FnMut(usize, usize, u8, u8),
 ) {
     for row in (0..h).step_by(2) {
@@ -135,14 +135,14 @@ fn for_each_block(
                 u32::from(row2_slice[off1]),
             );
 
-            emit_y(row * ow + col, bt601_y(s0.0, s0.1, s0.2));
+            emit_y(row, col, bt601_y(s0.0, s0.1, s0.2));
             if has_col2 {
-                emit_y(row * ow + col + 1, bt601_y(s1.0, s1.1, s1.2));
+                emit_y(row, col + 1, bt601_y(s1.0, s1.1, s1.2));
             }
             if has_row2 {
-                emit_y(row2 * ow + col, bt601_y(s2.0, s2.1, s2.2));
+                emit_y(row2, col, bt601_y(s2.0, s2.1, s2.2));
                 if has_col2 {
-                    emit_y(row2 * ow + col + 1, bt601_y(s3.0, s3.1, s3.2));
+                    emit_y(row2, col + 1, bt601_y(s3.0, s3.1, s3.2));
                 }
             }
 
@@ -177,7 +177,7 @@ pub fn bgrx_to_i420(
         ow,
         stride,
         pixels,
-        |offset, y| y_plane[offset] = y,
+        |row, col, y| y_plane[row * ow + col] = y,
         |block_row, block_col, u, v| {
             let uv_index = block_row * uv_w + block_col;
             u_plane[uv_index] = u;
@@ -211,7 +211,7 @@ pub fn bgrx_to_nv12(
         ow,
         stride,
         pixels,
-        |offset, y| y_plane[offset] = y,
+        |row, col, y| y_plane[row * ow + col] = y,
         |block_row, block_col, u, v| {
             let uv_index = (block_row * uv_w + block_col) * 2;
             uv_plane[uv_index] = u;
@@ -220,6 +220,56 @@ pub fn bgrx_to_nv12(
     );
 
     Ok(out)
+}
+
+/// Convert BGRX32 into caller-owned NV12 planes (typically a mapped VA surface).
+///
+/// Writes only the visible `width`×`height` region; padding in `out_w`/`out_h`
+/// is left untouched so the caller can keep it black from a prior zeroing.
+#[allow(clippy::too_many_arguments)]
+pub fn bgrx_to_nv12_into(
+    width: u16,
+    height: u16,
+    stride: usize,
+    pixels: &[u8],
+    out_w: u16,
+    out_h: u16,
+    y_plane: &mut [u8],
+    y_pitch: usize,
+    uv_plane: &mut [u8],
+    uv_pitch: usize,
+) -> Result<(), EncoderError> {
+    let (w, h, ow, oh) = check_bgrx_geometry(width, height, stride, pixels, out_w, out_h)?;
+    let y_needed = oh
+        .saturating_sub(1)
+        .saturating_mul(y_pitch)
+        .saturating_add(ow);
+    let uv_needed = (oh / 2)
+        .saturating_sub(1)
+        .saturating_mul(uv_pitch)
+        .saturating_add(ow);
+    if y_pitch < ow || uv_pitch < ow || y_plane.len() < y_needed || uv_plane.len() < uv_needed {
+        return Err(EncoderError::InvalidGeometry(format!(
+            "NV12 dest too small: y {}/{y_needed} pitch {y_pitch}, uv {}/{uv_needed} pitch {uv_pitch}",
+            y_plane.len(),
+            uv_plane.len()
+        )));
+    }
+
+    for_each_block(
+        w,
+        h,
+        ow,
+        stride,
+        pixels,
+        |row, col, y| y_plane[row * y_pitch + col] = y,
+        |block_row, block_col, u, v| {
+            let i = block_row * uv_pitch + block_col * 2;
+            uv_plane[i] = u;
+            uv_plane[i + 1] = v;
+        },
+    );
+    Ok(())
 }
 
 /// A trivial encoder that emits a fixed fake Annex-B blob (for unit tests).
@@ -369,6 +419,38 @@ mod tests {
         let y_plane = &i420[..16];
         assert_eq!(y_plane[3], 0, "padding column must stay black");
         assert_eq!(y_plane[12], 0, "padding row must stay black");
+    }
+
+    #[test]
+    fn bgrx_to_nv12_into_matches_packed_nv12() {
+        let w = 4u16;
+        let h = 4u16;
+        let stride = usize::from(w) * 4;
+        let mut pixels = vec![0u8; stride * usize::from(h)];
+        for (i, px) in pixels.chunks_exact_mut(4).enumerate() {
+            px[0] = (i * 11) as u8;
+            px[1] = (i * 19) as u8;
+            px[2] = (i * 29) as u8;
+        }
+        let packed = bgrx_to_nv12(w, h, stride, &pixels, w, h).unwrap();
+        let y_size = usize::from(w) * usize::from(h);
+        let mut y = vec![0u8; y_size];
+        let mut uv = vec![0u8; y_size / 2];
+        bgrx_to_nv12_into(
+            w,
+            h,
+            stride,
+            &pixels,
+            w,
+            h,
+            &mut y,
+            usize::from(w),
+            &mut uv,
+            usize::from(w),
+        )
+        .unwrap();
+        assert_eq!(y, packed[..y_size]);
+        assert_eq!(uv, packed[y_size..]);
     }
 
     #[test]

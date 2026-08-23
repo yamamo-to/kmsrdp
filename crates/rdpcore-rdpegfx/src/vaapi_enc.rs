@@ -15,7 +15,7 @@ use libva::{
     VA_RT_FORMAT_YUV420, VAConfigAttrib, VAConfigAttribType, VAEntrypoint, VAProfile,
 };
 
-use crate::encoder::{EncodedAu, H264Encoder, align16, bgrx_to_nv12};
+use crate::encoder::{EncodedAu, H264Encoder, align16, bgrx_to_nv12_into};
 use crate::error::EncoderError;
 use crate::h264_headers;
 
@@ -45,10 +45,8 @@ impl VaapiH264Encoder {
     pub fn probe() -> Result<Self, EncoderError> {
         let display = Display::open()
             .ok_or_else(|| EncoderError::InitFailed("VAAPI: no DRM display".to_string()))?;
-        let entrypoint = pick_entrypoint(display.as_ref())
-            .map_err(EncoderError::InitFailed)?;
-        let _ = make_config(&display, entrypoint)
-            .map_err(EncoderError::InitFailed)?;
+        let entrypoint = pick_entrypoint(display.as_ref()).map_err(EncoderError::InitFailed)?;
+        let _ = make_config(&display, entrypoint).map_err(EncoderError::InitFailed)?;
         let mut enc = Self {
             display,
             entrypoint,
@@ -142,14 +140,17 @@ fn make_config(
         .map_err(|e| format!("VAAPI create_config: {e}"))
 }
 
-fn upload_nv12(
+fn upload_bgrx(
     display: &Rc<Display>,
     surface: &libva::Surface<()>,
-    width: u32,
-    height: u32,
-    nv12: &[u8],
+    width: u16,
+    height: u16,
+    stride: usize,
+    pixels: &[u8],
+    coded_w: u16,
+    coded_h: u16,
 ) -> Result<(), String> {
-    let mut image = match Image::derive_from(surface, (width, height)) {
+    let mut image = match Image::derive_from(surface, (u32::from(coded_w), u32::from(coded_h))) {
         Ok(img) => img,
         Err(_) => {
             let image_fmts = display
@@ -159,52 +160,54 @@ fn upload_nv12(
                 .into_iter()
                 .find(|f| f.fourcc == VA_FOURCC_NV12)
                 .ok_or_else(|| "VAAPI: no NV12 image format".to_string())?;
-            Image::create_from(surface, image_fmt, (width, height), (width, height))
-                .map_err(|e| format!("VAAPI create image: {e}"))?
+            Image::create_from(
+                surface,
+                image_fmt,
+                (u32::from(coded_w), u32::from(coded_h)),
+                (u32::from(coded_w), u32::from(coded_h)),
+            )
+            .map_err(|e| format!("VAAPI create image: {e}"))?
         }
     };
     let va_image = *image.image();
     let dest = image.as_mut();
-    let w = width as usize;
-    let h = height as usize;
     let y_offset = va_image.offsets[0] as usize;
     let y_pitch = va_image.pitches[0] as usize;
     let uv_offset = va_image.offsets[1] as usize;
     let uv_pitch = va_image.pitches[1] as usize;
-
-    let y_needed = y_offset.saturating_add(h.saturating_mul(y_pitch));
-    let uv_needed = uv_offset.saturating_add((h / 2).saturating_mul(uv_pitch));
-    let nv12_needed = w
-        .saturating_mul(h)
-        .saturating_add((h / 2).saturating_mul(w));
-
-    if y_pitch < w
-        || uv_pitch < w
-        || dest.len() < y_needed
-        || dest.len() < uv_needed
-        || nv12.len() < nv12_needed
-    {
+    let y_h = usize::from(coded_h);
+    let uv_h = y_h / 2;
+    let y_needed = y_offset.saturating_add(y_h.saturating_mul(y_pitch));
+    let uv_needed = uv_offset.saturating_add(uv_h.saturating_mul(uv_pitch));
+    if dest.len() < y_needed || dest.len() < uv_needed {
         return Err(format!(
-            "VAAPI image geometry mismatch: dest len {}, needed Y {y_needed}/UV {uv_needed}, nv12 len {}, needed {nv12_needed}",
-            dest.len(),
-            nv12.len()
+            "VAAPI image too small: dest {}, needed Y {y_needed}/UV {uv_needed}",
+            dest.len()
         ));
     }
 
-    let mut src = nv12;
-    let mut dst = &mut dest[y_offset..];
-    for _ in 0..h {
-        dst[..w].copy_from_slice(&src[..w]);
-        dst = &mut dst[y_pitch..];
-        src = &src[w..];
-    }
-    let mut src = &nv12[w * h..];
-    let mut dst = &mut dest[uv_offset..];
-    for _ in 0..(h / 2) {
-        dst[..w].copy_from_slice(&src[..w]);
-        dst = &mut dst[uv_pitch..];
-        src = &src[w..];
-    }
+    // Black-fill so 16-align padding stays zero without a packed NV12 temp.
+    dest[y_offset..y_needed].fill(0);
+    dest[uv_offset..uv_needed].fill(0);
+
+    let (y_plane, uv_plane) = if y_offset <= uv_offset {
+        let (before_uv, rest) = dest.split_at_mut(uv_offset);
+        let y_plane = before_uv
+            .get_mut(y_offset..)
+            .ok_or_else(|| "VAAPI Y plane offset past UV".to_string())?;
+        (y_plane, rest)
+    } else {
+        let (before_y, rest) = dest.split_at_mut(y_offset);
+        let uv_plane = before_y
+            .get_mut(uv_offset..)
+            .ok_or_else(|| "VAAPI UV plane offset past Y".to_string())?;
+        (rest, uv_plane)
+    };
+
+    bgrx_to_nv12_into(
+        width, height, stride, pixels, coded_w, coded_h, y_plane, y_pitch, uv_plane, uv_pitch,
+    )
+    .map_err(|e| format!("VAAPI BGRX→NV12: {e}"))?;
     drop(image);
     surface
         .sync()
@@ -226,19 +229,22 @@ impl H264Encoder for VaapiH264Encoder {
         }
         let coded_w = align16(width).max(16);
         let coded_h = align16(height).max(16);
-        let nv12 = bgrx_to_nv12(width, height, stride, pixels, coded_w, coded_h)?;
         self.ensure_session(coded_w, coded_h)
             .map_err(EncoderError::InitFailed)?;
 
-        let session = self.session.as_mut().ok_or_else(|| {
-            EncoderError::InitFailed("VAAPI session missing".to_string())
-        })?;
-        upload_nv12(
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| EncoderError::InitFailed("VAAPI session missing".to_string()))?;
+        upload_bgrx(
             &session.display,
             &session.surface,
-            u32::from(coded_w),
-            u32::from(coded_h),
-            &nv12,
+            width,
+            height,
+            stride,
+            pixels,
+            coded_w,
+            coded_h,
         )?;
 
         let surface_id = session.surface.id();

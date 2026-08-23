@@ -54,9 +54,9 @@ impl CudaCtx {
             if cu_init(0) != 0 {
                 return Err(EncoderError::InitFailed("cuInit failed".into()));
             }
-            let cu_device_get: libloading::Symbol<unsafe extern "C" fn(*mut c_int, c_int) -> u32> = lib
-                .get(b"cuDeviceGet")
-                .map_err(|e| EncoderError::InitFailed(e.to_string()))?;
+            let cu_device_get: libloading::Symbol<unsafe extern "C" fn(*mut c_int, c_int) -> u32> =
+                lib.get(b"cuDeviceGet")
+                    .map_err(|e| EncoderError::InitFailed(e.to_string()))?;
             let mut device = 0;
             if cu_device_get(&mut device, 0) != 0 {
                 return Err(EncoderError::InitFailed("cuDeviceGet failed".into()));
@@ -133,8 +133,8 @@ impl NvencH264Encoder {
     /// Load CUDA + NVENC and open an encode session that supports H.264.
     pub fn probe() -> Result<Self, EncoderError> {
         let cuda = CudaCtx::create()?;
-        let nvenc_lib = nvenc_init()
-            .map_err(|e| EncoderError::InitFailed(format!("NVENC init: {e}")))?;
+        let nvenc_lib =
+            nvenc_init().map_err(|e| EncoderError::InitFailed(format!("NVENC init: {e}")))?;
         let fl = nvenc_lib
             .create_instance()
             .map_err(|e| EncoderError::InitFailed(format!("NVENC CreateInstance: {e:?}")))?;
@@ -236,7 +236,9 @@ impl NvencH264Encoder {
             width: u32::from(coded_w),
             height: u32::from(coded_h),
             memory_heap: NVencMemoryHeap::AutoSelect,
-            buffer_fmt: NVencBufferFormat::ABGR,
+            // DRM XRGB8888/BGRX is B,G,R,X in memory — the same layout as
+            // NVENC ARGB (A8R8G8B8 little-endian: B,G,R,A). Skip swizzle.
+            buffer_fmt: NVencBufferFormat::ARGB,
             ..unsafe { std::mem::zeroed() }
         };
         unsafe { (self.session.fl.nvenc_create_input_buffer)(self.session.encoder, &mut input) }
@@ -270,6 +272,54 @@ impl Drop for NvencH264Encoder {
 /// Minimum `pixels.len()` needed to read a `width`x`height` BGRX32 frame at
 /// `stride` without running off the end of the buffer - the last row only
 /// needs `width * 4` bytes, not a full `stride`.
+/// Copy visible BGRX rows into an NVENC ARGB buffer (identical LE layout)
+/// and black-fill 16-align padding.
+#[allow(clippy::too_many_arguments)]
+fn copy_bgrx_as_argb(
+    dst: &mut [u8],
+    dst_pitch: usize,
+    src: &[u8],
+    src_stride: usize,
+    width: usize,
+    height: usize,
+    coded_w: usize,
+    coded_h: usize,
+) -> Result<(), EncoderError> {
+    let row_bytes = width.saturating_mul(4);
+    let coded_row = coded_w.saturating_mul(4);
+    if dst_pitch < coded_row {
+        return Err(EncoderError::InvalidGeometry(format!(
+            "NVENC pitch {dst_pitch} < coded row {coded_row}"
+        )));
+    }
+    let dst_needed = coded_h
+        .saturating_sub(1)
+        .saturating_mul(dst_pitch)
+        .saturating_add(coded_row);
+    if dst.len() < dst_needed {
+        return Err(EncoderError::InvalidGeometry(format!(
+            "NVENC dest {} < needed {dst_needed}",
+            dst.len()
+        )));
+    }
+    for row in 0..height {
+        let src_off = row.saturating_mul(src_stride);
+        let dst_off = row.saturating_mul(dst_pitch);
+        let src_row = src
+            .get(src_off..src_off + row_bytes)
+            .ok_or_else(|| EncoderError::InvalidGeometry("NVENC source row truncated".into()))?;
+        dst[dst_off..dst_off + row_bytes].copy_from_slice(src_row);
+        if coded_w > width {
+            dst[dst_off + row_bytes..dst_off + coded_row].fill(0);
+        }
+    }
+    for row in height..coded_h {
+        let dst_off = row.saturating_mul(dst_pitch);
+        dst[dst_off..dst_off + coded_row].fill(0);
+    }
+    Ok(())
+}
+
 fn min_source_len(width: u16, height: u16, stride: usize) -> usize {
     usize::from(height)
         .saturating_sub(1)
@@ -289,13 +339,6 @@ impl H264Encoder for NvencH264Encoder {
         if width == 0 || height == 0 {
             return Err(EncoderError::InvalidGeometry("empty frame".into()));
         }
-        // The BGRX->ABGR copy loop below reads `pixels` via raw pointer
-        // arithmetic with no bounds check of its own - unlike
-        // `encoder::bgrx_to_i420`'s equivalent (used by the VAAPI/OpenH264
-        // backends), which validates this same invariant before its own
-        // unsafe-free copy. Check it here so a geometry mismatch (capture
-        // bug, resize race) becomes a clean error instead of an
-        // out-of-bounds read.
         let needed = min_source_len(width, height, stride);
         if pixels.len() < needed {
             return Err(EncoderError::InvalidGeometry(format!(
@@ -321,35 +364,21 @@ impl H264Encoder for NvencH264Encoder {
             .map_err(|e| EncoderError::EncodeFailed(format!("NVENC lock input: {e:?}")))?;
 
         let pitch = lock.pitch as usize;
-        let dst = lock.buffer_data_ptr as *mut u8;
-        let w = usize::from(width);
-        let h = usize::from(height);
-        let coded_w_px = usize::from(coded_w);
-        unsafe {
-            for row in 0..h {
-                let src_row = pixels.as_ptr().add(row * stride);
-                let dst_row = dst.add(row * pitch);
-                for col in 0..w {
-                    let s = src_row.add(col * 4);
-                    let d = dst_row.add(col * 4);
-                    // BGRX → ABGR
-                    *d = *s.add(2);
-                    *d.add(1) = *s.add(1);
-                    *d.add(2) = *s;
-                    *d.add(3) = 0xff;
-                }
-                // Zero the right-edge alignment padding (w..coded_w) so
-                // stale GPU buffer contents from a previous frame don't
-                // leak into the encoded picture when width isn't a
-                // multiple of 16.
-                if coded_w_px > w {
-                    ptr::write_bytes(dst_row.add(w * 4), 0, (coded_w_px - w) * 4);
-                }
-            }
-            for row in h..usize::from(coded_h) {
-                ptr::write_bytes(dst.add(row * pitch), 0, coded_w_px * 4);
-            }
-        }
+        let dst_len = usize::from(coded_h).saturating_mul(pitch);
+        // SAFETY: NVENC lock returned `buffer_data_ptr` valid for at least
+        // `coded_h * pitch` bytes until unlock.
+        let dst =
+            unsafe { std::slice::from_raw_parts_mut(lock.buffer_data_ptr as *mut u8, dst_len) };
+        copy_bgrx_as_argb(
+            dst,
+            pitch,
+            pixels,
+            stride,
+            usize::from(width),
+            usize::from(height),
+            usize::from(coded_w),
+            usize::from(coded_h),
+        )?;
         unsafe { (self.session.fl.nvenc_unlock_input_buffer)(self.session.encoder, buffers.input) }
             .into_error()
             .map_err(|e| EncoderError::EncodeFailed(format!("NVENC unlock input: {e:?}")))?;
@@ -367,7 +396,7 @@ impl H264Encoder for NvencH264Encoder {
             p.frame_idx = self.frame_idx;
             p.input_buffer = buffers.input;
             p.output_bitstream = buffers.output;
-            p.buffer_format = NVencBufferFormat::ABGR;
+            p.buffer_format = NVencBufferFormat::ARGB;
             p.picture_struct = NVencPicStruct::Frame;
             p.picture_type = if force_idr {
                 NVencPicType::IDR
@@ -449,5 +478,34 @@ mod tests {
     #[test]
     fn min_source_len_single_row_needs_only_that_row() {
         assert_eq!(min_source_len(10, 1, 999), 10 * 4);
+    }
+
+    #[test]
+    fn copy_bgrx_as_argb_memcpys_visible_rows_and_zeros_padding() {
+        let width = 2usize;
+        let height = 2usize;
+        let src_stride = 12; // padded source
+        let mut src = vec![0u8; src_stride * height];
+        src[0..4].copy_from_slice(&[1, 2, 3, 4]);
+        src[4..8].copy_from_slice(&[5, 6, 7, 8]);
+        src[src_stride..src_stride + 4].copy_from_slice(&[9, 10, 11, 12]);
+        src[src_stride + 4..src_stride + 8].copy_from_slice(&[13, 14, 15, 16]);
+
+        let coded_w = 4usize;
+        let coded_h = 4usize;
+        let dst_pitch = coded_w * 4;
+        let mut dst = vec![0xAAu8; dst_pitch * coded_h];
+        copy_bgrx_as_argb(
+            &mut dst, dst_pitch, &src, src_stride, width, height, coded_w, coded_h,
+        )
+        .unwrap();
+
+        assert_eq!(&dst[0..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&dst[8..16], &[0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            &dst[dst_pitch..dst_pitch + 8],
+            &[9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        assert!(dst[dst_pitch * 2..].iter().all(|&b| b == 0));
     }
 }
