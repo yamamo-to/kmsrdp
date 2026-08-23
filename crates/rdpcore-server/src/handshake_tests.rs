@@ -51,8 +51,8 @@ impl RdpServerDisplay for StaticDisplay {
         }
     }
 
-    async fn updates(&self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>> {
-        anyhow::bail!("unused during negotiate")
+    async fn updates(&self) -> Result<Box<dyn RdpServerDisplayUpdates>, crate::error::DisplayError> {
+        Err(crate::error::DisplayError::Other("unused during negotiate".into()))
     }
 }
 
@@ -475,7 +475,7 @@ struct IdleUpdates;
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for IdleUpdates {
-    async fn next_update(&mut self) -> anyhow::Result<Option<DisplayUpdate>> {
+    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>, crate::error::DisplayError> {
         std::future::pending().await
     }
 }
@@ -491,7 +491,7 @@ impl RdpServerDisplay for IdleDisplay {
         }
     }
 
-    async fn updates(&self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(&self) -> Result<Box<dyn RdpServerDisplayUpdates>, crate::error::DisplayError> {
         Ok(Box::new(IdleUpdates))
     }
 }

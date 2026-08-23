@@ -372,7 +372,7 @@ pub struct DisplayUpdates {
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for DisplayUpdates {
-    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>, rdpcore_server::DisplayError> {
         if let Some(full) = self.initial.take() {
             return Ok(Some(DisplayUpdate::Bitmap(full)));
         }
@@ -405,7 +405,7 @@ impl RdpServerDisplay for Display {
         *mutex_lock(&self.hub.size)
     }
 
-    async fn updates(&self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(&self) -> Result<Box<dyn RdpServerDisplayUpdates>, rdpcore_server::DisplayError> {
         Ok(Box::new(self.hub.subscribe()))
     }
 

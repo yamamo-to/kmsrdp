@@ -6,7 +6,6 @@ license = "MIT OR Apache-2.0"
 description = "Async RDP server built on rdpcore-connector: TLS glue, accept loop, Display/Input traits"
 
 [dependencies]
-anyhow = "1.0.103"
 async-trait = "0.1.89"
 rdpcore-cliprdr = { path = "../rdpcore-cliprdr" }
 rdpcore-connector = { path = "../rdpcore-connector" }

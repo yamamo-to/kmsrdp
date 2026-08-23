@@ -419,7 +419,7 @@ async fn main() -> Result<()> {
     // wait for DRM `spawn_blocking` / FUSE threads and can hang host
     // shutdown; `process::exit` after a short cleanup is still the backstop.
     tokio::select! {
-        result = server.run() => result,
+        result = server.run() => Ok(result?),
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("SIGINT, shutting down");
             graceful_shutdown(&input_for_shutdown, fuse_shutdown.as_ref());

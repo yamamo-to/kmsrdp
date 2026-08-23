@@ -314,7 +314,7 @@ impl RdpServer {
     /// Accepts connections and runs each on its own task. Display capture
     /// is shared; by default only one authenticated session may be in
     /// steady-state at a time (`with_max_sessions`).
-    pub async fn run(mut self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> Result<(), crate::error::ServerError> {
         let listener = match self.listener.take() {
             Some(listener) => listener,
             None => {
@@ -385,7 +385,7 @@ impl Session {
         &self,
         tcp: TcpStream,
         permit: tokio::sync::OwnedSemaphorePermit,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), crate::error::ServerError> {
         let peer = tcp.peer_addr()?;
         if self.auth_limiter.is_blocked(peer.ip()) {
             warn!(%peer, "dropping connection: too many failed authentication attempts");
@@ -432,12 +432,13 @@ impl Session {
         mut tcp: TcpStream,
         peer_ip: IpAddr,
         authenticated: &AtomicBool,
-    ) -> anyhow::Result<
+    ) -> Result<
         Option<(
             tokio_rustls::server::TlsStream<TcpStream>,
             Acceptor,
             AcceptedConnection,
         )>,
+        crate::error::ServerError,
     > {
         let desktop = self.display.size().await;
         let mut acceptor =
@@ -468,7 +469,7 @@ impl Session {
                 );
                 return Ok(None);
             }
-            other => anyhow::bail!("unexpected acceptor event before TLS upgrade: {other:?}"),
+            other => return Err(crate::error::ServerError::UnexpectedAcceptorEvent(other)),
         }
 
         let mut tls = match self.tls.accept(tcp).await {
@@ -617,7 +618,7 @@ impl Session {
         stream: S,
         mut acceptor: Acceptor,
         accepted: AcceptedConnection,
-    ) -> anyhow::Result<()>
+    ) -> Result<(), crate::error::ServerError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -1121,7 +1122,7 @@ impl Session {
                 }
                 update = updates.next_update() => {
                     match update {
-                        Err(e) => return Err(e),
+                        Err(e) => return Err(crate::error::ServerError::Display(e)),
                         Ok(Some(DisplayUpdate::Bitmap(bitmap))) if resizing => {
                             retain_bitmap_during_resize(
                                 &mut pending_after_resize,
@@ -1579,7 +1580,7 @@ async fn handle_slow_path_frame(
     policy: &BitmapEncodePolicy,
     frame_id: &mut u32,
     metrics: &mut SessionBitmapMetrics,
-) -> anyhow::Result<()> {
+) -> Result<(), SessionError> {
     let payload = rdpcore_pdu::x224::unwrap_data(bytes)?;
     let send_data = rdpcore_pdu::mcs::SendData::decode_request(payload)?;
 

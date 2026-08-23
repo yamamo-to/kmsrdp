@@ -121,7 +121,7 @@ pub enum DisplayUpdate {
 #[async_trait]
 pub trait RdpServerDisplay: Send + Sync {
     async fn size(&self) -> DesktopSize;
-    async fn updates(&self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>>;
+    async fn updates(&self) -> Result<Box<dyn RdpServerDisplayUpdates>, crate::error::DisplayError>;
 
     /// Host monitor layout for the current virtual desktop (≥1 when known).
     fn monitor_layout(&self) -> Vec<MonitorLayoutEntry> {
@@ -131,7 +131,9 @@ pub trait RdpServerDisplay: Send + Sync {
 
 #[async_trait]
 pub trait RdpServerDisplayUpdates: Send {
-    async fn next_update(&mut self) -> anyhow::Result<Option<DisplayUpdate>>;
+    async fn next_update(
+        &mut self,
+    ) -> Result<Option<DisplayUpdate>, crate::error::DisplayError>;
 
     /// Latest full-desktop frame, if the backend keeps one (for Refresh Rect).
     fn latest_full_frame(&self) -> Option<BitmapUpdate> {

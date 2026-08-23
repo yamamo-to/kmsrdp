@@ -27,7 +27,7 @@ pub use display::{
     BitmapUpdate, DesktopSize, DisplayUpdate, MonitorLayoutEntry, PixelFormat, RdpServerDisplay,
     RdpServerDisplayUpdates,
 };
-pub use error::SessionError;
+pub use error::{DisplayError, ServerError, SessionError};
 pub use input::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 pub use server::{RdpServer, RdpServerBuilder};
 
