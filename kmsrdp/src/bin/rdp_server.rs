@@ -412,6 +412,9 @@ async fn main() -> Result<()> {
         "TLS + optional NLA"
     };
     tracing::info!(addr = %cfg.listen, "RDP server listening ({nla_desc})");
+    kmsrdp::systemd::notify_ready();
+    let _watchdog = kmsrdp::systemd::spawn_watchdog_task();
+
     // Clean up FUSE/uinput first, then exit. Tokio graceful shutdown would
     // wait for DRM `spawn_blocking` / FUSE threads and can hang host
     // shutdown; `process::exit` after a short cleanup is still the backstop.
@@ -431,6 +434,7 @@ async fn main() -> Result<()> {
 }
 
 fn graceful_shutdown(input: &SharedInput, fuse: Option<&FuseDriveFactory>) {
+    kmsrdp::systemd::notify_stopping();
     if let Some(fuse) = fuse {
         fuse.unmount_all();
     }

@@ -448,9 +448,9 @@ impl DvcHandler for GfxDvcHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::EncodedAu;
     use crate::encoder::H264Encoder;
     use crate::pdu::{CAP_VERSION_81, CAPS_FLAG_AVC420_ENABLED};
+    use crate::{EncodedAu, EncoderError};
     use rdpcore_pdu::cursor::WriteBuf;
 
     fn expect_frames(result: GfxFrameResult) -> Vec<Vec<u8>> {
@@ -696,10 +696,10 @@ mod tests {
             _stride: usize,
             _pixels: &[u8],
             force_idr: bool,
-        ) -> Result<EncodedAu, String> {
+        ) -> Result<EncodedAu, EncoderError> {
             self.calls += 1;
             if self.calls == 1 {
-                return Err("transient".into());
+                return Err(EncoderError::EncodeFailed("transient".into()));
             }
             Ok(EncodedAu {
                 annex_b: vec![0, 0, 0, 1, if force_idr { 0x65 } else { 0x41 }],
@@ -737,7 +737,7 @@ mod tests {
             _stride: usize,
             _pixels: &[u8],
             _force_idr: bool,
-        ) -> Result<EncodedAu, String> {
+        ) -> Result<EncodedAu, EncoderError> {
             Ok(EncodedAu {
                 annex_b: Vec::new(),
                 qp: 22,

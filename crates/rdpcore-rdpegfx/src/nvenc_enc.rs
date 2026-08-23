@@ -23,6 +23,7 @@ use nvenc::sys::version::NVENC_API_VERSION;
 use nvenc::{NVENCLibrary, nvenc_init};
 
 use crate::encoder::{EncodedAu, H264Encoder, align16};
+use crate::error::EncoderError;
 
 struct CudaCtx {
     _lib: Library,
@@ -43,20 +44,22 @@ impl Drop for CudaCtx {
 }
 
 impl CudaCtx {
-    fn create() -> Result<Self, String> {
+    fn create() -> Result<Self, EncoderError> {
         let lib = unsafe { Library::new("libcuda.so.1") }
-            .map_err(|e| format!("NVENC: load libcuda.so.1: {e}"))?;
+            .map_err(|e| EncoderError::InitFailed(format!("NVENC: load libcuda.so.1: {e}")))?;
         unsafe {
-            let cu_init: libloading::Symbol<unsafe extern "C" fn(u32) -> u32> =
-                lib.get(b"cuInit").map_err(|e| e.to_string())?;
+            let cu_init: libloading::Symbol<unsafe extern "C" fn(u32) -> u32> = lib
+                .get(b"cuInit")
+                .map_err(|e| EncoderError::InitFailed(e.to_string()))?;
             if cu_init(0) != 0 {
-                return Err("cuInit failed".into());
+                return Err(EncoderError::InitFailed("cuInit failed".into()));
             }
-            let cu_device_get: libloading::Symbol<unsafe extern "C" fn(*mut c_int, c_int) -> u32> =
-                lib.get(b"cuDeviceGet").map_err(|e| e.to_string())?;
+            let cu_device_get: libloading::Symbol<unsafe extern "C" fn(*mut c_int, c_int) -> u32> = lib
+                .get(b"cuDeviceGet")
+                .map_err(|e| EncoderError::InitFailed(e.to_string()))?;
             let mut device = 0;
             if cu_device_get(&mut device, 0) != 0 {
-                return Err("cuDeviceGet failed".into());
+                return Err(EncoderError::InitFailed("cuDeviceGet failed".into()));
             }
             let cu_ctx_create: libloading::Symbol<
                 unsafe extern "C" fn(*mut *mut c_void, u32, c_int) -> u32,
@@ -128,12 +131,13 @@ unsafe impl Send for NvencH264Encoder {}
 
 impl NvencH264Encoder {
     /// Load CUDA + NVENC and open an encode session that supports H.264.
-    pub fn probe() -> Result<Self, String> {
+    pub fn probe() -> Result<Self, EncoderError> {
         let cuda = CudaCtx::create()?;
-        let nvenc_lib = nvenc_init().map_err(|e| format!("NVENC init: {e}"))?;
+        let nvenc_lib = nvenc_init()
+            .map_err(|e| EncoderError::InitFailed(format!("NVENC init: {e}")))?;
         let fl = nvenc_lib
             .create_instance()
-            .map_err(|e| format!("NVENC CreateInstance: {e:?}"))?;
+            .map_err(|e| EncoderError::InitFailed(format!("NVENC CreateInstance: {e:?}")))?;
 
         let mut params: NVencOpenEncodeSessionExParams = unsafe { std::mem::zeroed() };
         params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
@@ -143,9 +147,11 @@ impl NvencH264Encoder {
         let mut encoder = ptr::null_mut();
         unsafe { (fl.nvenc_open_encode_session_ex)(&mut params, &mut encoder) }
             .into_error()
-            .map_err(|e| format!("NVENC open session: {e:?}"))?;
+            .map_err(|e| EncoderError::InitFailed(format!("NVENC open session: {e:?}")))?;
         if encoder.is_null() {
-            return Err("NVENC open session returned null".into());
+            return Err(EncoderError::InitFailed(
+                "NVENC open session returned null".into(),
+            ));
         }
 
         let session = Session { encoder, fl };
@@ -153,7 +159,7 @@ impl NvencH264Encoder {
         let mut count = 0u32;
         unsafe { (session.fl.nvenc_get_encoder_guid_count)(session.encoder, &mut count) }
             .into_error()
-            .map_err(|e| format!("NVENC guid count: {e:?}"))?;
+            .map_err(|e| EncoderError::InitFailed(format!("NVENC guid count: {e:?}")))?;
         let mut guids = vec![nvenc::sys::structs::Guid::default(); count as usize];
         unsafe {
             (session.fl.nvenc_get_encoder_guids)(
@@ -164,10 +170,12 @@ impl NvencH264Encoder {
             )
         }
         .into_error()
-        .map_err(|e| format!("NVENC guids: {e:?}"))?;
+        .map_err(|e| EncoderError::InitFailed(format!("NVENC guids: {e:?}")))?;
         guids.truncate(count as usize);
         if !guids.contains(&NV_ENC_CODEC_H264_GUID) {
-            return Err("NVENC: H.264 codec not available".into());
+            return Err(EncoderError::InitFailed(
+                "NVENC: H.264 codec not available".into(),
+            ));
         }
 
         Ok(Self {
@@ -199,7 +207,7 @@ impl NvencH264Encoder {
         }
     }
 
-    fn ensure_buffers(&mut self, coded_w: u16, coded_h: u16) -> Result<(), String> {
+    fn ensure_buffers(&mut self, coded_w: u16, coded_h: u16) -> Result<(), EncoderError> {
         if let Some(b) = &self.buffers
             && b.coded_w == coded_w
             && b.coded_h == coded_h
@@ -221,7 +229,7 @@ impl NvencH264Encoder {
         init.enable_ptd = 1;
         unsafe { (self.session.fl.nvenc_initialize_encoder)(self.session.encoder, &mut init) }
             .into_error()
-            .map_err(|e| format!("NVENC initialize: {e:?}"))?;
+            .map_err(|e| EncoderError::InitFailed(format!("NVENC initialize: {e:?}")))?;
 
         let mut input = NVencCreateInputBuffer {
             version: NV_ENC_CREATE_INPUT_BUFFER_VER,
@@ -233,7 +241,7 @@ impl NvencH264Encoder {
         };
         unsafe { (self.session.fl.nvenc_create_input_buffer)(self.session.encoder, &mut input) }
             .into_error()
-            .map_err(|e| format!("NVENC create input: {e:?}"))?;
+            .map_err(|e| EncoderError::InitFailed(format!("NVENC create input: {e:?}")))?;
 
         let mut output: NVencCreateBitstreamBuffer = unsafe { std::mem::zeroed() };
         output.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
@@ -241,7 +249,7 @@ impl NvencH264Encoder {
             (self.session.fl.nvenc_create_bit_stream_buffer)(self.session.encoder, &mut output)
         }
         .into_error()
-        .map_err(|e| format!("NVENC create bitstream: {e:?}"))?;
+        .map_err(|e| EncoderError::InitFailed(format!("NVENC create bitstream: {e:?}")))?;
 
         self.buffers = Some(Buffers {
             input: input.input_buffer,
@@ -277,9 +285,9 @@ impl H264Encoder for NvencH264Encoder {
         stride: usize,
         pixels: &[u8],
         force_idr: bool,
-    ) -> Result<EncodedAu, String> {
+    ) -> Result<EncodedAu, EncoderError> {
         if width == 0 || height == 0 {
-            return Err("empty frame".into());
+            return Err(EncoderError::InvalidGeometry("empty frame".into()));
         }
         // The BGRX->ABGR copy loop below reads `pixels` via raw pointer
         // arithmetic with no bounds check of its own - unlike
@@ -290,24 +298,27 @@ impl H264Encoder for NvencH264Encoder {
         // out-of-bounds read.
         let needed = min_source_len(width, height, stride);
         if pixels.len() < needed {
-            return Err(format!(
+            return Err(EncoderError::InvalidGeometry(format!(
                 "source buffer too small: {}x{} @ stride {stride} needs {needed} bytes, got {}",
                 width,
                 height,
                 pixels.len()
-            ));
+            )));
         }
         let coded_w = align16(width).max(16);
         let coded_h = align16(height).max(16);
         self.ensure_buffers(coded_w, coded_h)?;
-        let buffers = self.buffers.as_ref().ok_or("NVENC buffers missing")?;
+        let buffers = self
+            .buffers
+            .as_ref()
+            .ok_or_else(|| EncoderError::InitFailed("NVENC buffers missing".to_string()))?;
 
         let mut lock: NVencLockInputBuffer = unsafe { std::mem::zeroed() };
         lock.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
         lock.input_buffer = buffers.input;
         unsafe { (self.session.fl.nvenc_lock_input_buffer)(self.session.encoder, &mut lock) }
             .into_error()
-            .map_err(|e| format!("NVENC lock input: {e:?}"))?;
+            .map_err(|e| EncoderError::EncodeFailed(format!("NVENC lock input: {e:?}")))?;
 
         let pitch = lock.pitch as usize;
         let dst = lock.buffer_data_ptr as *mut u8;
@@ -341,7 +352,7 @@ impl H264Encoder for NvencH264Encoder {
         }
         unsafe { (self.session.fl.nvenc_unlock_input_buffer)(self.session.encoder, buffers.input) }
             .into_error()
-            .map_err(|e| format!("NVENC unlock input: {e:?}"))?;
+            .map_err(|e| EncoderError::EncodeFailed(format!("NVENC unlock input: {e:?}")))?;
 
         let mut pic = std::mem::MaybeUninit::<NVencPicParams>::zeroed();
         unsafe {
@@ -367,7 +378,7 @@ impl H264Encoder for NvencH264Encoder {
 
         unsafe { (self.session.fl.nvenc_encode_picture)(self.session.encoder, &mut pic) }
             .into_error()
-            .map_err(|e| format!("NVENC encode: {e:?}"))?;
+            .map_err(|e| EncoderError::EncodeFailed(format!("NVENC encode: {e:?}")))?;
 
         let mut bs = std::mem::MaybeUninit::<NVencLockBitStream>::zeroed();
         unsafe {
@@ -377,7 +388,7 @@ impl H264Encoder for NvencH264Encoder {
         }
         unsafe { (self.session.fl.nvenc_lock_bit_stream)(self.session.encoder, &mut bs) }
             .into_error()
-            .map_err(|e| format!("NVENC lock bitstream: {e:?}"))?;
+            .map_err(|e| EncoderError::EncodeFailed(format!("NVENC lock bitstream: {e:?}")))?;
         let bs = unsafe { bs.assume_init() };
 
         let mut annex_b = Vec::new();
@@ -400,7 +411,9 @@ impl H264Encoder for NvencH264Encoder {
         self.frame_idx = self.frame_idx.wrapping_add(1);
 
         if annex_b.is_empty() {
-            return Err("NVENC produced empty bitstream".into());
+            return Err(EncoderError::EncodeFailed(
+                "NVENC produced empty bitstream".into(),
+            ));
         }
         Ok(EncodedAu {
             annex_b,

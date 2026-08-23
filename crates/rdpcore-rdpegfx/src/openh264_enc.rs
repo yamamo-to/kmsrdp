@@ -7,6 +7,7 @@ use openh264::encoder::{
 use openh264::formats::YUVSource;
 
 use crate::encoder::{EncodedAu, H264Encoder, align16, bgrx_to_i420};
+use crate::error::EncoderError;
 
 /// Thin [`YUVSource`] over a contiguous I420 buffer produced by [`bgrx_to_i420`].
 struct I420Frame<'a> {
@@ -52,7 +53,7 @@ pub struct OpenH264Encoder {
 }
 
 impl OpenH264Encoder {
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> Result<Self, EncoderError> {
         Ok(Self {
             inner: None,
             coded_w: 0,
@@ -62,7 +63,7 @@ impl OpenH264Encoder {
         })
     }
 
-    fn ensure_encoder(&mut self, coded_w: u16, coded_h: u16) -> Result<&mut Encoder, String> {
+    fn ensure_encoder(&mut self, coded_w: u16, coded_h: u16) -> Result<&mut Encoder, EncoderError> {
         if self.inner.is_none() || self.coded_w != coded_w || self.coded_h != coded_h {
             // Desktop bitrates: ~1.5 bpp/s at 30fps floor, min 2 Mbps.
             let bps = (u32::from(coded_w) * u32::from(coded_h)).max(2_000_000);
@@ -77,7 +78,7 @@ impl OpenH264Encoder {
                 .skip_frames(false)
                 .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(30));
             let enc = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
-                .map_err(|e| format!("openh264 init: {e}"))?;
+                .map_err(|e| EncoderError::InitFailed(format!("openh264 init: {e}")))?;
             self.inner = Some(enc);
             self.coded_w = coded_w;
             self.coded_h = coded_h;
@@ -85,7 +86,7 @@ impl OpenH264Encoder {
         }
         self.inner
             .as_mut()
-            .ok_or_else(|| "openh264 encoder missing".to_string())
+            .ok_or_else(|| EncoderError::InitFailed("openh264 encoder missing".to_string()))
     }
 }
 
@@ -97,9 +98,9 @@ impl H264Encoder for OpenH264Encoder {
         stride: usize,
         pixels: &[u8],
         force_idr: bool,
-    ) -> Result<EncodedAu, String> {
+    ) -> Result<EncodedAu, EncoderError> {
         if width == 0 || height == 0 {
-            return Err("empty frame".into());
+            return Err(EncoderError::InvalidGeometry("empty frame".into()));
         }
         let coded_w = align16(width).max(16);
         let coded_h = align16(height).max(16);
@@ -119,17 +120,17 @@ impl H264Encoder for OpenH264Encoder {
         }
         let bitstream = enc
             .encode_at(&frame, Timestamp::from_millis(ts_ms))
-            .map_err(|e| format!("openh264 encode: {e}"))?;
+            .map_err(|e| EncoderError::EncodeFailed(format!("openh264 encode: {e}")))?;
 
         // With skip_frames(false) this should be rare; still treat Skip as soft
         // failure so the session can force an IDR retry instead of Planar thrash.
         if matches!(bitstream.frame_type(), openh264::encoder::FrameType::Skip) {
-            return Err("openh264 skipped frame".into());
+            return Err(EncoderError::EncodeFailed("openh264 skipped frame".into()));
         }
 
         let annex_b = bitstream.to_vec();
         if annex_b.is_empty() {
-            return Err("openh264 returned empty bitstream".into());
+            return Err(EncoderError::EncodeFailed("openh264 returned empty bitstream".into()));
         }
         Ok(EncodedAu {
             annex_b,

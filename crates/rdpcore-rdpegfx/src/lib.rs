@@ -5,6 +5,7 @@
 //! and a [`GfxSession`] that negotiates AVC420 and emits full-frame updates.
 
 pub mod encoder;
+pub mod error;
 pub mod h264_headers;
 pub mod pdu;
 pub mod select;
@@ -18,6 +19,7 @@ pub mod openh264_enc;
 pub mod vaapi_enc;
 
 pub use encoder::{EncodedAu, H264Encoder, MockH264Encoder};
+pub use error::EncoderError;
 pub use pdu::CHANNEL_NAME;
 pub use select::{SelectedEncoder, select_h264_encoder};
 pub use session::{GfxDvcHandler, GfxFrameResult, GfxSession};

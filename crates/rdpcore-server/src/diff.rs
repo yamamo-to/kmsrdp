@@ -54,21 +54,21 @@ fn tile_differs(
 /// Returns the changed regions, each a multiple of one tile except at the
 /// frame's right/bottom edge.
 struct SmallBitSet {
-    inline: [u64; 64], // 4096 bits: fits up to 4K resolution (60x34 = 2040 tiles) on stack
+    inline: [u64; 128], // 8192 bits: fits up to 8K resolution (120x68 = 8160 tiles) or dual 4K on stack
     heap: Vec<u64>,
 }
 
 impl SmallBitSet {
     fn new(len: usize) -> Self {
         let words = len.div_ceil(64);
-        if words <= 64 {
+        if words <= 128 {
             Self {
-                inline: [0; 64],
+                inline: [0; 128],
                 heap: Vec::new(),
             }
         } else {
             Self {
-                inline: [0; 64],
+                inline: [0; 128],
                 heap: vec![0; words],
             }
         }
@@ -265,5 +265,22 @@ mod tests {
         let a = vec![42u8; height * stride];
         let b = a.clone();
         assert!(find_dirty_rects(&a, stride, &b, stride, width, height, bpp).is_empty());
+    }
+
+    #[test]
+    fn small_bitset_inline_and_heap_consistency() {
+        // 8K (8160 tiles) fits inline on stack
+        let mut bs_8k = SmallBitSet::new(8160);
+        assert!(bs_8k.heap.is_empty());
+        bs_8k.set(8159, true);
+        assert!(bs_8k.get(8159));
+        assert!(!bs_8k.get(8158));
+
+        // 16K / multi-monitor ultra-wide (e.g. 10000 tiles) overflows to heap safely
+        let mut bs_heap = SmallBitSet::new(10000);
+        assert!(!bs_heap.heap.is_empty());
+        bs_heap.set(9999, true);
+        assert!(bs_heap.get(9999));
+        assert!(!bs_heap.get(9998));
     }
 }

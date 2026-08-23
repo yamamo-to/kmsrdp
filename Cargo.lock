@@ -2651,6 +2651,7 @@ dependencies = [
  "openh264",
  "rdpcore-dvc",
  "rdpcore-pdu",
+ "thiserror 2.0.18",
  "tracing",
 ]
 

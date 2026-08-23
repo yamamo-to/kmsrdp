@@ -16,6 +16,7 @@ use libva::{
 };
 
 use crate::encoder::{EncodedAu, H264Encoder, align16, bgrx_to_nv12};
+use crate::error::EncoderError;
 use crate::h264_headers;
 
 struct Session {
@@ -41,10 +42,13 @@ unsafe impl Send for VaapiH264Encoder {}
 
 impl VaapiH264Encoder {
     /// Open a DRM VA display, verify H.264 encode, and smoke-encode one frame.
-    pub fn probe() -> Result<Self, String> {
-        let display = Display::open().ok_or_else(|| "VAAPI: no DRM display".to_string())?;
-        let entrypoint = pick_entrypoint(display.as_ref())?;
-        let _ = make_config(&display, entrypoint)?;
+    pub fn probe() -> Result<Self, EncoderError> {
+        let display = Display::open()
+            .ok_or_else(|| EncoderError::InitFailed("VAAPI: no DRM display".to_string()))?;
+        let entrypoint = pick_entrypoint(display.as_ref())
+            .map_err(EncoderError::InitFailed)?;
+        let _ = make_config(&display, entrypoint)
+            .map_err(EncoderError::InitFailed)?;
         let mut enc = Self {
             display,
             entrypoint,
@@ -53,7 +57,7 @@ impl VaapiH264Encoder {
         };
         let pixels = vec![0u8; 64 * 64 * 4];
         enc.encode_bgrx(64, 64, 64 * 4, &pixels, true)
-            .map_err(|e| format!("VAAPI smoke encode failed: {e}"))?;
+            .map_err(|e| EncoderError::InitFailed(format!("VAAPI smoke encode failed: {e}")))?;
         enc.reset();
         Ok(enc)
     }
@@ -216,16 +220,19 @@ impl H264Encoder for VaapiH264Encoder {
         stride: usize,
         pixels: &[u8],
         _force_idr: bool,
-    ) -> Result<EncodedAu, String> {
+    ) -> Result<EncodedAu, EncoderError> {
         if width == 0 || height == 0 {
-            return Err("empty frame".into());
+            return Err(EncoderError::InvalidGeometry("empty frame".into()));
         }
         let coded_w = align16(width).max(16);
         let coded_h = align16(height).max(16);
         let nv12 = bgrx_to_nv12(width, height, stride, pixels, coded_w, coded_h)?;
-        self.ensure_session(coded_w, coded_h)?;
+        self.ensure_session(coded_w, coded_h)
+            .map_err(EncoderError::InitFailed)?;
 
-        let session = self.session.as_mut().ok_or("VAAPI session missing")?;
+        let session = self.session.as_mut().ok_or_else(|| {
+            EncoderError::InitFailed("VAAPI session missing".to_string())
+        })?;
         upload_nv12(
             &session.display,
             &session.surface,
@@ -357,7 +364,7 @@ impl H264Encoder for VaapiH264Encoder {
                     2,
                 ),
             )))
-            .map_err(|e| format!("VAAPI slice buffer: {e}"))?;
+            .map_err(|e| EncoderError::EncodeFailed(format!("VAAPI slice buffer: {e}")))?;
 
         let Session {
             display,
@@ -366,24 +373,34 @@ impl H264Encoder for VaapiH264Encoder {
             coded,
             coded_w,
             coded_h,
-        } = self.session.take().ok_or("VAAPI session missing")?;
+        } = self
+            .session
+            .take()
+            .ok_or_else(|| EncoderError::InitFailed("VAAPI session missing".to_string()))?;
 
         let mut picture = Picture::new(0, Rc::clone(&context), surface);
         picture.add_buffer(sps);
         picture.add_buffer(pps);
         picture.add_buffer(slice);
         picture.add_buffer(rc);
-        let picture = picture.begin().map_err(|e| format!("VAAPI begin: {e}"))?;
-        let picture = picture.render().map_err(|e| format!("VAAPI render: {e}"))?;
-        let picture = picture.end().map_err(|e| format!("VAAPI end: {e}"))?;
+        let picture = picture
+            .begin()
+            .map_err(|e| EncoderError::EncodeFailed(format!("VAAPI begin: {e}")))?;
+        let picture = picture
+            .render()
+            .map_err(|e| EncoderError::EncodeFailed(format!("VAAPI render: {e}")))?;
+        let picture = picture
+            .end()
+            .map_err(|e| EncoderError::EncodeFailed(format!("VAAPI end: {e}")))?;
         let picture = picture
             .sync()
-            .map_err(|(e, _)| format!("VAAPI sync: {e}"))?;
+            .map_err(|(e, _)| EncoderError::EncodeFailed(format!("VAAPI sync: {e}")))?;
         let surface = picture
             .take_surface()
-            .map_err(|_| "VAAPI: surface still shared".to_string())?;
+            .map_err(|_| EncoderError::EncodeFailed("VAAPI: surface still shared".to_string()))?;
 
-        let mapped = MappedCodedBuffer::new(&coded).map_err(|e| format!("VAAPI map coded: {e}"))?;
+        let mapped = MappedCodedBuffer::new(&coded)
+            .map_err(|e| EncoderError::EncodeFailed(format!("VAAPI map coded: {e}")))?;
         let mut annex_b = h264_headers::annex_b_sps_pps(coded_w, coded_h);
         for segment in mapped.iter() {
             if segment.buf.is_empty() {
@@ -406,7 +423,9 @@ impl H264Encoder for VaapiH264Encoder {
         });
 
         if annex_b.len() <= 16 {
-            return Err("VAAPI produced empty bitstream".into());
+            return Err(EncoderError::EncodeFailed(
+                "VAAPI produced empty bitstream".into(),
+            ));
         }
         Ok(EncodedAu {
             annex_b,

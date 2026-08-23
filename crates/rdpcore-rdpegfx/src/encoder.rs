@@ -3,6 +3,8 @@
 //! Concrete backends (OpenH264 today; VAAPI/NVENC later) implement
 //! [`H264Encoder`]. The session always feeds BGRX32 host frames.
 
+use crate::error::EncoderError;
+
 /// One encoded Access Unit in Annex B byte-stream form (start-code prefixed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedAu {
@@ -21,7 +23,7 @@ pub trait H264Encoder: Send {
         stride: usize,
         pixels: &[u8],
         force_idr: bool,
-    ) -> Result<EncodedAu, String>;
+    ) -> Result<EncodedAu, EncoderError>;
 
     /// Drop any resolution-specific encoder state (call on desktop resize).
     fn reset(&mut self);
@@ -39,26 +41,30 @@ pub(crate) fn check_bgrx_geometry(
     pixels: &[u8],
     out_w: u16,
     out_h: u16,
-) -> Result<(usize, usize, usize, usize), String> {
+) -> Result<(usize, usize, usize, usize), EncoderError> {
     let w = usize::from(width);
     let h = usize::from(height);
     let ow = usize::from(out_w);
     let oh = usize::from(out_h);
     if !ow.is_multiple_of(2) || !oh.is_multiple_of(2) {
-        return Err(format!("planar YUV size must be even, got {ow}x{oh}"));
+        return Err(EncoderError::InvalidGeometry(format!(
+            "planar YUV size must be even, got {ow}x{oh}"
+        )));
     }
     if w > ow || h > oh {
-        return Err(format!("visible {w}x{h} larger than padded {ow}x{oh}"));
+        return Err(EncoderError::InvalidGeometry(format!(
+            "visible {w}x{h} larger than padded {ow}x{oh}"
+        )));
     }
     let needed = h
         .saturating_sub(1)
         .saturating_mul(stride)
         .saturating_add(w.saturating_mul(4));
     if pixels.len() < needed {
-        return Err(format!(
+        return Err(EncoderError::InvalidGeometry(format!(
             "pixel buffer too short: have {}, need at least {needed}",
             pixels.len()
-        ));
+        )));
     }
     Ok((w, h, ow, oh))
 }
@@ -77,17 +83,6 @@ fn bt601_uv(samples: [(u32, u32, u32); 4]) -> (u8, u8) {
     let u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
     let v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
     (u, v)
-}
-
-/// Reads one BGRX pixel at (row, col) as (r, g, b).
-#[inline]
-fn read_rgb(pixels: &[u8], stride: usize, row: usize, col: usize) -> (u32, u32, u32) {
-    let o = row * stride + col * 4;
-    (
-        u32::from(pixels[o + 2]),
-        u32::from(pixels[o + 1]),
-        u32::from(pixels[o]),
-    )
 }
 
 /// Walks the frame in 2x2 blocks, computing every pixel's luma and each
@@ -109,14 +104,36 @@ fn for_each_block(
     for row in (0..h).step_by(2) {
         let has_row2 = row + 1 < h;
         let row2 = row + (has_row2 as usize);
+        let row1_slice = &pixels[row * stride..];
+        let row2_slice = &pixels[row2 * stride..];
+
         for col in (0..w).step_by(2) {
             let has_col2 = col + 1 < w;
             let col2 = col + (has_col2 as usize);
 
-            let s0 = read_rgb(pixels, stride, row, col);
-            let s1 = read_rgb(pixels, stride, row, col2);
-            let s2 = read_rgb(pixels, stride, row2, col);
-            let s3 = read_rgb(pixels, stride, row2, col2);
+            let off0 = col * 4;
+            let off1 = col2 * 4;
+
+            let s0 = (
+                u32::from(row1_slice[off0 + 2]),
+                u32::from(row1_slice[off0 + 1]),
+                u32::from(row1_slice[off0]),
+            );
+            let s1 = (
+                u32::from(row1_slice[off1 + 2]),
+                u32::from(row1_slice[off1 + 1]),
+                u32::from(row1_slice[off1]),
+            );
+            let s2 = (
+                u32::from(row2_slice[off0 + 2]),
+                u32::from(row2_slice[off0 + 1]),
+                u32::from(row2_slice[off0]),
+            );
+            let s3 = (
+                u32::from(row2_slice[off1 + 2]),
+                u32::from(row2_slice[off1 + 1]),
+                u32::from(row2_slice[off1]),
+            );
 
             emit_y(row * ow + col, bt601_y(s0.0, s0.1, s0.2));
             if has_col2 {
@@ -144,7 +161,7 @@ pub fn bgrx_to_i420(
     pixels: &[u8],
     out_w: u16,
     out_h: u16,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, EncoderError> {
     let (w, h, ow, oh) = check_bgrx_geometry(width, height, stride, pixels, out_w, out_h)?;
 
     let y_size = ow * oh;
@@ -179,7 +196,7 @@ pub fn bgrx_to_nv12(
     pixels: &[u8],
     out_w: u16,
     out_h: u16,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, EncoderError> {
     let (w, h, ow, oh) = check_bgrx_geometry(width, height, stride, pixels, out_w, out_h)?;
 
     let y_size = ow * oh;
@@ -219,7 +236,7 @@ impl H264Encoder for MockH264Encoder {
         _stride: usize,
         _pixels: &[u8],
         force_idr: bool,
-    ) -> Result<EncodedAu, String> {
+    ) -> Result<EncodedAu, EncoderError> {
         self.frames += 1;
         let mut annex_b = vec![0x00, 0x00, 0x00, 0x01, if force_idr { 0x65 } else { 0x41 }];
         annex_b.extend_from_slice(&self.frames.to_le_bytes());

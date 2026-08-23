@@ -5,6 +5,7 @@ use tracing::debug;
 use tracing::info;
 
 use crate::encoder::H264Encoder;
+use crate::error::EncoderError;
 
 #[cfg(feature = "nvenc")]
 use crate::nvenc_enc::NvencH264Encoder;
@@ -20,7 +21,7 @@ pub struct SelectedEncoder {
 }
 
 /// Probe optional hardware backends then fall back to OpenH264.
-pub fn select_h264_encoder() -> Result<SelectedEncoder, String> {
+pub fn select_h264_encoder() -> Result<SelectedEncoder, EncoderError> {
     #[cfg(feature = "nvenc")]
     match NvencH264Encoder::probe() {
         Ok(encoder) => {
@@ -57,6 +58,6 @@ pub fn select_h264_encoder() -> Result<SelectedEncoder, String> {
 
     #[cfg(not(feature = "openh264"))]
     {
-        Err("no H.264 encoder backends compiled in (enable openh264/vaapi/nvenc)".into())
+        Err(EncoderError::NoBackendAvailable)
     }
 }
