@@ -453,10 +453,26 @@ pub struct BitmapUpdateData {
 
 impl BitmapUpdateData {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        Self::encode_rectangles(&self.rectangles)
+    }
+
+    /// Encodes `rectangles` without cloning their pixel payloads.
+    pub fn encode_rectangles(rectangles: &[BitmapRect]) -> Vec<u8> {
+        let body: usize = rectangles
+            .iter()
+            .map(|r| {
+                let header = if r.compressed_scan_width.is_some() {
+                    26
+                } else {
+                    18
+                };
+                header + r.data.len()
+            })
+            .sum();
+        let mut out = Vec::with_capacity(4 + body);
         out.write_u16_le(BITMAP_UPDATE_TYPE);
-        out.write_u16_le(self.rectangles.len() as u16);
-        for rect in &self.rectangles {
+        out.write_u16_le(rectangles.len() as u16);
+        for rect in rectangles {
             rect.encode(&mut out);
         }
         out
@@ -601,6 +617,10 @@ mod tests {
             }],
         };
         let encoded = bitmap.encode();
+        assert_eq!(
+            encoded,
+            BitmapUpdateData::encode_rectangles(&bitmap.rectangles)
+        );
         let decoded = BitmapUpdateData::decode(&encoded).unwrap();
         assert_eq!(decoded, bitmap);
         assert_eq!(decoded.rectangles[0].data, compressed_payload);

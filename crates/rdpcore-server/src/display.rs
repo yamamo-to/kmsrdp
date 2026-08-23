@@ -42,18 +42,34 @@ pub struct BitmapUpdate {
     /// loop can publish one full frame to `latest_full` and to subscribers
     /// without cloning megabytes of framebuffer data.
     ///
-    /// After [`BitmapUpdate::sub`] the buffer is tightly packed
-    /// (`stride == width * 4`) - the wire encoder relies on that (it only
-    /// reverses rows for the bottom-up wire convention, it doesn't re-pack
-    /// arbitrary strides).
+    /// [`BitmapUpdate::sub`] clones this `Arc` and keeps the parent
+    /// `stride`; the view's top-left pixel is at ([`src_x`], [`src_y`]).
+    /// The wire encoder indexes through those fields instead of
+    /// re-packing the rectangle.
     pub data: Arc<[u8]>,
     pub stride: NonZeroUsize,
+    /// Horizontal pixel offset of this update's origin inside [`data`].
+    pub src_x: u16,
+    /// Vertical pixel offset of this update's origin inside [`data`].
+    pub src_y: u16,
 }
 
 impl BitmapUpdate {
-    /// Extracts a sub-rectangle, re-packing it tightly (`stride = width *
-    /// 4`) regardless of `self`'s own stride - so downstream wire encoding
-    /// never has to deal with row padding.
+    /// Byte offset of the pixel `x`/`y` relative to this update's origin.
+    pub(crate) fn src_byte_offset(&self, x: u16, y: u16) -> usize {
+        const BYTES_PER_PIXEL: usize = 4;
+        (usize::from(self.src_y) + usize::from(y))
+            .saturating_mul(self.stride.get())
+            .saturating_add(
+                (usize::from(self.src_x) + usize::from(x)).saturating_mul(BYTES_PER_PIXEL),
+            )
+    }
+
+    /// View of a sub-rectangle that shares [`data`] (no framebuffer copy).
+    ///
+    /// The returned update keeps the parent stride and records the
+    /// region's origin in [`src_x`]/[`src_y`] so encoders can address
+    /// padded rows without a tightly-packed clone.
     pub fn sub(
         &self,
         x: u16,
@@ -68,20 +84,25 @@ impl BitmapUpdate {
             return None;
         }
 
-        let mut data = Vec::with_capacity(bw * BYTES_PER_PIXEL * bh);
-        for row in 0..bh {
-            let start = (by + row) * self.stride.get() + bx * BYTES_PER_PIXEL;
-            data.extend_from_slice(&self.data[start..start + bw * BYTES_PER_PIXEL]);
+        let src_x = self.src_x.checked_add(x)?;
+        let src_y = self.src_y.checked_add(y)?;
+        let last = (usize::from(src_y) + bh.saturating_sub(1))
+            .saturating_mul(self.stride.get())
+            .saturating_add((usize::from(src_x) + bw).saturating_mul(BYTES_PER_PIXEL));
+        if last > self.data.len() {
+            return None;
         }
 
         Some(BitmapUpdate {
-            x: self.x + x,
-            y: self.y + y,
+            x: self.x.checked_add(x)?,
+            y: self.y.checked_add(y)?,
             width,
             height,
             format: self.format,
-            data: Arc::from(data),
-            stride: NonZeroUsize::new(bw * BYTES_PER_PIXEL)?,
+            data: Arc::clone(&self.data),
+            stride: self.stride,
+            src_x,
+            src_y,
         })
     }
 }
@@ -115,5 +136,84 @@ pub trait RdpServerDisplayUpdates: Send {
     /// Latest full-desktop frame, if the backend keeps one (for Refresh Rect).
     fn latest_full_frame(&self) -> Option<BitmapUpdate> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn full_frame(width: u16, height: u16, fill: u8) -> BitmapUpdate {
+        let stride = NonZeroUsize::new(usize::from(width) * 4).unwrap();
+        BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(width).unwrap(),
+            height: NonZeroU16::new(height).unwrap(),
+            format: PixelFormat::BgrX32,
+            data: Arc::from(vec![fill; stride.get() * usize::from(height)]),
+            stride,
+            src_x: 0,
+            src_y: 0,
+        }
+    }
+
+    #[test]
+    fn sub_shares_backing_buffer_and_records_source_origin() {
+        let full = full_frame(128, 64, 7);
+        let sub = full
+            .sub(
+                64,
+                16,
+                NonZeroU16::new(32).unwrap(),
+                NonZeroU16::new(16).unwrap(),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&full.data, &sub.data));
+        assert_eq!(sub.stride, full.stride);
+        assert_eq!((sub.x, sub.y), (64, 16));
+        assert_eq!((sub.src_x, sub.src_y), (64, 16));
+        assert_eq!(sub.width.get(), 32);
+        assert_eq!(sub.height.get(), 16);
+        assert_eq!(sub.src_byte_offset(0, 0), 16 * full.stride.get() + 64 * 4);
+    }
+
+    #[test]
+    fn nested_sub_accumulates_source_origin() {
+        let full = full_frame(128, 64, 1);
+        let mid = full
+            .sub(
+                64,
+                16,
+                NonZeroU16::new(48).unwrap(),
+                NonZeroU16::new(32).unwrap(),
+            )
+            .unwrap();
+        let inner = mid
+            .sub(
+                8,
+                8,
+                NonZeroU16::new(16).unwrap(),
+                NonZeroU16::new(8).unwrap(),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&full.data, &inner.data));
+        assert_eq!((inner.src_x, inner.src_y), (72, 24));
+        assert_eq!((inner.x, inner.y), (72, 24));
+    }
+
+    #[test]
+    fn sub_rejects_out_of_bounds_rect() {
+        let full = full_frame(64, 64, 0);
+        assert!(
+            full.sub(
+                32,
+                32,
+                NonZeroU16::new(48).unwrap(),
+                NonZeroU16::new(16).unwrap()
+            )
+            .is_none()
+        );
     }
 }

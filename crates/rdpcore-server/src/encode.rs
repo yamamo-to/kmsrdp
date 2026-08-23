@@ -84,7 +84,6 @@ pub(crate) fn encode_bitmap_update(
 ) -> (Vec<Vec<Vec<u8>>>, BitmapWireStats) {
     let width = bitmap.width.get();
     let height = bitmap.height.get();
-    let row_bytes = bitmap.stride.get();
 
     let mut rectangles = Vec::new();
     let mut stats = BitmapWireStats::default();
@@ -99,7 +98,6 @@ pub(crate) fn encode_bitmap_update(
                 let tile_width = TILE_SIZE.min(width - tile_x);
                 push_bitmap_rect(
                     bitmap,
-                    row_bytes,
                     tile_x,
                     tile_y,
                     tile_width,
@@ -122,7 +120,6 @@ pub(crate) fn encode_bitmap_update(
             let th = strip_height.min(height - tile_y);
             push_bitmap_rect(
                 bitmap,
-                row_bytes,
                 0,
                 tile_y,
                 width,
@@ -150,7 +147,6 @@ pub(crate) fn encode_bitmap_update(
 #[allow(clippy::too_many_arguments)]
 fn push_bitmap_rect(
     bitmap: &BitmapUpdate,
-    row_bytes: usize,
     tile_x: u16,
     tile_y: u16,
     tile_width: u16,
@@ -166,8 +162,7 @@ fn push_bitmap_rect(
     tile_scratch.reserve(needed_len);
 
     for row in (0..tile_height).rev() {
-        let src_row = usize::from(tile_y + row);
-        let src_start = src_row * row_bytes + usize::from(tile_x) * 4;
+        let src_start = bitmap.src_byte_offset(tile_x, tile_y + row);
         if let Some(slice) = bitmap.data.get(src_start..src_start + tile_row_bytes) {
             tile_scratch.extend_from_slice(slice);
         } else {
@@ -218,8 +213,10 @@ pub(crate) fn encode_nscodec_update(
     color_loss_level: u8,
     max_request_size: usize,
 ) -> (Vec<Vec<Vec<u8>>>, BitmapWireStats) {
+    let start = bitmap.src_byte_offset(0, 0);
+    let pixels = bitmap.data.get(start..).unwrap_or(&[]);
     let data = rdpcore_pdu::nscodec::encode(
-        &bitmap.data,
+        pixels,
         bitmap.width.get(),
         bitmap.height.get(),
         bitmap.stride.get(),
@@ -282,10 +279,7 @@ fn encode_rectangles_to_wire_frames(
     rectangles: &[fastpath::BitmapRect],
     max_request_size: usize,
 ) -> Vec<Vec<u8>> {
-    let bitmap_bytes = fastpath::BitmapUpdateData {
-        rectangles: rectangles.to_vec(),
-    }
-    .encode();
+    let bitmap_bytes = fastpath::BitmapUpdateData::encode_rectangles(rectangles);
     encode_update_to_wire_frames(UPDATE_CODE_BITMAP, &bitmap_bytes, max_request_size)
 }
 
@@ -331,6 +325,8 @@ mod tests {
             format: PixelFormat::BgrX32,
             data: std::sync::Arc::from(vec![fill; stride.get() * usize::from(height)]),
             stride,
+            src_x: 0,
+            src_y: 0,
         }
     }
 
@@ -385,6 +381,69 @@ mod tests {
         let policy = bitmap_encode_policy("MSTSC", None, 8 * 1024 * 1024);
         assert!(policy.use_rdp6_planar);
         assert_eq!(policy.nscodec, None);
+    }
+
+    #[test]
+    fn stride_view_encodes_the_same_wire_as_a_tight_pack() {
+        let width = 128u16;
+        let height = 64u16;
+        let stride = usize::from(width) * 4;
+        let mut canvas = vec![0u8; stride * usize::from(height)];
+        for y in 0..usize::from(height) {
+            for x in 64..128 {
+                let i = y * stride + x * 4;
+                canvas[i] = 10;
+                canvas[i + 1] = 20;
+                canvas[i + 2] = 30;
+                canvas[i + 3] = 0xFF;
+            }
+        }
+        let full = BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(width).unwrap(),
+            height: NonZeroU16::new(height).unwrap(),
+            format: PixelFormat::BgrX32,
+            data: std::sync::Arc::from(canvas),
+            stride: NonZeroUsize::new(stride).unwrap(),
+            src_x: 0,
+            src_y: 0,
+        };
+        let view = full
+            .sub(
+                64,
+                0,
+                NonZeroU16::new(64).unwrap(),
+                NonZeroU16::new(height).unwrap(),
+            )
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&view.data, &full.data));
+
+        let mut packed = vec![0u8; 64 * usize::from(height) * 4];
+        let packed_stride = 64 * 4;
+        for y in 0..usize::from(height) {
+            let src = y * stride + 64 * 4;
+            packed[y * packed_stride..(y + 1) * packed_stride]
+                .copy_from_slice(&full.data[src..src + packed_stride]);
+        }
+        let packed_bmp = BitmapUpdate {
+            x: 64,
+            y: 0,
+            width: NonZeroU16::new(64).unwrap(),
+            height: NonZeroU16::new(height).unwrap(),
+            format: PixelFormat::BgrX32,
+            data: std::sync::Arc::from(packed),
+            stride: NonZeroUsize::new(packed_stride).unwrap(),
+            src_x: 0,
+            src_y: 0,
+        };
+
+        let policy = bitmap_encode_policy("MSTSC", None, 8 * 1024 * 1024);
+        let (from_view, view_stats) = encode_bitmap_update(&view, &policy);
+        let (from_packed, packed_stats) = encode_bitmap_update(&packed_bmp, &policy);
+        assert_eq!(from_view, from_packed);
+        assert_eq!(view_stats.tiles, packed_stats.tiles);
+        assert_eq!(view_stats.compressed_tiles, packed_stats.compressed_tiles);
     }
 
     #[test]

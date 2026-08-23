@@ -223,6 +223,8 @@ impl DisplayHub {
                         format: PixelFormat::BgrX32,
                         data: Arc::clone(&data),
                         stride,
+                        src_x: 0,
+                        src_y: 0,
                     };
 
                     let dirty_rects = match &previous {
@@ -256,8 +258,8 @@ impl DisplayHub {
                     // dropped messages — then a static console produces no
                     // further dirty rects and the client stays stuck forever.
                     //
-                    // `BitmapUpdate::data` is `Arc<[u8]>`, so this clone is
-                    // cheap (no framebuffer memcpy).
+                    // `BitmapUpdate::data` is `Arc<[u8]>`, and `sub` only
+                    // clones that Arc (no framebuffer memcpy).
                     *Self::lock(&self.latest_full) = Some(full.clone());
                     previous = Some(PrevFrame {
                         width: raw.width,

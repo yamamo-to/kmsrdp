@@ -1383,6 +1383,16 @@ enum GfxEncodeOutcome {
     Disable { teardown: Vec<Vec<u8>> },
 }
 
+/// True when `source` is the same framebuffer Arc already encoded this tick.
+#[cfg(any(test, feature = "gfx"))]
+fn gfx_already_sent_frame(
+    last: &Option<std::sync::Arc<[u8]>>,
+    source: &std::sync::Arc<[u8]>,
+) -> bool {
+    last.as_ref()
+        .is_some_and(|prev| std::sync::Arc::ptr_eq(prev, source))
+}
+
 /// Runs the GFX H.264 encode for one frame, if applicable.
 ///
 /// The encode is CPU/GPU-bound and runs on the blocking pool (see
@@ -1407,9 +1417,14 @@ async fn try_encode_gfx_frame(
     }
     let source = latest_full.unwrap_or(bitmap).clone();
     let source_data = std::sync::Arc::clone(&source.data);
+    // Capture allocates a new framebuffer Arc every tick, so pointer
+    // equality only dedups the N dirty-rect notifications of one frame
+    // (each would otherwise re-encode the whole desktop). A later tick
+    // always has a new Arc, so periodic IDR still runs.
+    if gfx_already_sent_frame(last_gfx_data, &source_data) {
+        return Ok(GfxEncodeOutcome::SoftSkip);
+    }
     let gfx_for_encode = gfx.clone();
-    // Do not skip on Arc ptr equality: a frozen/black client needs periodic
-    // IDR refresh even when the captured buffer object is reused.
     let payloads = tokio::task::spawn_blocking(move || {
         gfx_for_encode.encode_frame(
             source.width.get(),
@@ -1845,6 +1860,19 @@ mod tests {
         assert_eq!(handler.lock().unwrap().reset_calls, 0);
         drop(guard);
         assert_eq!(handler.lock().unwrap().reset_calls, 1);
+    }
+
+    #[test]
+    fn gfx_already_sent_frame_is_pointer_equality() {
+        use std::sync::Arc;
+
+        let frame: Arc<[u8]> = Arc::from(vec![1u8, 2, 3]);
+        let same = Arc::clone(&frame);
+        let other: Arc<[u8]> = Arc::from(vec![1u8, 2, 3]);
+
+        assert!(!super::gfx_already_sent_frame(&None, &frame));
+        assert!(super::gfx_already_sent_frame(&Some(same), &frame));
+        assert!(!super::gfx_already_sent_frame(&Some(other), &frame));
     }
 
     #[test]
