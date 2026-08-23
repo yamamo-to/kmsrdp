@@ -73,7 +73,13 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Generate coverage summary
-        run: cargo llvm-cov --workspace --summary-only
+        run: cargo llvm-cov --workspace --fail-under-lines 40 --lcov --output-path lcov.info --summary-only
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
 
   fuzz:
     name: Fuzz smoke
@@ -109,3 +115,23 @@ jobs:
           cd crates/rdpcore-rdpdr
           cargo +nightly fuzz run decode_rdpdr --target x86_64-unknown-linux-gnu -- \
             -max_total_time=20 -max_len=8192
+
+      - name: Fuzz channel PDU decoders
+        env:
+          RUSTFLAGS: -C target-feature=-crt-static
+        run: |
+          for crate_target in \
+            rdpcore-cliprdr:decode_cliprdr \
+            rdpcore-rdpsnd:decode_rdpsnd \
+            rdpcore-rdpeai:decode_rdpeai \
+            rdpcore-dvc:decode_dvc \
+            rdpcore-rdpegfx:decode_rdpegfx
+          do
+            crate="${crate_target%%:*}"
+            target="${crate_target##*:}"
+            (
+              cd "crates/${crate}"
+              cargo +nightly fuzz run "$target" --target x86_64-unknown-linux-gnu -- \
+                -max_total_time=20 -max_len=8192
+            )
+          done

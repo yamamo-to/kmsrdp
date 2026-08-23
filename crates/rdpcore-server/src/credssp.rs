@@ -17,6 +17,24 @@ use crate::credentials::{Credentials, eq_ignore_ascii_case_ct, normalize_client_
 type CredsspProcessGenerator<'a> =
     Generator<'a, NetworkRequest, sspi::Result<Vec<u8>>, Result<ServerState, ServerError>>;
 
+#[derive(Debug, thiserror::Error)]
+pub enum CredSspError {
+    #[error("CredSSP server initialization failed: {0}")]
+    ServerInit(String),
+    #[error("CredSSP process error: {0}")]
+    Process(String),
+    #[error("CredSSP TSRequest exceeded maximum allowed size ({0} bytes)")]
+    RequestTooLarge(usize),
+    #[error("CredSSP TSRequest length parse error: {0}")]
+    Length(String),
+    #[error("CredSSP TSRequest decode error: {0}")]
+    Decode(String),
+    #[error("CredSSP TSRequest encode error: {0}")]
+    Encode(String),
+    #[error("IO error during CredSSP exchange: {0}")]
+    Io(#[from] io::Error),
+}
+
 /// Looks up the single configured account for NTLM verification.
 /// Unknown usernames still return an `AuthIdentity` with a dummy password
 /// so NTLM fails without advertising whether the account exists.
@@ -103,7 +121,7 @@ pub async fn run_credssp_nla<S>(
     public_key: Vec<u8>,
     expected: Credentials,
     computer_name: &str,
-) -> anyhow::Result<String>
+) -> Result<String, CredSspError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -113,13 +131,13 @@ where
         proxy,
         ServerMode::Ntlm(NtlmConfig::new(computer_name.to_owned())),
     )
-    .map_err(|e| anyhow::anyhow!("CredSSP server init failed: {e}"))?;
+    .map_err(|e| CredSspError::ServerInit(e.to_string()))?;
 
     loop {
         let request = read_ts_request(stream).await?;
         let mut generator = server.process(request);
         let result = resolve_credssp_generator(&mut generator)
-            .map_err(|e| anyhow::anyhow!("CredSSP failed: {}", e.error))?;
+            .map_err(|e| CredSspError::Process(e.error.to_string()))?;
 
         match result {
             ServerState::ReplyNeeded(ts_request) => {
@@ -152,29 +170,25 @@ fn resolve_credssp_generator(
 /// Maximum allowed size for a CredSSP TSRequest PDU (64 KB).
 const MAX_TS_REQUEST_LEN: usize = 65_536;
 
-async fn read_ts_request<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Result<TsRequest> {
+async fn read_ts_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<TsRequest, CredSspError> {
     let mut buf = Vec::with_capacity(256);
     let total = loop {
         let mut byte = [0u8; 1];
         stream.read_exact(&mut byte).await?;
         buf.push(byte[0]);
         if buf.len() > MAX_TS_REQUEST_LEN {
-            anyhow::bail!(
-                "CredSSP TSRequest exceeded maximum allowed size ({MAX_TS_REQUEST_LEN} bytes)"
-            );
+            return Err(CredSspError::RequestTooLarge(MAX_TS_REQUEST_LEN));
         }
         match TsRequest::read_length(&buf[..]) {
             Ok(len) => {
                 if len > MAX_TS_REQUEST_LEN {
-                    anyhow::bail!(
-                        "CredSSP TSRequest declared length {len} exceeds maximum allowed size ({MAX_TS_REQUEST_LEN} bytes)"
-                    );
+                    return Err(CredSspError::RequestTooLarge(MAX_TS_REQUEST_LEN));
                 }
                 break len;
             }
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => continue,
             Err(e) => {
-                return Err(anyhow::anyhow!("CredSSP TSRequest length: {e}"));
+                return Err(CredSspError::Length(e.to_string()));
             }
         }
     };
@@ -183,17 +197,17 @@ async fn read_ts_request<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Result
         buf.resize(total, 0);
         stream.read_exact(&mut buf[already..]).await?;
     }
-    TsRequest::from_buffer(&buf[..]).map_err(|e| anyhow::anyhow!("CredSSP TSRequest decode: {e}"))
+    TsRequest::from_buffer(&buf[..]).map_err(|e| CredSspError::Decode(e.to_string()))
 }
 
 async fn write_ts_request<S: AsyncWrite + Unpin>(
     stream: &mut S,
     ts_request: &TsRequest,
-) -> anyhow::Result<()> {
+) -> Result<(), CredSspError> {
     let mut buf = Vec::with_capacity(usize::from(ts_request.buffer_len()));
     ts_request
         .encode_ts_request(&mut buf)
-        .map_err(|e| anyhow::anyhow!("CredSSP TSRequest encode: {e}"))?;
+        .map_err(|e| CredSspError::Encode(e.to_string()))?;
     stream.write_all(&buf).await?;
     stream.flush().await?;
     Ok(())

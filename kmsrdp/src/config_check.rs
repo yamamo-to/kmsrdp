@@ -365,7 +365,10 @@ mod tests {
         clear_password_env();
         let report = validate(&test_cfg("kmsrdp", "", false));
         assert!(
-            report.errors.iter().any(|e| e.contains("password is empty")),
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("password is empty")),
             "{report:?}"
         );
     }

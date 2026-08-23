@@ -30,10 +30,11 @@ use crate::credentials::{CredentialValidator, Credentials};
 use crate::credssp;
 use crate::display::{BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay};
 use crate::encode::{
-    BitmapEncodePolicy, bitmap_encode_policy, client_needs_compat_workarounds,
+    BitmapEncodePolicy, BitmapWireStats, bitmap_encode_policy, client_needs_compat_workarounds,
     encode_bitmap_update, encode_nscodec_update, encode_update_to_wire_frames,
     retain_bitmap_during_resize,
 };
+use crate::error::{SessionError, finish_session};
 use crate::input::{ConnectionScopedInput, KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use crate::transport::{SteadyStateFrame, read_steady_state_frame, read_tpkt_frame};
 
@@ -848,7 +849,8 @@ impl Session {
             .max(fastpath::MAX_FASTPATH_CHUNK_SIZE as u32);
         let bitmap_policy =
             bitmap_encode_policy(client_label, accepted.nscodec, max_request_size as usize);
-        let defer_ms = initial_bitmap_defer_ms(client_label);
+        let defer_ms = initial_bitmap_defer_ms(client_label, bitmap_policy.nscodec.is_some());
+        let mut metrics = SessionBitmapMetrics::default();
         let mut bitmap_gate_open = defer_ms == 0;
         let mut bitmap_gate = Box::pin(tokio::time::sleep(std::time::Duration::from_millis(
             defer_ms,
@@ -955,17 +957,17 @@ impl Session {
                             // AlreadyFinished and keeps the client black.
                             if acceptor.is_finished() {
                                 resizing = false;
-                                if flush_pending_resize_bitmap(
+                                if let Err(e) = flush_pending_resize_bitmap(
                                     &mut pending_after_resize,
                                     &frame_sender,
                                     &bitmap_policy,
                                     &mut frame_id,
                                     display_updates_allowed,
+                                    &mut metrics,
                                 )
                                 .await
-                                .is_err()
                                 {
-                                    return Ok(());
+                                    return finish_session(Err(e));
                                 }
                                 if let Err(e) = handle_slow_path_frame(
                                     &bytes,
@@ -979,6 +981,7 @@ impl Session {
                                     &frame_sender,
                                     &bitmap_policy,
                                     &mut frame_id,
+                                    &mut metrics,
                                 )
                                 .await
                                 {
@@ -993,23 +996,23 @@ impl Session {
                                             .send(Frame { channel: ChannelKey::Io, priority: Priority::Latency, bytes: result.response })
                                             .is_err()
                                     {
-                                        return Ok(());
+                                        return finish_session(Err(SessionError::WriterClosed));
                                     }
                                     if acceptor.is_finished()
                                         || matches!(result.event, AcceptorEvent::Accepted(_))
                                     {
                                         resizing = false;
-                                        if flush_pending_resize_bitmap(
+                                        if let Err(e) = flush_pending_resize_bitmap(
                                             &mut pending_after_resize,
                                             &frame_sender,
                                             &bitmap_policy,
                                             &mut frame_id,
                                             display_updates_allowed,
+                                            &mut metrics,
                                         )
                                         .await
-                                        .is_err()
                                         {
-                                            return Ok(());
+                                            return finish_session(Err(e));
                                         }
                                     }
                                 }
@@ -1018,17 +1021,17 @@ impl Session {
                                         || matches!(e, ConnectorError::AlreadyFinished)
                                     {
                                         resizing = false;
-                                        if flush_pending_resize_bitmap(
+                                        if let Err(e) = flush_pending_resize_bitmap(
                                             &mut pending_after_resize,
                                             &frame_sender,
                                             &bitmap_policy,
                                             &mut frame_id,
                                             display_updates_allowed,
+                                            &mut metrics,
                                         )
                                         .await
-                                        .is_err()
                                         {
-                                            return Ok(());
+                                            return finish_session(Err(e));
                                         }
                                         if let Err(err) = handle_slow_path_frame(
                                             &bytes,
@@ -1042,6 +1045,7 @@ impl Session {
                                             &frame_sender,
                                             &bitmap_policy,
                                             &mut frame_id,
+                                            &mut metrics,
                                         )
                                         .await
                                         {
@@ -1068,6 +1072,7 @@ impl Session {
                                 &frame_sender,
                                 &bitmap_policy,
                                 &mut frame_id,
+                                &mut metrics,
                             )
                             .await
                             {
@@ -1095,22 +1100,22 @@ impl Session {
                                 Ok(outcome) => {
                                     apply_gfx_encode_outcome(outcome, dvc.as_ref(), &frame_sender)
                                 }
-                                Err(()) => Err(()),
+                                Err(e) => Err(e),
                             },
                         );
-                        if send_outbound_frame(
+                        if let Err(e) = send_outbound_frame(
                             &bitmap,
                             &frame_sender,
                             &bitmap_policy,
                             &mut frame_id,
                             full.as_ref(),
+                            &mut metrics,
                             #[cfg(feature = "gfx")]
                             gfx_attempt,
                         )
                         .await
-                        .is_err()
                         {
-                            return Ok(());
+                            return finish_session(Err(e));
                         }
                     }
                 }
@@ -1146,22 +1151,22 @@ impl Session {
                                         dvc.as_ref(),
                                         &frame_sender,
                                     ),
-                                    Err(()) => Err(()),
+                                    Err(e) => Err(e),
                                 },
                             );
-                            if send_outbound_frame(
+                            if let Err(e) = send_outbound_frame(
                                 &bitmap,
                                 &frame_sender,
                                 &bitmap_policy,
                                 &mut frame_id,
                                 full.as_ref(),
+                                &mut metrics,
                                 #[cfg(feature = "gfx")]
                                 gfx_attempt,
                             )
                             .await
-                            .is_err()
                             {
-                                return Ok(());
+                                return finish_session(Err(e));
                             }
                         }
                         Ok(Some(DisplayUpdate::Resized(size))) if resizing => {
@@ -1181,13 +1186,16 @@ impl Session {
                                     resize_desktop = size;
                                     pending_after_resize = None;
                                     if frame_sender.send(Frame { channel: ChannelKey::Io, priority: Priority::Latency, bytes: response }).is_err() {
-                                        return Ok(());
+                                        return finish_session(Err(SessionError::WriterClosed));
                                     }
                                 }
                                 Err(e) => warn!("failed to start resize to {}x{}: {e}", size.width, size.height),
                             }
                         }
-                        Ok(None) => return Ok(()),
+                        Ok(None) => {
+                            metrics.log("display_ended");
+                            return Ok(());
+                        }
                     }
                 }
                 clipboard_event = recv_optional(&mut cliprdr_event_rx) => {
@@ -1211,7 +1219,7 @@ impl Session {
                                 })
                                 .is_err()
                             {
-                                return Ok(());
+                                return finish_session(Err(SessionError::WriterClosed));
                             }
                         }
                     }
@@ -1225,11 +1233,51 @@ fn trim_client_name(name: &str) -> &str {
     name.trim_end_matches('\0').trim()
 }
 
-fn initial_bitmap_defer_ms(client_name: &str) -> u64 {
-    if client_needs_compat_workarounds(client_name) {
+fn initial_bitmap_defer_ms(client_name: &str, using_nscodec: bool) -> u64 {
+    if using_nscodec || client_needs_compat_workarounds(client_name) {
         400
     } else {
         0
+    }
+}
+
+#[derive(Debug, Default)]
+struct SessionBitmapMetrics {
+    frames: u64,
+    tiles: u64,
+    compressed_tiles: u64,
+    raw_tiles: u64,
+    encoded_bytes: u64,
+    update_batches: u64,
+}
+
+impl SessionBitmapMetrics {
+    fn record(&mut self, stats: BitmapWireStats) {
+        self.frames += 1;
+        self.tiles += u64::from(stats.tiles);
+        self.compressed_tiles += u64::from(stats.compressed_tiles);
+        self.raw_tiles += u64::from(stats.raw_tiles);
+        self.encoded_bytes += stats.encoded_bytes as u64;
+        self.update_batches += u64::from(stats.update_batches);
+        if self.frames.is_multiple_of(30) {
+            self.log("periodic");
+        }
+    }
+
+    fn log(&self, reason: &'static str) {
+        if self.frames == 0 {
+            return;
+        }
+        info!(
+            reason,
+            frames = self.frames,
+            tiles = self.tiles,
+            compressed_tiles = self.compressed_tiles,
+            raw_tiles = self.raw_tiles,
+            encoded_bytes = self.encoded_bytes,
+            update_batches = self.update_batches,
+            "session bitmap metrics"
+        );
     }
 }
 
@@ -1238,7 +1286,8 @@ async fn send_outbound_bitmap(
     frame_sender: &FrameSender,
     policy: &BitmapEncodePolicy,
     frame_id: &mut u32,
-) -> Result<(), ()> {
+    metrics: &mut SessionBitmapMetrics,
+) -> Result<(), SessionError> {
     // Planar/NSCodec encoding is CPU-bound and was previously run inline on
     // this connection's steady-state select! task, stalling input dispatch
     // and every other channel for the full encode duration on every frame
@@ -1247,15 +1296,16 @@ async fn send_outbound_bitmap(
     // pool instead.
     let bitmap = bitmap.clone();
     let policy = *policy;
-    let batches = tokio::task::spawn_blocking(move || {
+    let (batches, stats) = tokio::task::spawn_blocking(move || {
         if let Some((codec_id, cll)) = policy.nscodec {
-            encode_nscodec_update(&bitmap, codec_id, cll, policy.max_request_size).0
+            encode_nscodec_update(&bitmap, codec_id, cll, policy.max_request_size)
         } else {
-            encode_bitmap_update(&bitmap, &policy).0
+            encode_bitmap_update(&bitmap, &policy)
         }
     })
     .await
-    .map_err(|_| ())?;
+    .map_err(|_| SessionError::EncodeJoin)?;
+    metrics.record(stats);
 
     let id = *frame_id;
     *frame_id = frame_id.wrapping_add(1).max(1);
@@ -1283,7 +1333,7 @@ async fn send_outbound_bitmap(
             })
             .is_err()
         {
-            return Err(());
+            return Err(SessionError::WriterClosed);
         }
     }
     Ok(())
@@ -1298,18 +1348,19 @@ async fn send_outbound_frame(
     policy: &BitmapEncodePolicy,
     frame_id: &mut u32,
     latest_full: Option<&BitmapUpdate>,
-    #[cfg(feature = "gfx")] gfx_attempt: Option<Result<bool, ()>>,
-) -> Result<(), ()> {
+    metrics: &mut SessionBitmapMetrics,
+    #[cfg(feature = "gfx")] gfx_attempt: Option<Result<bool, SessionError>>,
+) -> Result<(), SessionError> {
     #[cfg(feature = "gfx")]
     if let Some(result) = gfx_attempt {
         match result {
             Ok(true) => return Ok(()),
             Ok(false) => {}
-            Err(()) => return Err(()),
+            Err(e) => return Err(e),
         }
     }
     let _ = latest_full;
-    send_outbound_bitmap(bitmap, frame_sender, policy, frame_id).await
+    send_outbound_bitmap(bitmap, frame_sender, policy, frame_id, metrics).await
 }
 
 /// Outcome of attempting the GFX path for one frame - kept separate from
@@ -1347,7 +1398,7 @@ async fn try_encode_gfx_frame(
     last_gfx_data: &mut Option<std::sync::Arc<[u8]>>,
     latest_full: Option<&BitmapUpdate>,
     bitmap: &BitmapUpdate,
-) -> Result<GfxEncodeOutcome, ()> {
+) -> Result<GfxEncodeOutcome, SessionError> {
     let Some(gfx) = gfx else {
         return Ok(GfxEncodeOutcome::Fallback);
     };
@@ -1368,7 +1419,7 @@ async fn try_encode_gfx_frame(
         )
     })
     .await
-    .map_err(|_| ())?;
+    .map_err(|_| SessionError::GfxEncodeJoin)?;
     match payloads {
         rdpcore_rdpegfx::GfxFrameResult::Frames(payloads) => {
             *last_gfx_data = Some(source_data);
@@ -1388,12 +1439,12 @@ fn apply_gfx_encode_outcome(
     outcome: GfxEncodeOutcome,
     dvc: Option<&DvcMux>,
     frame_sender: &FrameSender,
-) -> Result<bool, ()> {
+) -> Result<bool, SessionError> {
     match outcome {
         GfxEncodeOutcome::Fallback => Ok(false),
         GfxEncodeOutcome::SoftSkip => Ok(true),
         GfxEncodeOutcome::Send(payloads) => {
-            let mux = dvc.ok_or(())?;
+            let mux = dvc.ok_or(SessionError::GfxChannelMissing)?;
             send_gfx_payloads(mux, frame_sender, payloads)?;
             Ok(true)
         }
@@ -1413,9 +1464,9 @@ fn send_gfx_payloads(
     mux: &DvcMux,
     frame_sender: &FrameSender,
     payloads: Vec<Vec<u8>>,
-) -> Result<(), ()> {
+) -> Result<(), SessionError> {
     let Some(dyn_id) = mux.channel_id_for_name(rdpcore_rdpegfx::CHANNEL_NAME) else {
-        return Err(());
+        return Err(SessionError::GfxChannelMissing);
     };
     for bytes in mux.wrap_channel_payloads(dyn_id, payloads) {
         if frame_sender
@@ -1426,7 +1477,7 @@ fn send_gfx_payloads(
             })
             .is_err()
         {
-            return Err(());
+            return Err(SessionError::WriterClosed);
         }
     }
     Ok(())
@@ -1510,6 +1561,7 @@ async fn handle_slow_path_frame(
     frame_sender: &rdpcore_transport::FrameSender,
     policy: &BitmapEncodePolicy,
     frame_id: &mut u32,
+    metrics: &mut SessionBitmapMetrics,
 ) -> anyhow::Result<()> {
     let payload = rdpcore_pdu::x224::unwrap_data(bytes)?;
     let send_data = rdpcore_pdu::mcs::SendData::decode_request(payload)?;
@@ -1525,8 +1577,14 @@ async fn handle_slow_path_frame(
                             && !was
                             && let Some(full) = updates.latest_full_frame()
                         {
-                            let _ =
-                                send_outbound_bitmap(&full, frame_sender, policy, frame_id).await;
+                            let _ = send_outbound_bitmap(
+                                &full,
+                                frame_sender,
+                                policy,
+                                frame_id,
+                                metrics,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1535,8 +1593,14 @@ async fn handle_slow_path_frame(
                         && let Some(full) = updates.latest_full_frame()
                     {
                         if rects.is_empty() {
-                            let _ =
-                                send_outbound_bitmap(&full, frame_sender, policy, frame_id).await;
+                            let _ = send_outbound_bitmap(
+                                &full,
+                                frame_sender,
+                                policy,
+                                frame_id,
+                                metrics,
+                            )
+                            .await;
                         } else {
                             for rect in rects {
                                 let w = rect.right.saturating_sub(rect.left).saturating_add(1);
@@ -1547,9 +1611,14 @@ async fn handle_slow_path_frame(
                                     continue;
                                 };
                                 if let Some(sub) = full.sub(rect.left, rect.top, nw, nh) {
-                                    let _ =
-                                        send_outbound_bitmap(&sub, frame_sender, policy, frame_id)
-                                            .await;
+                                    let _ = send_outbound_bitmap(
+                                        &sub,
+                                        frame_sender,
+                                        policy,
+                                        frame_id,
+                                        metrics,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -1706,7 +1775,8 @@ async fn flush_pending_resize_bitmap(
     policy: &BitmapEncodePolicy,
     frame_id: &mut u32,
     display_updates_allowed: bool,
-) -> Result<(), ()> {
+    metrics: &mut SessionBitmapMetrics,
+) -> Result<(), SessionError> {
     if !display_updates_allowed {
         *pending = None;
         return Ok(());
@@ -1714,7 +1784,7 @@ async fn flush_pending_resize_bitmap(
     let Some(bitmap) = pending.take() else {
         return Ok(());
     };
-    send_outbound_bitmap(&bitmap, frame_sender, policy, frame_id).await
+    send_outbound_bitmap(&bitmap, frame_sender, policy, frame_id, metrics).await
 }
 
 #[cfg(test)]

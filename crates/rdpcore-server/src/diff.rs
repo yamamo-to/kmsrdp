@@ -53,6 +53,55 @@ fn tile_differs(
 /// `stride >= width * bpp`; `bpp` is bytes per pixel (4 for BGRX32).
 /// Returns the changed regions, each a multiple of one tile except at the
 /// frame's right/bottom edge.
+struct SmallBitSet {
+    inline: [u64; 64], // 4096 bits: fits up to 4K resolution (60x34 = 2040 tiles) on stack
+    heap: Vec<u64>,
+}
+
+impl SmallBitSet {
+    fn new(len: usize) -> Self {
+        let words = len.div_ceil(64);
+        if words <= 64 {
+            Self {
+                inline: [0; 64],
+                heap: Vec::new(),
+            }
+        } else {
+            Self {
+                inline: [0; 64],
+                heap: vec![0; words],
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, idx: usize) -> bool {
+        let word_idx = idx / 64;
+        let bit_idx = idx % 64;
+        if self.heap.is_empty() {
+            (self.inline[word_idx] & (1 << bit_idx)) != 0
+        } else {
+            (self.heap[word_idx] & (1 << bit_idx)) != 0
+        }
+    }
+
+    #[inline(always)]
+    fn set(&mut self, idx: usize, val: bool) {
+        let word_idx = idx / 64;
+        let bit_idx = idx % 64;
+        let word = if self.heap.is_empty() {
+            &mut self.inline[word_idx]
+        } else {
+            &mut self.heap[word_idx]
+        };
+        if val {
+            *word |= 1 << bit_idx;
+        } else {
+            *word &= !(1 << bit_idx);
+        }
+    }
+}
+
 pub fn find_dirty_rects(
     image1: &[u8],
     stride1: usize,
@@ -77,7 +126,8 @@ pub fn find_dirty_rects(
 
     let tiles_x = width.div_ceil(TILE_SIZE);
     let tiles_y = height.div_ceil(TILE_SIZE);
-    let mut dirty = vec![false; tiles_x * tiles_y];
+    let total = tiles_x * tiles_y;
+    let mut dirty = SmallBitSet::new(total);
     for ty in 0..tiles_y {
         for tx in 0..tiles_x {
             let tile = Rect::new(
@@ -86,7 +136,10 @@ pub fn find_dirty_rects(
                 TILE_SIZE.min(width - tx * TILE_SIZE),
                 TILE_SIZE.min(height - ty * TILE_SIZE),
             );
-            dirty[ty * tiles_x + tx] = tile_differs(image1, stride1, image2, stride2, bpp, tile);
+            dirty.set(
+                ty * tiles_x + tx,
+                tile_differs(image1, stride1, image2, stride2, bpp, tile),
+            );
         }
     }
 
@@ -94,9 +147,8 @@ pub fn find_dirty_rects(
     let mod_height = height % TILE_SIZE;
     let mut rects = Vec::new();
     let mut idx = 0;
-    let total = tiles_x * tiles_y;
     while idx < total {
-        if !dirty[idx] {
+        if !dirty.get(idx) {
             idx += 1;
             continue;
         }
@@ -104,14 +156,14 @@ pub fn find_dirty_rects(
         let start_x = idx % tiles_x;
 
         let mut run_width = 1;
-        while start_x + run_width < tiles_x && dirty[idx + run_width] {
+        while start_x + run_width < tiles_x && dirty.get(idx + run_width) {
             run_width += 1;
         }
 
         let mut run_height = 1;
         'grow: while start_y + run_height < tiles_y {
             for x in 0..run_width {
-                if !dirty[(start_y + run_height) * tiles_x + start_x + x] {
+                if !dirty.get((start_y + run_height) * tiles_x + start_x + x) {
                     break 'grow;
                 }
             }
@@ -138,7 +190,7 @@ pub fn find_dirty_rects(
 
         for y in 0..run_height {
             for x in 0..run_width {
-                dirty[(start_y + y) * tiles_x + start_x + x] = false;
+                dirty.set((start_y + y) * tiles_x + start_x + x, false);
             }
         }
         idx += run_width;

@@ -1,0 +1,21 @@
+[package]
+name = "rdpcore-cliprdr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rdpcore-cliprdr = { path = ".." }
+
+[[bin]]
+name = "decode_cliprdr"
+path = "fuzz_targets/decode_cliprdr.rs"
+test = false
+doc = false
+bench = false

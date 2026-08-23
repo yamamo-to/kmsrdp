@@ -1,4 +1,16 @@
 [workspace]
 resolver = "2"
 members = ["kmsrdp", "crates/*"]
-exclude = ["crates/rdpcore-pdu/fuzz", "crates/rdpcore-rdpdr/fuzz"]
+
+# rust-toolchain.toml pins the CI/dev channel. MSRV is 1.87 (`uN::is_multiple_of`).
+[workspace.package]
+rust-version = "1.87"
+exclude = [
+    "crates/rdpcore-pdu/fuzz",
+    "crates/rdpcore-rdpdr/fuzz",
+    "crates/rdpcore-cliprdr/fuzz",
+    "crates/rdpcore-rdpsnd/fuzz",
+    "crates/rdpcore-rdpeai/fuzz",
+    "crates/rdpcore-dvc/fuzz",
+    "crates/rdpcore-rdpegfx/fuzz",
+]

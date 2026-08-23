@@ -29,10 +29,12 @@ use tokio_rustls::rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
 };
 
+use rdpcore_pdu::fastpath::{FastPathInput, FastPathInputEvent};
+
 use super::Session;
 use crate::auth_limit::AuthLimiter;
 use crate::credentials::{CredentialValidator, Credentials, ExactMatchCredentialValidator};
-use crate::display::{DesktopSize, RdpServerDisplay, RdpServerDisplayUpdates};
+use crate::display::{DesktopSize, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
 use crate::input::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use crate::transport::read_tpkt_frame;
 
@@ -467,4 +469,203 @@ async fn negotiate_require_nla_rejects_tls_only_client() {
 
     let negotiated = server.await.unwrap().unwrap();
     assert!(negotiated.is_none());
+}
+
+struct IdleUpdates;
+
+#[async_trait::async_trait]
+impl RdpServerDisplayUpdates for IdleUpdates {
+    async fn next_update(&mut self) -> anyhow::Result<Option<DisplayUpdate>> {
+        std::future::pending().await
+    }
+}
+
+struct IdleDisplay;
+
+#[async_trait::async_trait]
+impl RdpServerDisplay for IdleDisplay {
+    async fn size(&self) -> DesktopSize {
+        DesktopSize {
+            width: 1024,
+            height: 768,
+        }
+    }
+
+    async fn updates(&self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>> {
+        Ok(Box::new(IdleUpdates))
+    }
+}
+
+struct RecordingInput {
+    keys: Arc<Mutex<Vec<KeyboardEvent>>>,
+}
+
+impl RdpServerInputHandler for RecordingInput {
+    fn keyboard(&mut self, event: KeyboardEvent) {
+        self.keys.lock().unwrap().push(event);
+    }
+    fn mouse(&mut self, _event: MouseEvent) {}
+    fn reset(&mut self) {}
+}
+
+#[tokio::test]
+async fn negotiate_hybrid_without_nla_credentials_ends_cleanly() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let session = test_session(false, Some(matching_validator()));
+    let server = tokio::spawn(async move {
+        let (tcp, peer) = listener.accept().await.unwrap();
+        session
+            .negotiate(tcp, peer.ip(), &AtomicBool::new(false))
+            .await
+    });
+
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    tcp.set_nodelay(true).ok();
+    let cr = ConnectionRequest {
+        cookie: Some("kmsrdp".to_owned()),
+        flags: x224::RequestFlags(0),
+        protocol: SecurityProtocol::SSL | SecurityProtocol::HYBRID,
+    };
+    let mut tcp = tcp;
+    tcp.write_all(&cr.encode()).await.unwrap();
+    tcp.flush().await.unwrap();
+    let cc = read_tpkt_frame(&mut tcp).await.unwrap();
+    assert!(matches!(
+        ConnectionConfirm::decode(&cc).unwrap(),
+        ConnectionConfirm::Response { protocol, .. }
+            if protocol.contains(SecurityProtocol::HYBRID)
+    ));
+
+    let _tls = tls_connect(tcp).await;
+    let negotiated = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("NLA-without-credentials must not hang")
+        .unwrap()
+        .unwrap();
+    assert!(
+        negotiated.is_none(),
+        "HYBRID without NLA credentials must end negotiate with Ok(None)"
+    );
+}
+
+#[tokio::test]
+async fn negotiate_hybrid_rejects_garbage_tsrequest() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut session = test_session(true, Some(matching_validator()));
+    session.nla_credentials = Some(Credentials {
+        username: "kmsrdp".to_owned(),
+        password: "hunter2".to_owned(),
+        domain: None,
+    });
+    session.tls_public_key = vec![0u8; 64];
+    let server = tokio::spawn(async move {
+        let (tcp, peer) = listener.accept().await.unwrap();
+        session
+            .negotiate(tcp, peer.ip(), &AtomicBool::new(false))
+            .await
+    });
+
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    tcp.set_nodelay(true).ok();
+    let cr = ConnectionRequest {
+        cookie: Some("kmsrdp".to_owned()),
+        flags: x224::RequestFlags(0),
+        protocol: SecurityProtocol::SSL | SecurityProtocol::HYBRID,
+    };
+    let mut tcp = tcp;
+    tcp.write_all(&cr.encode()).await.unwrap();
+    tcp.flush().await.unwrap();
+    let _ = read_tpkt_frame(&mut tcp).await.unwrap();
+
+    let mut tls = tls_connect(tcp).await;
+    tls.write_all(&[0u8; 16]).await.unwrap();
+    tls.flush().await.unwrap();
+    // Close the client so CredSSP's length-prefixed read sees EOF instead of
+    // parking forever on a truncated TSRequest.
+    drop(tls);
+
+    let negotiated = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("CredSSP failure must not hang")
+        .unwrap()
+        .unwrap();
+    assert!(
+        negotiated.is_none(),
+        "garbage TSRequest must fail CredSSP and end negotiate with Ok(None)"
+    );
+}
+
+#[tokio::test]
+async fn steady_state_dispatches_fastpath_scancode() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let keys = Arc::new(Mutex::new(Vec::new()));
+    let mut session = test_session(false, Some(matching_validator()));
+    session.display = Arc::new(IdleDisplay);
+    session.input = Arc::new(Mutex::new(RecordingInput {
+        keys: Arc::clone(&keys),
+    }));
+
+    let server = tokio::spawn(async move {
+        let (tcp, peer) = listener.accept().await.unwrap();
+        let negotiated = session
+            .negotiate(tcp, peer.ip(), &AtomicBool::new(false))
+            .await
+            .unwrap();
+        let (tls, acceptor, accepted) = negotiated.expect("handshake");
+        session
+            .run_steady_state(peer, tls, acceptor, accepted)
+            .await
+    });
+
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    tcp.set_nodelay(true).ok();
+    let cr = ConnectionRequest {
+        cookie: Some("kmsrdp".to_owned()),
+        flags: x224::RequestFlags(0),
+        protocol: SecurityProtocol::SSL,
+    };
+    let mut tcp = tcp;
+    tcp.write_all(&cr.encode()).await.unwrap();
+    tcp.flush().await.unwrap();
+    let _ = read_tpkt_frame(&mut tcp).await.unwrap();
+
+    let mut tls = tls_connect(tcp).await;
+    drive_tls_handshake(&mut tls, "kmsrdp", "hunter2").await;
+    finish_accepted(&mut tls).await;
+
+    let input = FastPathInput {
+        events: vec![FastPathInputEvent::Scancode {
+            flags: 0,
+            code: 0x1E,
+        }],
+    };
+    tls.write_all(&input.encode()).await.unwrap();
+    tls.flush().await.unwrap();
+
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            {
+                let rec = keys.lock().unwrap();
+                if rec.iter().any(|e| {
+                    matches!(
+                        e,
+                        KeyboardEvent::Pressed {
+                            code: 0x1E,
+                            extended: false
+                        }
+                    )
+                }) {
+                    return;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    drop(tls);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+    seen.expect("steady-state must dispatch the Fast-Path scancode");
 }

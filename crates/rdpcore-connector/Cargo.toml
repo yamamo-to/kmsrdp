@@ -7,3 +7,4 @@ description = "Sans-io RDP server-side connection-sequence state machine"
 
 [dependencies]
 rdpcore-pdu = { path = "../rdpcore-pdu" }
+thiserror = "2.0.17"

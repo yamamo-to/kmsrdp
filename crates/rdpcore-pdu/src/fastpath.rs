@@ -655,4 +655,66 @@ mod tests {
         let decoded = FastPathInput::decode(&encoded).unwrap();
         assert_eq!(decoded, input);
     }
+
+    fn event_strategy() -> impl proptest::strategy::Strategy<Value = FastPathInputEvent> {
+        use proptest::prelude::*;
+        prop_oneof![
+            (any::<u8>(), any::<u8>()).prop_map(|(flags, code)| FastPathInputEvent::Scancode {
+                flags: flags & 0x1F,
+                code,
+            }),
+            (any::<u16>(), any::<u16>(), any::<u16>()).prop_map(|(pointer_flags, x, y)| {
+                FastPathInputEvent::Mouse {
+                    pointer_flags,
+                    x,
+                    y,
+                }
+            }),
+            any::<u8>().prop_map(|flags| FastPathInputEvent::Sync {
+                flags: flags & 0x1F
+            }),
+            (any::<u8>(), any::<u16>()).prop_map(|(flags, code)| FastPathInputEvent::Unicode {
+                flags: flags & 0x1F,
+                code,
+            }),
+        ]
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_fastpath_input_round_trip(
+            events in proptest::collection::vec(event_strategy(), 0..32)
+        ) {
+            let input = FastPathInput { events };
+            let encoded = input.encode();
+            let decoded = FastPathInput::decode(&encoded).unwrap();
+            proptest::prop_assert_eq!(decoded, input);
+        }
+
+        #[test]
+        fn prop_fastpath_output_round_trip(
+            update_code in 0u8..16,
+            frag in 0u8..4,
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64)
+        ) {
+            let output = FastPathOutput {
+                updates: vec![FastPathUpdatePdu {
+                    update_code,
+                    fragmentation: Fragmentation::from_u8(frag).unwrap(),
+                    data,
+                }],
+            };
+            let encoded = output.encode();
+            let decoded = FastPathOutput::decode(&encoded).unwrap();
+            proptest::prop_assert_eq!(decoded, output);
+        }
+
+        #[test]
+        fn prop_arbitrary_bytes_do_not_panic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)
+        ) {
+            let _ = FastPathInput::decode(&data);
+            let _ = FastPathOutput::decode(&data);
+        }
+    }
 }

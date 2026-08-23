@@ -257,7 +257,8 @@ pub fn wrap_data(payload: &[u8]) -> Vec<u8> {
         li: (DATA_TPDU_FIXED_SIZE - 1) as u8,
         code: TpduCode::DATA,
     };
-    let packet_length = (tpkt::HEADER_SIZE + DATA_TPDU_FIXED_SIZE + payload.len()).min(u16::MAX as usize);
+    let packet_length =
+        (tpkt::HEADER_SIZE + DATA_TPDU_FIXED_SIZE + payload.len()).min(u16::MAX as usize);
     let mut out = Vec::with_capacity(packet_length);
     TpktHeader {
         packet_length: packet_length as u16,

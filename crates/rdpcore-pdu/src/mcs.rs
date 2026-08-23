@@ -637,4 +637,96 @@ mod tests {
             pdu
         );
     }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_connect_initial_round_trip(
+            user_data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64)
+        ) {
+            let ci = ConnectInitial {
+                target_parameters: DomainParameters::target(),
+                min_parameters: DomainParameters::min(),
+                max_parameters: DomainParameters::max(),
+                user_data,
+            };
+            let decoded = ConnectInitial::decode(&ci.encode()).unwrap();
+            proptest::prop_assert_eq!(decoded, ci);
+        }
+
+        #[test]
+        fn prop_connect_response_round_trip(
+            called_connect_id: u32,
+            user_data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64)
+        ) {
+            let cr = ConnectResponse {
+                called_connect_id,
+                domain_parameters: DomainParameters::target(),
+                user_data,
+            };
+            let decoded = ConnectResponse::decode(&cr.encode()).unwrap();
+            proptest::prop_assert_eq!(decoded, cr);
+        }
+
+        #[test]
+        fn prop_domain_pdus_round_trip(
+            sub_height: u32,
+            sub_interval: u32,
+            initiator_off in 0u16..256,
+            channel_id: u16,
+            payload in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            reason in 0u8..8
+        ) {
+            let erect = ErectDomainRequest {
+                sub_height,
+                sub_interval,
+            };
+            proptest::prop_assert_eq!(
+                ErectDomainRequest::decode(&erect.encode()).unwrap(),
+                erect
+            );
+
+            let initiator = BASE_CHANNEL_ID + initiator_off;
+            let join = ChannelJoinRequest {
+                initiator,
+                channel_id,
+            };
+            proptest::prop_assert_eq!(
+                ChannelJoinRequest::decode(&join.encode()).unwrap(),
+                join
+            );
+
+            let send = SendData {
+                initiator,
+                channel_id,
+                data: payload,
+                complete: true,
+            };
+            proptest::prop_assert_eq!(
+                SendData::decode_request(&send.encode_request()).unwrap(),
+                send
+            );
+
+            let disc = DisconnectProviderUltimatum { reason };
+            proptest::prop_assert_eq!(
+                DisconnectProviderUltimatum::decode(&disc.encode()).unwrap(),
+                disc
+            );
+        }
+
+        #[test]
+        fn prop_arbitrary_bytes_do_not_panic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)
+        ) {
+            let _ = ConnectInitial::decode(&data);
+            let _ = ConnectResponse::decode(&data);
+            let _ = ErectDomainRequest::decode(&data);
+            let _ = AttachUserRequest::decode(&data);
+            let _ = AttachUserConfirm::decode(&data);
+            let _ = ChannelJoinRequest::decode(&data);
+            let _ = ChannelJoinConfirm::decode(&data);
+            let _ = SendData::decode_request(&data);
+            let _ = SendData::decode_indication(&data);
+            let _ = DisconnectProviderUltimatum::decode(&data);
+        }
+    }
 }

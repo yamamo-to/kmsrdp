@@ -44,6 +44,10 @@ fn ioctl_check(ret: libc::c_int, what: &str) -> io::Result<()> {
 ///
 /// # Safety
 /// The type `T` must be plain data without uninitialized memory or invalid byte patterns.
+/// # Safety
+/// `T` must be a plain C-layout struct with no padding that the kernel
+/// interprets as uninitialized (or padding must be zeroed by the caller).
+/// The returned slice is valid only for `val`'s lifetime.
 unsafe fn as_byte_slice<T: Sized>(val: &T) -> &[u8] {
     // SAFETY: val is a valid reference to T for size_of::<T>() bytes over its lifetime.
     unsafe { std::slice::from_raw_parts((val as *const T) as *const u8, mem::size_of::<T>()) }
@@ -341,7 +345,7 @@ mod tests {
     fn extended_arrow_keys_map_to_linux_codes() {
         assert_eq!(linux_keycode_from_rdp_scancode(0x48, true), Some(103)); // Up
         assert_eq!(linux_keycode_from_rdp_scancode(0x50, true), Some(108)); // Down
-        assert_eq!(linux_keycode_from_rdp_scancode(0x37, true), Some(99));  // PrintScreen
+        assert_eq!(linux_keycode_from_rdp_scancode(0x37, true), Some(99)); // PrintScreen
         assert_eq!(linux_keycode_from_rdp_scancode(0x20, true), Some(113)); // Mute
     }
 

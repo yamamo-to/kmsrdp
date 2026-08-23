@@ -137,9 +137,16 @@ pub enum ClientMessage {
     FormatList(Vec<u32>),
     FormatListResponse,
     FormatDataRequest(u32),
-    /// `Ok(text)` for `CB_RESPONSE_OK`, `Err(())` for `CB_RESPONSE_FAIL`.
-    FormatDataResponse(Result<String, ()>),
+    /// `Ok(text)` for `CB_RESPONSE_OK`, `Failed` for `CB_RESPONSE_FAIL`.
+    FormatDataResponse(FormatDataStatus),
     Other,
+}
+
+/// Wire-level Format Data Response status (see `CB_RESPONSE_*`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormatDataStatus {
+    Ok(String),
+    Failed,
 }
 
 pub fn decode_client_message(input: &[u8]) -> Result<ClientMessage, DecodeError> {
@@ -158,11 +165,11 @@ pub fn decode_client_message(input: &[u8]) -> Result<ClientMessage, DecodeError>
         }
         CB_FORMAT_DATA_RESPONSE => {
             if msg_flags & CB_RESPONSE_FAIL != 0 {
-                Ok(ClientMessage::FormatDataResponse(Err(())))
+                Ok(ClientMessage::FormatDataResponse(FormatDataStatus::Failed))
             } else {
-                Ok(ClientMessage::FormatDataResponse(Ok(utf16::read_fixed(
-                    body,
-                ))))
+                Ok(ClientMessage::FormatDataResponse(FormatDataStatus::Ok(
+                    utf16::read_fixed(body),
+                )))
             }
         }
         _ => Ok(ClientMessage::Other),
@@ -187,7 +194,7 @@ mod tests {
         let decoded = decode_client_message(&encoded).unwrap();
         assert_eq!(
             decoded,
-            ClientMessage::FormatDataResponse(Ok("hello".to_owned()))
+            ClientMessage::FormatDataResponse(FormatDataStatus::Ok("hello".to_owned()))
         );
     }
 
@@ -195,7 +202,10 @@ mod tests {
     fn format_data_response_error_round_trip() {
         let encoded = encode_format_data_response_error();
         let decoded = decode_client_message(&encoded).unwrap();
-        assert_eq!(decoded, ClientMessage::FormatDataResponse(Err(())));
+        assert_eq!(
+            decoded,
+            ClientMessage::FormatDataResponse(FormatDataStatus::Failed)
+        );
     }
 
     #[test]

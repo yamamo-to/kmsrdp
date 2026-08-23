@@ -440,4 +440,32 @@ mod tests {
             }
         ));
     }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_rdp6_round_trip(
+            w_blocks in 1usize..=8,
+            h in 1usize..=8,
+            seed: u32,
+        ) {
+            let w = w_blocks * 4;
+            let bgrx = make_tile(w, h, |x, y| {
+                let s = seed.wrapping_add((y * w + x) as u32);
+                ((s & 0xFF) as u8, ((s >> 8) & 0xFF) as u8, ((s >> 16) & 0xFF) as u8)
+            });
+            let encoded = encode(&bgrx, w, h);
+            let decoded = decode(&encoded, w, h).unwrap();
+            proptest::prop_assert_eq!(decoded, bgrx);
+        }
+
+        #[test]
+        fn prop_rdp6_arbitrary_bytes_do_not_panic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..128),
+            w_blocks in 1usize..=4,
+            h in 1usize..=4,
+        ) {
+            let w = w_blocks * 4;
+            let _ = decode(&data, w, h);
+        }
+    }
 }

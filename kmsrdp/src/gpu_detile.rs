@@ -74,6 +74,8 @@ macro_rules! gl_fns {
             unsafe fn load(lib: &Library) -> io::Result<Self> {
                 $(
                     let $field = {
+                        // SAFETY: `lib` is a live GLES library; the symbol name is a
+                        // NUL-terminated compile-time string matching the GLES ABI.
                         let sym: Symbol<unsafe extern "C" fn($($arg),*) $(-> $ret)?> =
                             unsafe { lib.get(concat!($name, "\0").as_bytes()) }
                                 .map_err(|e| io::Error::other(format!("dlsym {}: {e}", $name)))?;
@@ -288,9 +290,12 @@ impl GpuDetiler {
             .write(true)
             .open(&render_node)?;
 
+        // SAFETY: dlopen of a well-known soname; failure is converted to Err.
         let gbm_lib = unsafe { Library::new("libgbm.so.1") }
             .or_else(|_| unsafe { Library::new("libgbm.so") })
             .map_err(|e| io::Error::other(format!("failed to load libgbm: {e}")))?;
+        // SAFETY: `render_fd` is an open render-node fd; `gbm_lib` stays
+        // owned by Self for the GBM device lifetime.
         let gbm_device = unsafe { gbm_create_device(&gbm_lib, render_fd.as_raw_fd()) }?;
         let gbm_device_destroy: Option<GbmDeviceDestroy> =
             unsafe { gbm_lib.get(b"gbm_device_destroy\0") }
@@ -300,6 +305,8 @@ impl GpuDetiler {
         let egl: EglInstance = unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required() }
             .map_err(|e| io::Error::other(format!("failed to load libEGL: {e}")))?;
 
+        // SAFETY: `gbm_device` is a live `gbm_device*` from libgbm; the attrib
+        // list is terminated with EGL_NONE.
         let display = unsafe {
             egl.get_platform_display(EGL_PLATFORM_GBM_KHR, gbm_device, &[egl::ATTRIB_NONE])
         }
@@ -336,9 +343,11 @@ impl GpuDetiler {
         egl.make_current(display, None, None, Some(context))
             .map_err(|e| io::Error::other(format!("eglMakeCurrent failed: {e:?}")))?;
 
+        // SAFETY: dlopen of libGLESv2; symbols are resolved in `GlFns::load`.
         let gles_lib = unsafe { Library::new("libGLESv2.so.2") }
             .or_else(|_| unsafe { Library::new("libGLESv2.so") })
             .map_err(|e| io::Error::other(format!("failed to load libGLESv2: {e}")))?;
+        // SAFETY: `gles_lib` is stored on Self so the function pointers stay valid.
         let gl = unsafe { GlFns::load(&gles_lib)? };
 
         let image_target_texture_2d_oes = egl
@@ -519,6 +528,9 @@ impl GpuDetiler {
 
     fn draw_and_read(&self, image: egl::Image) -> io::Result<Vec<u8>> {
         let gl = &self.gl;
+        // SAFETY: the EGL context is current (`ensure_current`); GL object
+        // names were created in `new` and are still owned by this detiler;
+        // `out` is large enough for width*height*4 RGBA8.
         unsafe {
             (gl.active_texture)(GL_TEXTURE0);
             (gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, self.external_tex);
@@ -594,6 +606,8 @@ impl Drop for GpuDetiler {
     fn drop(&mut self) {
         if self.ensure_current().is_ok() {
             let gl = &self.gl;
+            // SAFETY: context is current; GL objects are deleted before EGL
+            // context / GBM device (required teardown order).
             unsafe {
                 if self.external_tex != 0 {
                     (gl.delete_textures)(1, &self.external_tex);

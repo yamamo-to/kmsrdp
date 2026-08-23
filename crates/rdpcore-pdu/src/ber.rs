@@ -253,4 +253,25 @@ mod tests {
         let mut cursor = ReadCursor::new(&buf);
         assert_eq!(read_application_tag(&mut cursor, 0x65).unwrap(), 10);
     }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_integer_round_trip(val: u32) {
+            let mut buf = Vec::new();
+            write_integer(&mut buf, val);
+            let mut cursor = ReadCursor::new(&buf);
+            let decoded = read_integer(&mut cursor).unwrap();
+            proptest::prop_assert_eq!(decoded, val);
+        }
+
+        #[test]
+        fn prop_arbitrary_bytes_do_not_panic(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..128)) {
+            let mut cursor = ReadCursor::new(&data);
+            let _ = read_integer(&mut cursor);
+            let mut cursor = ReadCursor::new(&data);
+            let _ = read_boolean(&mut cursor);
+            let mut cursor = ReadCursor::new(&data);
+            let _ = read_octet_string(&mut cursor);
+        }
+    }
 }

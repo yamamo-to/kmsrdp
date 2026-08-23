@@ -251,4 +251,38 @@ mod tests {
         let mut cursor = ReadCursor::new(&buf);
         assert_eq!(read_octet_string(&mut cursor, 4).unwrap(), b"Duca");
     }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_per_u32_round_trip(val: u32) {
+            let mut buf = Vec::new();
+            write_u32(&mut buf, val);
+            let mut cursor = ReadCursor::new(&buf);
+            let decoded = read_u32(&mut cursor).unwrap();
+            proptest::prop_assert_eq!(decoded, val);
+        }
+
+        #[test]
+        fn prop_per_u16_round_trip(val in 1000u16..=65535, min in 0u16..=1000) {
+            let mut buf = Vec::new();
+            write_u16(&mut buf, val, min);
+            let mut cursor = ReadCursor::new(&buf);
+            let decoded = read_u16(&mut cursor, min).unwrap();
+            proptest::prop_assert_eq!(decoded, val);
+        }
+
+        #[test]
+        fn prop_per_arbitrary_bytes_do_not_panic(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..128)) {
+            let mut cursor = ReadCursor::new(&data);
+            let _ = read_u32(&mut cursor);
+            let mut cursor = ReadCursor::new(&data);
+            let _ = read_length(&mut cursor);
+            let mut cursor = ReadCursor::new(&data);
+            let _ = read_choice(&mut cursor);
+            let mut cursor = ReadCursor::new(&data);
+            let _ = read_selection(&mut cursor);
+            let mut cursor = ReadCursor::new(&data);
+            let _ = read_object_id(&mut cursor);
+        }
+    }
 }

@@ -43,37 +43,37 @@ pub(crate) fn bitmap_encode_policy(
     nscodec: Option<NsCodecNegotiated>,
     max_request_size: usize,
 ) -> BitmapEncodePolicy {
-    let compat_mode = client_needs_compat_workarounds(client_name);
-    // macOS Windows App: prefer NSCodec SurfaceCommands (IronRDP path). Raw
-    // fast-path bitmaps work but are ~9MB/frame; RDP6 planar disconnects.
-    let nscodec = if compat_mode {
-        nscodec.map(|n| (n.codec_id, n.color_loss_level))
-    } else {
-        None
-    };
+    // Capability-first: if the client negotiated NSCodec, use it. RDP6
+    // planar is the default for everyone else. Name matching is only a
+    // last-resort fallback — some Mac clients disconnect on planar even
+    // when they omit NSCodec from Confirm Active.
+    let nscodec_params = nscodec.map(|n| (n.codec_id, n.color_loss_level));
+    let name_compat = client_needs_compat_workarounds(client_name);
+    let use_rdp6_planar = nscodec_params.is_none() && !name_compat;
+    let compat_limits = nscodec_params.is_some() || name_compat;
     // Keep each reassembled Fast-Path Update under MaxRequestSize. A 64x64
     // compressed tile is typically a few KB; use a conservative per-rect budget.
     let size_limited_rects = (max_request_size / 8192).max(1);
-    let max_rects_per_update = if compat_mode {
+    let max_rects_per_update = if compat_limits {
         COMPAT_MAX_RECTS_PER_UPDATE.min(size_limited_rects)
     } else {
         size_limited_rects
     };
     BitmapEncodePolicy {
-        use_rdp6_planar: !compat_mode,
+        use_rdp6_planar,
         max_rects_per_update,
-        nscodec,
+        nscodec: nscodec_params,
         max_request_size,
     }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct BitmapWireStats {
-    tiles: u32,
-    compressed_tiles: u32,
-    raw_tiles: u32,
-    encoded_bytes: usize,
-    update_batches: u32,
+    pub(crate) tiles: u32,
+    pub(crate) compressed_tiles: u32,
+    pub(crate) raw_tiles: u32,
+    pub(crate) encoded_bytes: usize,
+    pub(crate) update_batches: u32,
 }
 
 /// Splits one `BitmapUpdate` into wire-ready `FastPathOutput` byte buffers,
@@ -88,6 +88,7 @@ pub(crate) fn encode_bitmap_update(
 
     let mut rectangles = Vec::new();
     let mut stats = BitmapWireStats::default();
+    let mut tile_scratch = Vec::with_capacity(usize::from(TILE_SIZE) * 4 * usize::from(TILE_SIZE));
 
     if policy.use_rdp6_planar {
         let mut tile_y = 0u16;
@@ -104,6 +105,7 @@ pub(crate) fn encode_bitmap_update(
                     tile_width,
                     tile_height,
                     policy,
+                    &mut tile_scratch,
                     &mut rectangles,
                     &mut stats,
                 );
@@ -126,6 +128,7 @@ pub(crate) fn encode_bitmap_update(
                 width,
                 th,
                 policy,
+                &mut tile_scratch,
                 &mut rectangles,
                 &mut stats,
             );
@@ -153,37 +156,40 @@ fn push_bitmap_rect(
     tile_width: u16,
     tile_height: u16,
     policy: &BitmapEncodePolicy,
+    tile_scratch: &mut Vec<u8>,
     rectangles: &mut Vec<fastpath::BitmapRect>,
     stats: &mut BitmapWireStats,
 ) {
     let tile_row_bytes = usize::from(tile_width) * 4;
+    let needed_len = tile_row_bytes * usize::from(tile_height);
+    tile_scratch.clear();
+    tile_scratch.reserve(needed_len);
 
-    let mut tile_data = Vec::with_capacity(tile_row_bytes * usize::from(tile_height));
     for row in (0..tile_height).rev() {
         let src_row = usize::from(tile_y + row);
         let src_start = src_row * row_bytes + usize::from(tile_x) * 4;
         if let Some(slice) = bitmap.data.get(src_start..src_start + tile_row_bytes) {
-            tile_data.extend_from_slice(slice);
+            tile_scratch.extend_from_slice(slice);
         } else {
-            tile_data.extend(std::iter::repeat_n(0u8, tile_row_bytes));
+            tile_scratch.extend(std::iter::repeat_n(0u8, tile_row_bytes));
         }
     }
 
     let planar_ok = policy.use_rdp6_planar && tile_width.is_multiple_of(4);
     let (data, compressed_scan_width) = if planar_ok {
         let compressed = rdpcore_pdu::rdp6::encode(
-            &tile_data,
+            tile_scratch,
             usize::from(tile_width),
             usize::from(tile_height),
         );
-        if compressed.len() < tile_data.len() {
+        if compressed.len() < tile_scratch.len() {
             // Bytes, not pixels — see BitmapRect docs (MS-RDPBCGR vs mstsc).
             (compressed, Some(tile_width * 4))
         } else {
-            (tile_data, None)
+            (tile_scratch.clone(), None)
         }
     } else {
-        (tile_data, None)
+        (tile_scratch.clone(), None)
     };
 
     stats.tiles += 1;
@@ -362,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn mac_compat_full_frame_uses_few_strip_tiles() {
+    fn mac_name_without_nscodec_falls_back_to_raw_strips() {
         let policy = bitmap_encode_policy("m1-mac-mini", None, 8 * 1024 * 1024);
         assert!(!policy.use_rdp6_planar);
         assert_eq!(policy.max_rects_per_update, 32);
@@ -372,5 +378,24 @@ mod tests {
         assert_eq!(stats.tiles, 150); // 1200 / 8 scanline strips
         assert_eq!(stats.update_batches, 5); // ceil(150 / 32)
         assert_eq!(stats.raw_tiles, 150);
+    }
+
+    #[test]
+    fn mstsc_without_nscodec_uses_rdp6_planar() {
+        let policy = bitmap_encode_policy("MSTSC", None, 8 * 1024 * 1024);
+        assert!(policy.use_rdp6_planar);
+        assert_eq!(policy.nscodec, None);
+    }
+
+    #[test]
+    fn negotiated_nscodec_wins_over_windows_client_name() {
+        let nscodec = rdpcore_pdu::capability_sets::NsCodecNegotiated {
+            codec_id: 1,
+            color_loss_level: 3,
+        };
+        let policy = bitmap_encode_policy("MSTSC", Some(nscodec), 8 * 1024 * 1024);
+        assert!(!policy.use_rdp6_planar);
+        assert_eq!(policy.nscodec, Some((1, 3)));
+        assert_eq!(policy.max_rects_per_update, 32);
     }
 }

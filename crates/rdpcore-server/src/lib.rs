@@ -17,6 +17,7 @@ mod credssp;
 pub mod diff;
 mod display;
 mod encode;
+mod error;
 mod input;
 mod server;
 mod transport;
@@ -26,6 +27,7 @@ pub use display::{
     BitmapUpdate, DesktopSize, DisplayUpdate, MonitorLayoutEntry, PixelFormat, RdpServerDisplay,
     RdpServerDisplayUpdates,
 };
+pub use error::SessionError;
 pub use input::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 pub use server::{RdpServer, RdpServerBuilder};
 

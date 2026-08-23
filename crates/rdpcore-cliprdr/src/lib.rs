@@ -27,25 +27,30 @@ pub struct FormatDataRequest {
     pub format: u32,
 }
 
-/// `Ok(text)` for a successful response, `Err(())` for `CB_RESPONSE_FAIL`.
+pub use pdu::FormatDataStatus;
+
+/// `Ok(text)` for a successful response, `Failed` for `CB_RESPONSE_FAIL`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FormatDataResponse(Result<String, ()>);
+pub struct FormatDataResponse(FormatDataStatus);
 
 impl FormatDataResponse {
     pub fn new_unicode_string(text: &str) -> Self {
-        Self(Ok(text.to_owned()))
+        Self(FormatDataStatus::Ok(text.to_owned()))
     }
 
     pub fn new_error() -> Self {
-        Self(Err(()))
+        Self(FormatDataStatus::Failed)
     }
 
     pub fn is_error(&self) -> bool {
-        self.0.is_err()
+        matches!(self.0, FormatDataStatus::Failed)
     }
 
     pub fn to_unicode_string(&self) -> Option<String> {
-        self.0.as_ref().ok().cloned()
+        match &self.0 {
+            FormatDataStatus::Ok(text) => Some(text.clone()),
+            FormatDataStatus::Failed => None,
+        }
     }
 }
 
@@ -173,10 +178,12 @@ impl CliprdrChannel {
                     .on_format_data_request(FormatDataRequest { format });
                 Ok(Vec::new()) // the response comes asynchronously via encode_message
             }
-            pdu::ClientMessage::FormatDataResponse(result) => {
-                let response = match result {
-                    Ok(text) => FormatDataResponse::new_unicode_string(&text),
-                    Err(()) => FormatDataResponse::new_error(),
+            pdu::ClientMessage::FormatDataResponse(status) => {
+                let response = match status {
+                    pdu::FormatDataStatus::Ok(text) => {
+                        FormatDataResponse::new_unicode_string(&text)
+                    }
+                    pdu::FormatDataStatus::Failed => FormatDataResponse::new_error(),
                 };
                 self.backend.on_format_data_response(response);
                 Ok(Vec::new())

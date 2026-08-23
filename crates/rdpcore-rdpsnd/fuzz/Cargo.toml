@@ -1,0 +1,21 @@
+[package]
+name = "rdpcore-rdpsnd-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rdpcore-rdpsnd = { path = ".." }
+
+[[bin]]
+name = "decode_rdpsnd"
+path = "fuzz_targets/decode_rdpsnd.rs"
+test = false
+doc = false
+bench = false
