@@ -1,3 +1,12 @@
+kmsrdp (0.1.52) unstable; urgency=medium
+
+  * Modularize server and capture monoliths into structured submodules.
+  * Add FreeRDP E2E integration test suite with Xvfb harness.
+  * Add comprehensive ARCHITECTURE.md documentation and sequence diagrams.
+  * Clean up rustdoc intra-doc link warnings and enforce pre-commit cargo fmt.
+
+ -- kmsrdp contributors <noreply@example.com>  Mon, 24 Aug 2026 02:13:00 +0900
+
 kmsrdp (0.1.51) unstable; urgency=medium
 
   * Replace anyhow with structured thiserror types (DisplayError, ServerError) in rdpcore-server.

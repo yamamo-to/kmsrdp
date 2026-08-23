@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.51
+Version:        0.1.52
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,12 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Mon Aug 24 2026 kmsrdp contributors <noreply@example.com> - 0.1.52-1
+- Modularize server and capture monoliths into structured submodules
+- Add FreeRDP E2E integration test suite with Xvfb harness
+- Add comprehensive ARCHITECTURE.md documentation and sequence diagrams
+- Clean up rustdoc intra-doc link warnings and enforce pre-commit cargo fmt
+
 * Mon Aug 24 2026 kmsrdp contributors <noreply@example.com> - 0.1.51-1
 - Replace anyhow with structured thiserror types (DisplayError, ServerError) in rdpcore-server
 - Optimize bitmap encode and avoid blocking Tokio worker threads
