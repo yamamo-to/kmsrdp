@@ -1,3 +1,14 @@
+kmsrdp (0.1.50) unstable; urgency=medium
+
+  * Replace encoder String errors with structured EncoderError (thiserror).
+  * Optimize BGRX-to-YUV420 color conversion by pre-slicing row pointers.
+  * Expand SmallBitSet to 8K-capable inline buffer to avoid heap allocation.
+  * Add systemd sd_notify READY/WATCHDOG/STOPPING integration.
+  * Harden session diagnostics with typed errors and capability-based codecs.
+  * Close protocol test gaps with broader proptest and fuzz coverage.
+
+ -- kmsrdp contributors <noreply@example.com>  Sun, 23 Aug 2026 14:25:00 +0900
+
 kmsrdp (0.1.49) unstable; urgency=medium
 
   * Add DMA_BUF_IOCTL_SYNC cache synchronization around CPU mmap reads in KMS capture.
