@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.46
+Version:        0.1.47
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,15 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Sun Aug 23 2026 kmsrdp contributors <noreply@example.com> - 0.1.47-1
+- Parse GFX/FPS in Config and pass them through the server builder
+  (rdpcore-server no longer reads KMSRDP_* itself)
+- Fall back from GFX AVC420 to Planar/NSCodec after repeated H.264
+  encode failures, without dropping the session
+- Cover Session::negotiate with TLS loopback tests
+- Clipboard sync fix, auth/TLS hardening, RDPDR FUSE modularization,
+  and encoder/detile performance work since 0.1.46
+
 * Fri Aug 21 2026 kmsrdp contributors <noreply@example.com> - 0.1.46-1
 - Decouple RDPSND wave delivery from the steady-state session loop
 - Release stuck keys/mouse buttons on RDP disconnect

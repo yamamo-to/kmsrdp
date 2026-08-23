@@ -1374,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "kmsrdp"
-version = "0.1.46"
+version = "0.1.47"
 dependencies = [
  "anyhow",
  "arboard",

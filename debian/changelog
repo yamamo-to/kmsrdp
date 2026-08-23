@@ -1,3 +1,15 @@
+kmsrdp (0.1.47) unstable; urgency=medium
+
+  * Parse GFX/FPS in Config and pass them through the server builder
+    (rdpcore-server no longer reads KMSRDP_* itself).
+  * Fall back from GFX AVC420 to Planar/NSCodec after repeated H.264
+    encode failures, without dropping the session.
+  * Cover Session::negotiate with TLS loopback tests.
+  * Clipboard sync fix, auth/TLS hardening, RDPDR FUSE modularization,
+    and encoder/detile performance work since 0.1.46.
+
+ -- kmsrdp contributors <noreply@example.com>  Sun, 23 Aug 2026 10:28:00 +0900
+
 kmsrdp (0.1.46) unstable; urgency=medium
 
   * Decouple RDPSND wave delivery from the steady-state session loop.
