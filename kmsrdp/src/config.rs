@@ -198,6 +198,12 @@ fn load_credentials() -> Result<(String, String, bool)> {
     let username = std::env::var("KMSRDP_USER").unwrap_or_else(|_| "kmsrdp".to_string());
     match std::env::var("KMSRDP_PASSWORD") {
         Ok(password) => {
+            if password.is_empty() {
+                anyhow::bail!(
+                    "KMSRDP_PASSWORD is set but empty — set a password or unset the variable \
+                     to get a generated one-shot password"
+                );
+            }
             // Safety: Single-threaded startup phase before multithreading begins.
             // Minimizes the window where the secret is visible in /proc/<pid>/environ.
             unsafe {
@@ -485,6 +491,26 @@ mod tests {
         unsafe {
             std::env::remove_var("KMSRDP_PASSWORD_FILE");
             std::env::remove_var("CREDENTIALS_DIRECTORY");
+        }
+    }
+
+    #[test]
+    fn load_credentials_rejects_empty_env_password() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("KMSRDP_USER", "kmsrdp");
+            std::env::set_var("KMSRDP_PASSWORD", "");
+            std::env::remove_var("KMSRDP_PASSWORD_FILE");
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+        }
+        let err = load_credentials().unwrap_err();
+        assert!(
+            err.to_string().contains("KMSRDP_PASSWORD"),
+            "unexpected error: {err}"
+        );
+        unsafe {
+            std::env::remove_var("KMSRDP_PASSWORD");
+            std::env::remove_var("KMSRDP_USER");
         }
     }
 }

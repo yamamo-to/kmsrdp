@@ -27,8 +27,7 @@ struct ConfiguredCredentials {
 
 impl ConfiguredCredentials {
     fn new(expected: Credentials) -> Self {
-        // Strictly longer than `expected.password`, so it can never equal it.
-        let dummy_password = format!("\u{1}kmsrdp-nla-dummy:{}{}", expected.password, '\u{1}');
+        let dummy_password = dummy_nla_password(&expected.password);
         Self {
             expected,
             dummy_password,
@@ -47,6 +46,22 @@ impl ConfiguredCredentials {
             &self.dummy_password
         }
     }
+}
+
+/// Password returned for unknown NTLM identities so verification fails
+/// without advertising whether the account exists. Must be unequal to
+/// `real` and must not contain it (a memory dump of the dummy must not
+/// recover the secret).
+fn dummy_nla_password(real: &str) -> String {
+    let mut dummy = format!(
+        "\u{1}kmsrdp-nla-dummy\u{1}{}\u{1}{}",
+        real.len(),
+        "\u{2}".repeat(real.len().saturating_add(1))
+    );
+    if dummy == real {
+        dummy.push('\u{3}');
+    }
+    dummy
 }
 
 impl CredentialsProxy for ConfiguredCredentials {
@@ -211,6 +226,25 @@ mod tests {
         });
         let user = Username::parse("other").unwrap();
         let identity = proxy.auth_data_by_user(&user).unwrap();
-        assert_ne!(identity.password.as_ref().as_str(), "secret");
+        let dummy = identity.password.as_ref().as_str();
+        assert_ne!(dummy, "secret");
+        assert!(
+            !dummy.contains("secret"),
+            "dummy password must not contain the real secret"
+        );
+    }
+
+    #[test]
+    fn dummy_nla_password_never_equals_or_contains_real() {
+        for real in ["", "x", "secret", "hunter2"] {
+            let dummy = dummy_nla_password(real);
+            assert_ne!(dummy, real);
+            if !real.is_empty() {
+                assert!(!dummy.contains(real), "dummy {dummy:?} contains {real:?}");
+            }
+        }
+        // The constructed dummy, if used as the real password, must still differ.
+        let crafted = dummy_nla_password("secret");
+        assert_ne!(dummy_nla_password(&crafted), crafted);
     }
 }

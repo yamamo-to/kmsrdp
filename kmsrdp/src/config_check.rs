@@ -9,6 +9,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::capture;
+use crate::config::Config;
 use crate::tls;
 
 /// Linux capability numbers (uapi/linux/capability.h).
@@ -28,14 +29,18 @@ impl StartupReport {
     }
 }
 
-/// Validate env, capabilities, devices, and helper binaries for `listen_port`.
-pub fn validate(listen_port: u16) -> StartupReport {
+/// Validate env, capabilities, devices, and helper binaries.
+///
+/// Credential checks use the already-parsed [`Config`] so they still work
+/// after `Config::from_env` has cleared `KMSRDP_PASSWORD` from the process
+/// environment.
+pub fn validate(cfg: &Config) -> StartupReport {
     let mut report = StartupReport::default();
 
-    check_credentials(&mut report);
+    check_credentials(&mut report, cfg);
     check_display_env(&mut report);
     check_tls_env(&mut report);
-    check_capabilities(listen_port, &mut report);
+    check_capabilities(cfg.listen.port(), &mut report);
     check_devices(&mut report);
     check_pulse_capture(&mut report);
     check_helper_binaries(&mut report);
@@ -74,46 +79,46 @@ pub fn log_report(report: &StartupReport) -> io::Result<()> {
     }
 }
 
-fn check_credentials(report: &mut StartupReport) {
-    match std::env::var("KMSRDP_USER") {
-        Ok(user) if user.trim().is_empty() => {
-            report
-                .errors
-                .push("KMSRDP_USER is set but empty — set a non-empty RDP username".to_string());
-        }
-        _ => {}
+fn check_credentials(report: &mut StartupReport, cfg: &Config) {
+    if cfg.username.trim().is_empty() {
+        report
+            .errors
+            .push("KMSRDP_USER is set but empty — set a non-empty RDP username".to_string());
     }
-    match std::env::var("KMSRDP_PASSWORD") {
-        Ok(password) if password.is_empty() => {
-            report.errors.push(
-                "KMSRDP_PASSWORD is set but empty — set a password or unset the variable \
-                 to get a generated one-shot password"
-                    .to_string(),
-            );
-        }
-        Ok(password) if password.len() < 8 => {
-            report.warnings.push(format!(
-                "KMSRDP_PASSWORD is only {} character(s); prefer a longer password",
-                password.len()
-            ));
-        }
-        Ok(_) => {}
-        Err(_) => match crate::config::password_file_path() {
-            Some(path) if crate::config::password_file_has_content(&path) => {}
-            Some(path) => report.errors.push(format!(
-                "password file {} is missing or empty — set a password there, \
-                 or unset KMSRDP_PASSWORD_FILE",
-                path.display()
-            )),
-            None => {
-                report.warnings.push(
-                    "KMSRDP_PASSWORD unset — a one-shot password will be written to a 0600 file \
-                     (printed to stderr only if it is a TTY). Prefer KMSRDP_PASSWORD_FILE or \
-                     systemd LoadCredential=kmsrdp.password so the secret is not in the environment"
-                        .to_string(),
-                );
-            }
-        },
+    if cfg.password.is_empty() {
+        report.errors.push(
+            "RDP password is empty — set KMSRDP_PASSWORD, KMSRDP_PASSWORD_FILE, \
+             or unset them to get a generated one-shot password"
+                .to_string(),
+        );
+    } else if cfg.password.len() < 8 {
+        report.warnings.push(format!(
+            "RDP password is only {} character(s); prefer a longer password",
+            cfg.password.len()
+        ));
+    }
+    if cfg.password_generated {
+        report.warnings.push(
+            "using a generated one-shot password; set KMSRDP_PASSWORD_FILE or KMSRDP_PASSWORD \
+             for a stable credential (the secret should not live in the process environment)"
+                .to_string(),
+        );
+    }
+    if let Some(path) = crate::config::password_file_path() {
+        warn_if_insecure_password_file(&path, report);
+    }
+}
+
+fn warn_if_insecure_password_file(path: &Path, report: &mut StartupReport) {
+    let Ok(meta) = fs::metadata(path) else {
+        return;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        report.warnings.push(format!(
+            "password file {} is mode {mode:04o}; prefer 0600 so group/other cannot read it",
+            path.display()
+        ));
     }
 }
 
@@ -313,7 +318,36 @@ fn capability_set(cap_eff: u64, cap: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clipboard::ClipboardMode;
+    use crate::config::DEFAULT_FRAME_INTERVAL;
     use crate::test_env::env_lock;
+    use std::fs;
+
+    fn test_cfg(username: &str, password: &str, password_generated: bool) -> Config {
+        Config {
+            listen: "127.0.0.1:3389".parse().unwrap(),
+            require_nla: true,
+            max_sessions: 1,
+            username: username.to_owned(),
+            password: password.to_owned(),
+            password_generated,
+            clipboard: ClipboardMode::Bidirectional,
+            gfx_enabled: false,
+            frame_interval: DEFAULT_FRAME_INTERVAL,
+        }
+    }
+
+    fn clear_password_env() {
+        unsafe {
+            std::env::remove_var("KMSRDP_PASSWORD");
+            std::env::remove_var("KMSRDP_PASSWORD_FILE");
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+            std::env::remove_var("KMSRDP_USER");
+            std::env::remove_var("KMSRDP_DISPLAY");
+            std::env::remove_var("KMSRDP_TLS_CERT");
+            std::env::remove_var("KMSRDP_TLS_KEY");
+        }
+    }
 
     #[test]
     fn capability_bit_sys_admin() {
@@ -328,23 +362,77 @@ mod tests {
     #[test]
     fn empty_password_is_hard_error() {
         let _guard = env_lock();
-        unsafe {
-            std::env::set_var("KMSRDP_PASSWORD", "");
-            std::env::remove_var("KMSRDP_USER");
-            std::env::remove_var("KMSRDP_DISPLAY");
-            std::env::remove_var("KMSRDP_TLS_CERT");
-            std::env::remove_var("KMSRDP_TLS_KEY");
-            std::env::remove_var("KMSRDP_PASSWORD_FILE");
-            std::env::remove_var("CREDENTIALS_DIRECTORY");
-        }
-        let report = validate(3389);
+        clear_password_env();
+        let report = validate(&test_cfg("kmsrdp", "", false));
         assert!(
-            report.errors.iter().any(|e| e.contains("KMSRDP_PASSWORD")),
+            report.errors.iter().any(|e| e.contains("password is empty")),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn loaded_password_does_not_warn_about_oneshot() {
+        let _guard = env_lock();
+        clear_password_env();
+        let report = validate(&test_cfg("kmsrdp", "a-real-password", false));
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.contains("one-shot") || w.contains("generated")),
+            "unexpected oneshot warning: {report:?}"
+        );
+        assert!(
+            !report.errors.iter().any(|e| e.contains("password")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn short_loaded_password_is_a_warning() {
+        let _guard = env_lock();
+        clear_password_env();
+        let report = validate(&test_cfg("kmsrdp", "short", false));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("only 5 character")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn world_readable_password_file_is_a_warning() {
+        let _guard = env_lock();
+        clear_password_env();
+        let dir = std::env::temp_dir().join(format!(
+            "kmsrdp-pwfile-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rdp-password");
+        fs::write(&path, b"a-real-password").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         unsafe {
-            std::env::remove_var("KMSRDP_PASSWORD");
+            std::env::set_var("KMSRDP_PASSWORD_FILE", &path);
         }
+        let report = validate(&test_cfg("kmsrdp", "a-real-password", false));
+        unsafe {
+            std::env::remove_var("KMSRDP_PASSWORD_FILE");
+        }
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("prefer 0600") && w.contains("0644")),
+            "{report:?}"
+        );
     }
 
     #[test]
@@ -370,23 +458,12 @@ mod tests {
     #[test]
     fn empty_user_is_hard_error() {
         let _guard = env_lock();
-        unsafe {
-            std::env::set_var("KMSRDP_USER", "   ");
-            std::env::remove_var("KMSRDP_PASSWORD");
-            std::env::remove_var("KMSRDP_DISPLAY");
-            std::env::remove_var("KMSRDP_TLS_CERT");
-            std::env::remove_var("KMSRDP_TLS_KEY");
-            std::env::remove_var("KMSRDP_PASSWORD_FILE");
-            std::env::remove_var("CREDENTIALS_DIRECTORY");
-        }
-        let report = validate(3390);
+        clear_password_env();
+        let report = validate(&test_cfg("   ", "a-real-password", false));
         assert!(
             report.errors.iter().any(|e| e.contains("KMSRDP_USER")),
             "{report:?}"
         );
-        unsafe {
-            std::env::remove_var("KMSRDP_USER");
-        }
     }
 
     #[test]

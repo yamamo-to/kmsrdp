@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rdpcore_cliprdr::{CliprdrBackendFactory, CliprdrChannel};
@@ -33,7 +34,7 @@ use crate::encode::{
     encode_bitmap_update, encode_nscodec_update, encode_update_to_wire_frames,
     retain_bitmap_during_resize,
 };
-use crate::input::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+use crate::input::{ConnectionScopedInput, KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use crate::transport::{SteadyStateFrame, read_steady_state_frame, read_tpkt_frame};
 
 static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -391,14 +392,22 @@ impl Session {
         }
         // Held only for the handshake itself; acquired by the accept loop
         // before this task was even spawned (see `run`).
-        let negotiated =
-            match tokio::time::timeout(HANDSHAKE_TIMEOUT, self.negotiate(tcp, peer.ip())).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    warn!("handshake did not complete within {HANDSHAKE_TIMEOUT:?}");
-                    return Ok(());
+        let authenticated = AtomicBool::new(false);
+        let negotiated = match tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            self.negotiate(tcp, peer.ip(), &authenticated),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                warn!("handshake did not complete within {HANDSHAKE_TIMEOUT:?}");
+                if !authenticated.load(Ordering::Relaxed) {
+                    self.auth_limiter.record_failure(peer.ip());
                 }
-            };
+                return Ok(());
+            }
+        };
         drop(permit);
         let Some((tls, acceptor, accepted)) = negotiated else {
             return Ok(());
@@ -421,6 +430,7 @@ impl Session {
         &self,
         mut tcp: TcpStream,
         peer_ip: IpAddr,
+        authenticated: &AtomicBool,
     ) -> anyhow::Result<
         Option<(
             tokio_rustls::server::TlsStream<TcpStream>,
@@ -574,6 +584,7 @@ impl Session {
                         return Ok(None);
                     }
                     self.auth_limiter.record_success(peer_ip);
+                    authenticated.store(true, Ordering::Relaxed);
                     if !result.response.is_empty() {
                         tls.write_all(&result.response).await?;
                     }
@@ -609,10 +620,12 @@ impl Session {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        // Guarantees input::reset() runs once this connection's steady
-        // state ends, no matter which of the many return/`?` paths below
-        // gets taken.
-        let _reset_input_on_drop = ResetInputOnDrop(Arc::clone(&self.input));
+        // Per-connection wrapper so reset() releases only this session's
+        // holds. Guarantees reset runs on every exit path.
+        let connection_input: Arc<Mutex<dyn RdpServerInputHandler>> = Arc::new(Mutex::new(
+            ConnectionScopedInput::new(Arc::clone(&self.input)),
+        ));
+        let _reset_input_on_drop = ResetInputOnDrop(Arc::clone(&connection_input));
 
         let (mut read_half, write_half) = tokio::io::split(stream);
         let (writer, frame_sender) = ConnectionWriter::new(write_half);
@@ -927,7 +940,7 @@ impl Session {
                             match fastpath::FastPathInput::decode(&bytes) {
                                 Ok(input_pdu) => {
                                     let mut input =
-                                        self.input.lock().unwrap_or_else(|e| e.into_inner());
+                                        connection_input.lock().unwrap_or_else(|e| e.into_inner());
                                     for event in input_pdu.events {
                                         dispatch_input_event(&mut *input, event);
                                     }

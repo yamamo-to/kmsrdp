@@ -23,7 +23,7 @@
 //! session is rejected. Audio is per-connection. Clipboard backends are
 //! per-connection but share one process-wide local watcher.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -45,15 +45,13 @@ struct Input {
     device: VirtualInput,
     mouse_scale: MouseScale,
     x11_typer: X11UnicodeTyper,
-    /// Linux keycodes currently reported as held down, so `reset` can
-    /// release exactly those on disconnect - a client that disconnects
-    /// mid-keypress (before the matching `Released` arrives) would
-    /// otherwise leave the shared uinput device reporting that key held
-    /// forever, which e.g. X11's key-repeat then turns into the key
-    /// retyping itself indefinitely.
-    pressed_keys: HashSet<i32>,
+    /// Linux keycodes currently reported as held down, with a refcount so
+    /// two sessions can press the same key. `reset` (process shutdown)
+    /// releases anything still held. Per-connection release is done by
+    /// `ConnectionScopedInput` before it reaches this handler.
+    pressed_keys: HashMap<i32, u32>,
     /// Same idea for mouse buttons.
-    pressed_buttons: HashSet<i32>,
+    pressed_buttons: HashMap<i32, u32>,
 }
 
 /// Cloneable handle around the singleton uinput / X11 typer. All RDP
@@ -119,13 +117,11 @@ impl RdpServerInputHandler for Input {
         };
         match uinput::linux_keycode_from_rdp_scancode(code, extended) {
             Some(keycode) => {
-                if let Err(e) = self.device.key(keycode, down) {
+                let device = &self.device;
+                if let Err(e) = inject_held(&mut self.pressed_keys, keycode, down, |down| {
+                    device.key(keycode, down)
+                }) {
                     tracing::warn!(error = %e, "key injection failed");
-                }
-                if down {
-                    self.pressed_keys.insert(keycode);
-                } else {
-                    self.pressed_keys.remove(&keycode);
                 }
             }
             None => tracing::debug!(scancode = code, extended, "no keycode mapping for scancode"),
@@ -146,47 +142,69 @@ impl RdpServerInputHandler for Input {
             MouseEvent::LeftPressed | MouseEvent::RightPressed | MouseEvent::MiddlePressed
         );
 
-        let result = match event {
-            MouseEvent::Move { x, y } => {
-                let (width, height) = *self.mouse_scale.lock().unwrap_or_else(|e| e.into_inner());
-                self.device
-                    .move_abs(f64::from(x) / width, f64::from(y) / height)
+        let result = if let Some(button) = button {
+            let device = &self.device;
+            inject_held(&mut self.pressed_buttons, button, down, |down| {
+                device.button(button, down)
+            })
+        } else {
+            match event {
+                MouseEvent::Move { x, y } => {
+                    let (width, height) =
+                        *self.mouse_scale.lock().unwrap_or_else(|e| e.into_inner());
+                    self.device
+                        .move_abs(f64::from(x) / width, f64::from(y) / height)
+                }
+                MouseEvent::VerticalScroll { value } => self.device.scroll(value),
+                MouseEvent::HorizontalScroll { value } => self.device.hscroll(value),
+                _ => Ok(()),
             }
-            MouseEvent::LeftPressed | MouseEvent::LeftReleased => {
-                self.device.button(uinput::BTN_LEFT, down)
-            }
-            MouseEvent::RightPressed | MouseEvent::RightReleased => {
-                self.device.button(uinput::BTN_RIGHT, down)
-            }
-            MouseEvent::MiddlePressed | MouseEvent::MiddleReleased => {
-                self.device.button(uinput::BTN_MIDDLE, down)
-            }
-            MouseEvent::VerticalScroll { value } => self.device.scroll(value),
-            MouseEvent::HorizontalScroll { value } => self.device.hscroll(value),
         };
         if let Err(e) = result {
             tracing::warn!(error = %e, "mouse injection failed");
         }
-        if let Some(button) = button {
-            if down {
-                self.pressed_buttons.insert(button);
-            } else {
-                self.pressed_buttons.remove(&button);
-            }
-        }
     }
 
     fn reset(&mut self) {
-        for keycode in self.pressed_keys.drain() {
+        for keycode in self.pressed_keys.drain().map(|(k, _)| k) {
             if let Err(e) = self.device.key(keycode, false) {
                 tracing::warn!(error = %e, keycode, "failed to release stuck key on disconnect");
             }
         }
-        for button in self.pressed_buttons.drain() {
+        for button in self.pressed_buttons.drain().map(|(b, _)| b) {
             if let Err(e) = self.device.button(button, false) {
                 tracing::warn!(error = %e, button, "failed to release stuck mouse button on disconnect");
             }
         }
+    }
+}
+
+/// Hold/release with a refcount. Injects the kernel event only on the
+/// 0→1 (down) and 1→0 (up) transitions so two sessions can share a key.
+fn inject_held(
+    counts: &mut HashMap<i32, u32>,
+    id: i32,
+    down: bool,
+    mut inject: impl FnMut(bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if down {
+        let count = counts.entry(id).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count == 1 {
+            inject(true)?;
+        }
+        return Ok(());
+    }
+    match counts.get(&id).copied() {
+        Some(c) if c > 1 => {
+            counts.insert(id, c - 1);
+            Ok(())
+        }
+        Some(_) => {
+            counts.remove(&id);
+            inject(false)
+        }
+        None => inject(false),
     }
 }
 
@@ -198,7 +216,7 @@ async fn main() -> Result<()> {
 
     // Fail fast on bad env / missing privileges before touching DRM or uinput.
     let cfg = kmsrdp::config::Config::from_env()?;
-    kmsrdp::config_check::log_report(&kmsrdp::config_check::validate(cfg.listen.port()))
+    kmsrdp::config_check::log_report(&kmsrdp::config_check::validate(&cfg))
         .context("startup configuration check failed")?;
 
     // Session watcher must start first: it sets DISPLAY/XAUTHORITY/
@@ -291,8 +309,8 @@ async fn main() -> Result<()> {
         device,
         mouse_scale,
         x11_typer: X11UnicodeTyper::spawn(session_rx.clone()),
-        pressed_keys: HashSet::new(),
-        pressed_buttons: HashSet::new(),
+        pressed_keys: HashMap::new(),
+        pressed_buttons: HashMap::new(),
     });
 
     let (drive_factory, fuse_shutdown): (

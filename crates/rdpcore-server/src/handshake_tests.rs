@@ -1,6 +1,7 @@
 //! Loopback tests for [`super::Session::negotiate`]: TLS + Client Info auth
 //! over a real TCP pair, without CredSSP.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use rdpcore_connector::{IO_CHANNEL_ID, USER_CHANNEL_ID};
@@ -370,7 +371,9 @@ async fn negotiate_accepts_matching_tls_client_info() {
     let session = test_session(false, Some(matching_validator()));
     let server = tokio::spawn(async move {
         let (tcp, peer) = listener.accept().await.unwrap();
-        session.negotiate(tcp, peer.ip()).await
+        session
+            .negotiate(tcp, peer.ip(), &AtomicBool::new(false))
+            .await
     });
 
     let tcp = TcpStream::connect(addr).await.unwrap();
@@ -407,7 +410,9 @@ async fn negotiate_rejects_wrong_password() {
     let session = test_session(false, Some(matching_validator()));
     let server = tokio::spawn(async move {
         let (tcp, peer) = listener.accept().await.unwrap();
-        session.negotiate(tcp, peer.ip()).await
+        session
+            .negotiate(tcp, peer.ip(), &AtomicBool::new(false))
+            .await
     });
 
     let tcp = TcpStream::connect(addr).await.unwrap();
@@ -439,7 +444,9 @@ async fn negotiate_require_nla_rejects_tls_only_client() {
     let session = test_session(true, Some(matching_validator()));
     let server = tokio::spawn(async move {
         let (tcp, peer) = listener.accept().await.unwrap();
-        session.negotiate(tcp, peer.ip()).await
+        session
+            .negotiate(tcp, peer.ip(), &AtomicBool::new(false))
+            .await
     });
 
     let tcp = TcpStream::connect(addr).await.unwrap();
