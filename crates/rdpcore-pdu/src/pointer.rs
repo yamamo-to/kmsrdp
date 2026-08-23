@@ -49,7 +49,7 @@ pub fn encode_cached_pointer(cache_index: u16) -> Vec<u8> {
     single_update(UPDATE_CODE_CACHED, data)
 }
 
-/// Encode a 24 bpp Color Pointer Update (xor + 1 bpp and-mask).
+/// Encode a 24/32 bpp Color Pointer Update (xor + 1 bpp and-mask).
 pub fn encode_color_pointer(
     cache_index: u16,
     hot_x: u16,
@@ -70,6 +70,37 @@ pub fn encode_color_pointer(
     data.write_slice(xor_bgr_bottom_up);
     data.write_slice(and_mask);
     single_update(UPDATE_CODE_COLOR, data)
+}
+
+/// Encodes a 32 bpp BGRA cursor with alpha channel into a Color Pointer Update.
+pub fn encode_rgba_pointer(
+    cache_index: u16,
+    hot_x: u16,
+    hot_y: u16,
+    width: u16,
+    height: u16,
+    bgra_top_down: &[u8],
+) -> Vec<u8> {
+    let w = usize::from(width);
+    let h = usize::from(height);
+    let mut xor_bottom_up = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let src_row = y * w * 4;
+        let dst_row = (h - 1 - y) * w * 4;
+        xor_bottom_up[dst_row..dst_row + w * 4]
+            .copy_from_slice(&bgra_top_down[src_row..src_row + w * 4]);
+    }
+    let stride = w.div_ceil(16) * 2;
+    let and_mask = vec![0u8; stride * h];
+    encode_color_pointer(
+        cache_index,
+        hot_x,
+        hot_y,
+        width,
+        height,
+        &xor_bottom_up,
+        &and_mask,
+    )
 }
 
 /// A simple 16×16 black arrow with a white outline (hotspot at tip).
@@ -155,5 +186,24 @@ mod tests {
         let decoded = FastPathOutput::decode(&wire).unwrap();
         assert_eq!(decoded.updates[0].update_code, UPDATE_CODE_COLOR);
         assert!(decoded.updates[0].data.len() > 12);
+    }
+
+    #[test]
+    fn rgba_pointer_encodes_bottom_up() {
+        let bgra = vec![
+            1, 2, 3, 4, // top-left (0,0)
+            5, 6, 7, 8, // top-right (1,0)
+            9, 10, 11, 12, // bottom-left (0,1)
+            13, 14, 15, 16, // bottom-right (1,1)
+        ];
+        let wire = encode_rgba_pointer(1, 0, 0, 2, 2, &bgra);
+        let decoded = FastPathOutput::decode(&wire).unwrap();
+        assert_eq!(decoded.updates[0].update_code, UPDATE_CODE_COLOR);
+        // XOR data starts after the 14-byte header
+        let xor = &decoded.updates[0].data[14..14 + 16];
+        // bottom row first
+        assert_eq!(&xor[0..8], &[9, 10, 11, 12, 13, 14, 15, 16]);
+        // top row second
+        assert_eq!(&xor[8..16], &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
 }

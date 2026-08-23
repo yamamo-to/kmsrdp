@@ -887,6 +887,14 @@ impl Session {
             });
         }
 
+        // Ensure client cursor is synchronized to default pointer on initial connect.
+        let default_ptr = rdpcore_pdu::pointer::encode_ptr_default();
+        let _ = frame_sender.send(Frame {
+            channel: ChannelKey::Io,
+            priority: Priority::Latency,
+            bytes: default_ptr,
+        });
+
         // Set while a server-initiated resize (Deactivate-All + new Demand
         // Active, see `Acceptor::begin_resize`) is in flight: slow-path
         // frames on the IO channel go to the acceptor instead of the usual
