@@ -8,3 +8,4 @@
 **/fuzz/artifacts/
 **/fuzz/target/
 **/fuzz/Cargo.lock
+/AGENTS.md
