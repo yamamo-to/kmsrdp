@@ -692,7 +692,13 @@ pub fn detile_to_bgrx(
             }
         }
     }
-    let detiler = slot.detiler.as_mut().expect("just initialized above");
+    let Some(detiler) = slot.detiler.as_mut() else {
+        // Unreachable: `GpuDetiler::new` succeeded and set
+        // `slot.detiler = Some(_)` above.
+        return Err(io::Error::other(
+            "GPU detiler unexpectedly missing after successful init",
+        ));
+    };
     match detiler.detile(fd, fourcc, modifier, width, height, offset, pitch) {
         Ok(data) => Ok(data),
         Err(e) => {

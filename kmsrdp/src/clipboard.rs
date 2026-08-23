@@ -53,12 +53,6 @@ fn set_local_text(text: String) {
     }
 }
 
-fn advertise_local_text(sender: &UnboundedSender<ClipboardMessage>) -> bool {
-    if matches!(local_text(), Some(t) if !t.is_empty()) {
-        return advertise_unicode_formats(sender);
-    }
-    true
-}
 
 fn advertise_unicode_formats(sender: &UnboundedSender<ClipboardMessage>) -> bool {
     sender
@@ -76,7 +70,7 @@ fn spawn_shared_clipboard_watcher(
     mut session_rx: watch::Receiver<Option<Session>>,
 ) {
     tokio::spawn(async move {
-        let mut last = local_text();
+        let mut last = tokio::task::spawn_blocking(local_text).await.unwrap_or(None);
         let mut xfixes_stop = Arc::new(AtomicBool::new(false));
         let mut xfixes_active =
             start_xfixes_watch(Arc::clone(&subscribers), Arc::clone(&xfixes_stop));
@@ -331,7 +325,12 @@ impl core::fmt::Debug for LocalClipboardBackend {
 impl CliprdrBackend for LocalClipboardBackend {
     fn on_ready(&mut self) {
         if self.mode.allows_host_to_client() {
-            let _ = advertise_local_text(&self.sender);
+            // Optimistically advertise unicode text support; the actual
+            // clipboard content is read lazily in on_format_data_request
+            // (via spawn_blocking) when the client requests a paste.
+            // This avoids blocking the Tokio worker on a synchronous
+            // arboard/X11 IPC call at channel startup.
+            let _ = advertise_unicode_formats(&self.sender);
         }
     }
 

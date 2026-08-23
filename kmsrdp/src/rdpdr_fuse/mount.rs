@@ -153,11 +153,15 @@ impl MountRegistry {
         };
         slot.members.remove(&conn_id);
         if slot.members.is_empty() {
-            let SharedMount {
+            let Some(SharedMount {
                 mount_point,
                 session,
                 ..
-            } = slots.remove(dos_name).expect("slot just checked");
+            }) = slots.remove(dos_name)
+            else {
+                // Unreachable: `slots.get_mut` succeeded on the line above.
+                return;
+            };
             drop(slots);
             tracing::info!(
                 "kmsrdp: rdpdr FUSE releasing {} at {} (last connection)",
@@ -170,7 +174,10 @@ impl MountRegistry {
         }
 
         if slot.owner_conn == conn_id {
-            let new_owner = *slot.members.keys().next().expect("members non-empty");
+            let Some(&new_owner) = slot.members.keys().next() else {
+                // Unreachable: `members.is_empty()` was checked above.
+                return;
+            };
             let member = &slot.members[&new_owner];
             member.bridge.ensure_root_ino(member.device_id);
             // Clear stale opens from the departing owner's bridge; swap the

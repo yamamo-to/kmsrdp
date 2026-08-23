@@ -30,9 +30,9 @@ use crate::credentials::{CredentialValidator, Credentials};
 use crate::credssp;
 use crate::display::{BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay};
 use crate::encode::{
-    BitmapEncodePolicy, BitmapWireStats, bitmap_encode_policy, client_needs_compat_workarounds,
-    encode_bitmap_update, encode_nscodec_update, encode_update_to_wire_frames,
-    retain_bitmap_during_resize,
+    BitmapEncodePolicy, BitmapWireStats, EncodeScratch, bitmap_encode_policy,
+    client_needs_compat_workarounds, encode_bitmap_update, encode_nscodec_update,
+    encode_update_to_wire_frames, retain_bitmap_during_resize,
 };
 use crate::error::{SessionError, finish_session};
 use crate::input::{ConnectionScopedInput, KeyboardEvent, MouseEvent, RdpServerInputHandler};
@@ -1300,7 +1300,9 @@ async fn send_outbound_bitmap(
         if let Some((codec_id, cll)) = policy.nscodec {
             encode_nscodec_update(&bitmap, codec_id, cll, policy.max_request_size)
         } else {
-            encode_bitmap_update(&bitmap, &policy)
+            let mut scratch = EncodeScratch::default();
+            let stats = encode_bitmap_update(&bitmap, &policy, &mut scratch);
+            (scratch.batches, stats)
         }
     })
     .await

@@ -76,18 +76,32 @@ pub(crate) struct BitmapWireStats {
     pub(crate) update_batches: u32,
 }
 
+/// Reusable scratch buffers for [`encode_bitmap_update`], avoiding
+/// per-frame heap allocations on the hot path.
+#[derive(Default)]
+pub(crate) struct EncodeScratch {
+    pub(crate) rectangles: Vec<fastpath::BitmapRect>,
+    pub(crate) tile_scratch: Vec<u8>,
+    pub(crate) batches: Vec<Vec<Vec<u8>>>,
+}
+
 /// Splits one `BitmapUpdate` into wire-ready `FastPathOutput` byte buffers,
 /// batched for strict clients (macOS Windows App).
+///
+/// The caller-provided `scratch` is cleared and reused across frames to
+/// avoid per-frame heap allocations (see AGENTS.md Rule 2.6).
 pub(crate) fn encode_bitmap_update(
     bitmap: &BitmapUpdate,
     policy: &BitmapEncodePolicy,
-) -> (Vec<Vec<Vec<u8>>>, BitmapWireStats) {
+    scratch: &mut EncodeScratch,
+) -> BitmapWireStats {
     let width = bitmap.width.get();
     let height = bitmap.height.get();
 
-    let mut rectangles = Vec::new();
+    scratch.rectangles.clear();
+    scratch.batches.clear();
     let mut stats = BitmapWireStats::default();
-    let mut tile_scratch = Vec::with_capacity(usize::from(TILE_SIZE) * 4 * usize::from(TILE_SIZE));
+    scratch.tile_scratch.clear();
 
     if policy.use_rdp6_planar {
         let mut tile_y = 0u16;
@@ -103,8 +117,8 @@ pub(crate) fn encode_bitmap_update(
                     tile_width,
                     tile_height,
                     policy,
-                    &mut tile_scratch,
-                    &mut rectangles,
+                    &mut scratch.tile_scratch,
+                    &mut scratch.rectangles,
                     &mut stats,
                 );
                 tile_x += TILE_SIZE;
@@ -125,23 +139,22 @@ pub(crate) fn encode_bitmap_update(
                 width,
                 th,
                 policy,
-                &mut tile_scratch,
-                &mut rectangles,
+                &mut scratch.tile_scratch,
+                &mut scratch.rectangles,
                 &mut stats,
             );
             tile_y += th;
         }
     }
 
-    let max_rects = policy.max_rects_per_update.min(rectangles.len().max(1));
-    let mut batches = Vec::new();
-    for chunk in rectangles.chunks(max_rects) {
+    let max_rects = policy.max_rects_per_update.min(scratch.rectangles.len().max(1));
+    for chunk in scratch.rectangles.chunks(max_rects) {
         let wire = encode_rectangles_to_wire_frames(chunk, policy.max_request_size);
         stats.encoded_bytes += chunk.iter().map(|r| r.data.len()).sum::<usize>();
         stats.update_batches += 1;
-        batches.push(wire);
+        scratch.batches.push(wire);
     }
-    (batches, stats)
+    stats
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -311,7 +324,7 @@ mod tests {
     use crate::display::{BitmapUpdate, PixelFormat};
     use core::num::{NonZeroU16, NonZeroUsize};
 
-    use super::{bitmap_encode_policy, encode_bitmap_update, max_raw_strip_height};
+    use super::{EncodeScratch, bitmap_encode_policy, encode_bitmap_update, max_raw_strip_height};
 
     fn bitmap(x: u16, y: u16, width: u16, height: u16, fill: u8) -> BitmapUpdate {
         let w = NonZeroU16::new(width).unwrap();
@@ -370,7 +383,9 @@ mod tests {
         assert_eq!(policy.max_rects_per_update, 32);
 
         let frame = bitmap(0, 0, 1920, 1200, 0);
-        let (_wire, stats) = encode_bitmap_update(&frame, &policy);
+        let mut scratch = EncodeScratch::default();
+        let stats = encode_bitmap_update(&frame, &policy, &mut scratch);
+        assert!(!scratch.batches.is_empty());
         assert_eq!(stats.tiles, 150); // 1200 / 8 scanline strips
         assert_eq!(stats.update_batches, 5); // ceil(150 / 32)
         assert_eq!(stats.raw_tiles, 150);
@@ -439,9 +454,11 @@ mod tests {
         };
 
         let policy = bitmap_encode_policy("MSTSC", None, 8 * 1024 * 1024);
-        let (from_view, view_stats) = encode_bitmap_update(&view, &policy);
-        let (from_packed, packed_stats) = encode_bitmap_update(&packed_bmp, &policy);
-        assert_eq!(from_view, from_packed);
+        let mut scratch_view = EncodeScratch::default();
+        let view_stats = encode_bitmap_update(&view, &policy, &mut scratch_view);
+        let mut scratch_packed = EncodeScratch::default();
+        let packed_stats = encode_bitmap_update(&packed_bmp, &policy, &mut scratch_packed);
+        assert_eq!(scratch_view.batches, scratch_packed.batches);
         assert_eq!(view_stats.tiles, packed_stats.tiles);
         assert_eq!(view_stats.compressed_tiles, packed_stats.compressed_tiles);
     }

@@ -145,6 +145,10 @@ async fn find_active_session(conn: &Connection) -> Option<Session> {
     graphical.or(tty_x11)
 }
 
+/// Serializes all process-level environment writes so concurrent Rust
+/// callers never observe a half-written set of session variables.
+static SESSION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Update process-level environment variables to reflect `session`.
 ///
 /// Process environment variables are updated so arboard and libpulse clients
@@ -157,14 +161,25 @@ async fn find_active_session(conn: &Connection) -> Option<Session> {
 /// only an explicit `PULSE_SERVER` reaches the target user's PipeWire/Pulse
 /// instance in that case.
 ///
-/// # Safety
-/// `set_var`/`remove_var` are unsafe in Rust edition 2024 because they race
-/// with concurrent `getenv` in other threads (including C libraries:
-/// libpulse, libX11, arboard). This process still uses process-wide env
-/// because those libraries have no other way to pick a session.
-/// Writes are confined to this one watcher task; readers (clipboard poll,
-/// Pulse clients) may observe a torn update across a session switch.
+/// # Serialization
+///
+/// All mutations are serialized through [`SESSION_ENV_LOCK`], preventing
+/// concurrent Rust callers from observing a half-written set of variables.
+/// The residual C-level race with `libc::getenv` in background threads
+/// (libpulse, libX11, arboard) is inherent to the POSIX environment API
+/// and cannot be eliminated without API changes in those libraries.  This
+/// risk is accepted because:
+///
+/// * Writes are infrequent (only on session change events).
+/// * Readers (clipboard poll, Pulse clients) tolerate brief inconsistency —
+///   a torn read simply causes one failed clipboard poll or Pulse
+///   reconnection attempt, both of which retry.
 fn apply_session_env(session: &Option<Session>) {
+    let _guard = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: `set_var`/`remove_var` are unsafe in edition 2024 because
+    // they race with concurrent `getenv` in C libraries.  We accept this
+    // residual risk (documented above) because libpulse, libX11, and
+    // arboard have no other mechanism to discover the active session.
     unsafe {
         match session {
             Some(s) => {

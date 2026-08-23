@@ -29,6 +29,10 @@ const MAX_STACK_PIXELS: usize = 4096;
 /// for, see `rdpcore_server::encode_bitmap_update`).
 pub fn encode(bgrx: &[u8], width: usize, height: usize) -> Vec<u8> {
     let pixel_count = width * height;
+    if pixel_count == 0 {
+        // Nothing to encode — return just the format header.
+        return vec![FORMAT_HEADER_RLE_NO_ALPHA_ARGB];
+    }
     let mut out = Vec::with_capacity(1 + pixel_count * 3 / 2);
     out.push(FORMAT_HEADER_RLE_NO_ALPHA_ARGB);
 
@@ -439,6 +443,18 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn zero_height_encode_does_not_panic() {
+        let out = encode(&[], 64, 0);
+        assert_eq!(out, vec![FORMAT_HEADER_RLE_NO_ALPHA_ARGB]);
+    }
+
+    #[test]
+    fn zero_width_encode_does_not_panic() {
+        let out = encode(&[], 0, 64);
+        assert_eq!(out, vec![FORMAT_HEADER_RLE_NO_ALPHA_ARGB]);
     }
 
     proptest::proptest! {
