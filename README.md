@@ -170,6 +170,11 @@ sudo chmod 600 /etc/kmsrdp/kmsrdp.env   # RDP login credentials only
 sudo systemctl enable --now kmsrdp.service
 ```
 
+## Documentation
+
+- [Architecture & Protocol Flow](ARCHITECTURE.md): detailed overview of the DRM capture pipeline, internal crates, and RDP connection sequence diagrams.
+- [Security Model & Advisories](SECURITY.md): threat model, deployment recommendations, and vulnerability reporting.
+
 ## Security
 
 Treat a connected client like a person at the console. Use a strong password,

@@ -43,14 +43,14 @@ pub struct BitmapUpdate {
     /// without cloning megabytes of framebuffer data.
     ///
     /// [`BitmapUpdate::sub`] clones this `Arc` and keeps the parent
-    /// `stride`; the view's top-left pixel is at ([`src_x`], [`src_y`]).
+    /// `stride`; the view's top-left pixel is at (`src_x`, `src_y`).
     /// The wire encoder indexes through those fields instead of
     /// re-packing the rectangle.
     pub data: Arc<[u8]>,
     pub stride: NonZeroUsize,
-    /// Horizontal pixel offset of this update's origin inside [`data`].
+    /// Horizontal pixel offset of this update's origin inside [`Self::data`].
     pub src_x: u16,
-    /// Vertical pixel offset of this update's origin inside [`data`].
+    /// Vertical pixel offset of this update's origin inside [`Self::data`].
     pub src_y: u16,
 }
 
@@ -65,10 +65,10 @@ impl BitmapUpdate {
             )
     }
 
-    /// View of a sub-rectangle that shares [`data`] (no framebuffer copy).
+    /// View of a sub-rectangle that shares [`Self::data`] (no framebuffer copy).
     ///
     /// The returned update keeps the parent stride and records the
-    /// region's origin in [`src_x`]/[`src_y`] so encoders can address
+    /// region's origin in `src_x`/`src_y` so encoders can address
     /// padded rows without a tightly-packed clone.
     pub fn sub(
         &self,
