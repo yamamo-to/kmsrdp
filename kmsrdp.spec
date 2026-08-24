@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.54
+Version:        0.1.55
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,11 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Mon Aug 24 2026 kmsrdp contributors <noreply@example.com> - 0.1.55-1
+- Fix RDPSND live-slot clobber and WaveConfirm RTT poisoning
+- Add no-panic proptest coverage for virtual-channel decoders
+- Fix bulk-queue-full mid-frame truncation and spurious session teardown
+
 * Mon Aug 24 2026 kmsrdp contributors <noreply@example.com> - 0.1.54-1
 - Keep RDPSND live: cap Pulse capture, drain to the live edge, pace sends
 - Overwrite unread waves on a slow socket instead of queueing PCM
