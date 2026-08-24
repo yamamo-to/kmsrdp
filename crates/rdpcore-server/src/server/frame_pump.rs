@@ -14,6 +14,28 @@ use crate::encode::{
 };
 use crate::error::SessionError;
 
+/// How long a single frame is allowed to wait for bulk-queue space before
+/// the connection is treated as dead. `FrameSender::send_all` waits
+/// indefinitely on its own (that's the fix for truncating updates under
+/// brief backpressure) - this bounds that wait so a client that's genuinely
+/// stopped reading (hung, not just momentarily slow) still gets reaped
+/// instead of wedging this connection's whole steady-state loop (input
+/// included) forever.
+const BULK_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Waits for bulk-queue space like `FrameSender::send_all`, but gives up
+/// (as if the writer had closed) after [`BULK_SEND_TIMEOUT`] instead of
+/// waiting forever.
+pub async fn send_all_or_timeout(
+    frame_sender: &FrameSender,
+    frame: Frame,
+) -> Result<(), SessionError> {
+    match tokio::time::timeout(BULK_SEND_TIMEOUT, frame_sender.send_all(frame)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err(SessionError::WriterClosed),
+    }
+}
+
 pub async fn send_outbound_bitmap(
     bitmap: &BitmapUpdate,
     frame_sender: &FrameSender,
@@ -62,15 +84,17 @@ pub async fn send_outbound_bitmap(
     {
         // A momentarily full bulk queue must not truncate this update
         // partway through (e.g. dropping the tail rows of a full-screen
-        // refresh) or tear down the session - wait for space instead.
-        frame_sender
-            .send_all(Frame {
+        // refresh) or tear down the session - wait for space instead
+        // (bounded, so a genuinely hung client still gets reaped).
+        send_all_or_timeout(
+            frame_sender,
+            Frame {
                 channel: ChannelKey::Io,
                 priority: Priority::Bulk,
                 bytes: wire_frame,
-            })
-            .await
-            .map_err(|_| SessionError::WriterClosed)?;
+            },
+        )
+        .await?;
     }
     Ok(())
 }
@@ -243,10 +267,7 @@ pub async fn send_gfx_frames(
     frames: Vec<Frame>,
 ) -> Result<(), SessionError> {
     for frame in frames {
-        frame_sender
-            .send_all(frame)
-            .await
-            .map_err(|_| SessionError::WriterClosed)?;
+        send_all_or_timeout(frame_sender, frame).await?;
     }
     Ok(())
 }

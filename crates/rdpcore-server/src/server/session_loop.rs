@@ -33,7 +33,9 @@ use crate::transport::{SteadyStateFrame, read_steady_state_frame};
 use super::frame_pump::{
     apply_gfx_encode_outcome, build_gfx_frames, send_gfx_frames, try_encode_gfx_frame,
 };
-use super::frame_pump::{flush_pending_resize_bitmap, send_outbound_bitmap, send_outbound_frame};
+use super::frame_pump::{
+    flush_pending_resize_bitmap, send_all_or_timeout, send_outbound_bitmap, send_outbound_frame,
+};
 use super::input_handler::dispatch_input_event;
 use super::metrics::SessionBitmapMetrics;
 
@@ -408,9 +410,12 @@ where
                         match acceptor.step(&bytes) {
                             Ok(result) => {
                                 if !result.response.is_empty()
-                                    && frame_sender
-                                        .send(Frame { channel: ChannelKey::Io, priority: Priority::Latency, bytes: result.response })
-                                        .is_err()
+                                    && send_all_or_timeout(
+                                        &frame_sender,
+                                        Frame { channel: ChannelKey::Io, priority: Priority::Latency, bytes: result.response },
+                                    )
+                                    .await
+                                    .is_err()
                                 {
                                     return finish_session(Err(SessionError::WriterClosed));
                                 }
@@ -635,22 +640,31 @@ where
                 let Some(event) = clipboard_event else { continue };
                 if let Some(channel) = cliprdr.as_mut() {
                     let channel_id = channel.channel_id();
-                    for bytes in channel.encode_message(event) {
-                        let _ = frame_sender.send(Frame { channel: ChannelKey::Static(channel_id), priority: Priority::Bulk, bytes });
+                    let outgoing = channel.encode_message(event);
+                    for bytes in outgoing {
+                        let _ = send_all_or_timeout(
+                            &frame_sender,
+                            Frame { channel: ChannelKey::Static(channel_id), priority: Priority::Bulk, bytes },
+                        )
+                        .await;
                     }
                 }
             }
             _ = recv_optional(&mut rdpdr_wake_rx) => {
                 if let Some(channel) = rdpdr.as_mut() {
                     let channel_id = channel.channel_id();
-                    for bytes in channel.flush_pending_commands() {
-                        if frame_sender
-                            .send(Frame {
+                    let outgoing = channel.flush_pending_commands();
+                    for bytes in outgoing {
+                        if send_all_or_timeout(
+                            &frame_sender,
+                            Frame {
                                 channel: ChannelKey::Static(channel_id),
                                 priority: Priority::Latency,
                                 bytes,
-                            })
-                            .is_err()
+                            },
+                        )
+                        .await
+                        .is_err()
                         {
                             return finish_session(Err(SessionError::WriterClosed));
                         }
@@ -813,12 +827,18 @@ async fn handle_slow_path_frame(
         let mut channel = channel.lock().await;
         if send_data.channel_id == channel.channel_id() {
             let channel_id = channel.channel_id();
-            for response in channel.on_channel_data(&send_data.data)? {
-                let _ = frame_sender.send(Frame {
-                    channel: ChannelKey::Static(channel_id),
-                    priority: Priority::Latency,
-                    bytes: response,
-                });
+            let responses = channel.on_channel_data(&send_data.data)?;
+            drop(channel);
+            for response in responses {
+                let _ = send_all_or_timeout(
+                    frame_sender,
+                    Frame {
+                        channel: ChannelKey::Static(channel_id),
+                        priority: Priority::Latency,
+                        bytes: response,
+                    },
+                )
+                .await;
             }
             return Ok(());
         }
@@ -828,11 +848,15 @@ async fn handle_slow_path_frame(
     {
         let channel_id = channel.channel_id();
         for response in channel.on_channel_data(&send_data.data)? {
-            let _ = frame_sender.send(Frame {
-                channel: ChannelKey::Static(channel_id),
-                priority: Priority::Bulk,
-                bytes: response,
-            });
+            let _ = send_all_or_timeout(
+                frame_sender,
+                Frame {
+                    channel: ChannelKey::Static(channel_id),
+                    priority: Priority::Bulk,
+                    bytes: response,
+                },
+            )
+            .await;
         }
         return Ok(());
     }
@@ -840,12 +864,17 @@ async fn handle_slow_path_frame(
         && send_data.channel_id == mux.channel_id()
     {
         let channel_id = mux.channel_id();
-        for response in mux.on_channel_data(&send_data.data)? {
-            let _ = frame_sender.send(Frame {
-                channel: ChannelKey::Static(channel_id),
-                priority: Priority::Latency,
-                bytes: response,
-            });
+        let responses = mux.on_channel_data(&send_data.data)?;
+        for response in responses {
+            let _ = send_all_or_timeout(
+                frame_sender,
+                Frame {
+                    channel: ChannelKey::Static(channel_id),
+                    priority: Priority::Latency,
+                    bytes: response,
+                },
+            )
+            .await;
         }
         return Ok(());
     }
@@ -854,11 +883,15 @@ async fn handle_slow_path_frame(
     {
         let channel_id = channel.channel_id();
         for response in channel.on_channel_data(&send_data.data)? {
-            let _ = frame_sender.send(Frame {
-                channel: ChannelKey::Static(channel_id),
-                priority: Priority::Latency,
-                bytes: response,
-            });
+            let _ = send_all_or_timeout(
+                frame_sender,
+                Frame {
+                    channel: ChannelKey::Static(channel_id),
+                    priority: Priority::Latency,
+                    bytes: response,
+                },
+            )
+            .await;
         }
     }
     Ok(())
