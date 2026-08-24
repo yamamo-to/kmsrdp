@@ -60,16 +60,17 @@ pub async fn send_outbound_bitmap(
         .chain(batches.into_iter().flatten())
         .chain(end)
     {
-        if frame_sender
-            .send(Frame {
+        // A momentarily full bulk queue must not truncate this update
+        // partway through (e.g. dropping the tail rows of a full-screen
+        // refresh) or tear down the session - wait for space instead.
+        frame_sender
+            .send_all(Frame {
                 channel: ChannelKey::Io,
                 priority: Priority::Bulk,
                 bytes: wire_frame,
             })
-            .is_err()
-        {
-            return Err(SessionError::WriterClosed);
-        }
+            .await
+            .map_err(|_| SessionError::WriterClosed)?;
     }
     Ok(())
 }
@@ -182,53 +183,70 @@ pub async fn try_encode_gfx_frame(
     }
 }
 
-/// Applies a [`GfxEncodeOutcome`] - the only place that still needs
-/// `&DvcMux`, called synchronously (no `.await`) after the encode above.
+/// Builds the wire-ready GFX channel frames for `payloads`.
+#[cfg(feature = "gfx")]
+pub(crate) fn build_gfx_frames(
+    mux: &DvcMux,
+    payloads: Vec<Vec<u8>>,
+) -> Result<Vec<Frame>, SessionError> {
+    let Some(dyn_id) = mux.channel_id_for_name(rdpcore_rdpegfx::CHANNEL_NAME) else {
+        return Err(SessionError::GfxChannelMissing);
+    };
+    let channel = ChannelKey::Static(mux.channel_id());
+    Ok(mux
+        .wrap_channel_payloads(dyn_id, payloads)
+        .into_iter()
+        .map(|bytes| Frame {
+            channel,
+            priority: Priority::Bulk,
+            bytes,
+        })
+        .collect())
+}
+
+/// Applies a [`GfxEncodeOutcome`], building any wire frames it needs sent.
+/// Deliberately synchronous (no `.await`, unlike the rest of this module):
+/// `&DvcMux` isn't `Sync`, so merely being a parameter of an `async fn`
+/// that awaits anything - even if unused past that point - makes the
+/// generated future `!Send` and unspawnable. Keeping this function fully
+/// sync means `&DvcMux` never needs to cross an await point; the caller
+/// sends the returned frames via [`send_gfx_frames`] afterward.
 #[cfg(feature = "gfx")]
 pub fn apply_gfx_encode_outcome(
     outcome: GfxEncodeOutcome,
     dvc: Option<&DvcMux>,
-    frame_sender: &FrameSender,
-) -> Result<bool, SessionError> {
+) -> Result<(bool, Vec<Frame>), SessionError> {
     match outcome {
-        GfxEncodeOutcome::Fallback => Ok(false),
-        GfxEncodeOutcome::SoftSkip => Ok(true),
+        GfxEncodeOutcome::Fallback => Ok((false, Vec::new())),
+        GfxEncodeOutcome::SoftSkip => Ok((true, Vec::new())),
         GfxEncodeOutcome::Send(payloads) => {
             let mux = dvc.ok_or(SessionError::GfxChannelMissing)?;
-            send_gfx_payloads(mux, frame_sender, payloads)?;
-            Ok(true)
+            Ok((true, build_gfx_frames(mux, payloads)?))
         }
         GfxEncodeOutcome::Disable { teardown } => {
-            if !teardown.is_empty()
-                && let Some(mux) = dvc
-            {
-                let _ = send_gfx_payloads(mux, frame_sender, teardown);
-            }
-            Ok(false)
+            let frames = match (teardown.is_empty(), dvc) {
+                (false, Some(mux)) => build_gfx_frames(mux, teardown).unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            Ok((false, frames))
         }
     }
 }
 
+/// Sends already-built GFX wire frames, waiting for bulk-queue space
+/// instead of dropping a frame mid-update or tearing down the session (see
+/// `send_outbound_bitmap`). Takes no `&DvcMux` - see
+/// [`apply_gfx_encode_outcome`]'s doc comment for why that matters here.
 #[cfg(feature = "gfx")]
-pub fn send_gfx_payloads(
-    mux: &DvcMux,
+pub async fn send_gfx_frames(
     frame_sender: &FrameSender,
-    payloads: Vec<Vec<u8>>,
+    frames: Vec<Frame>,
 ) -> Result<(), SessionError> {
-    let Some(dyn_id) = mux.channel_id_for_name(rdpcore_rdpegfx::CHANNEL_NAME) else {
-        return Err(SessionError::GfxChannelMissing);
-    };
-    for bytes in mux.wrap_channel_payloads(dyn_id, payloads) {
-        if frame_sender
-            .send(Frame {
-                channel: ChannelKey::Static(mux.channel_id()),
-                priority: Priority::Bulk,
-                bytes,
-            })
-            .is_err()
-        {
-            return Err(SessionError::WriterClosed);
-        }
+    for frame in frames {
+        frame_sender
+            .send_all(frame)
+            .await
+            .map_err(|_| SessionError::WriterClosed)?;
     }
     Ok(())
 }

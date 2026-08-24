@@ -30,7 +30,9 @@ use crate::input::{ConnectionScopedInput, RdpServerInputHandler};
 use crate::transport::{SteadyStateFrame, read_steady_state_frame};
 
 #[cfg(feature = "gfx")]
-use super::frame_pump::{apply_gfx_encode_outcome, send_gfx_payloads, try_encode_gfx_frame};
+use super::frame_pump::{
+    apply_gfx_encode_outcome, build_gfx_frames, send_gfx_frames, try_encode_gfx_frame,
+};
 use super::frame_pump::{flush_pending_resize_bitmap, send_outbound_bitmap, send_outbound_frame};
 use super::input_handler::dispatch_input_event;
 use super::metrics::SessionBitmapMetrics;
@@ -511,9 +513,15 @@ where
                         )
                         .await
                         {
-                            Ok(outcome) => {
-                                apply_gfx_encode_outcome(outcome, dvc.as_ref(), &frame_sender)
-                            }
+                            Ok(outcome) => match apply_gfx_encode_outcome(outcome, dvc.as_ref()) {
+                                Ok((handled, frames)) => {
+                                    match send_gfx_frames(&frame_sender, frames).await {
+                                        Ok(()) => Ok(handled),
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                                Err(e) => Err(e),
+                            },
                             Err(e) => Err(e),
                         },
                     );
@@ -560,11 +568,15 @@ where
                             )
                             .await
                             {
-                                Ok(outcome) => apply_gfx_encode_outcome(
-                                    outcome,
-                                    dvc.as_ref(),
-                                    &frame_sender,
-                                ),
+                                Ok(outcome) => match apply_gfx_encode_outcome(outcome, dvc.as_ref()) {
+                                    Ok((handled, frames)) => {
+                                        match send_gfx_frames(&frame_sender, frames).await {
+                                            Ok(()) => Ok(handled),
+                                            Err(e) => Err(e),
+                                        }
+                                    }
+                                    Err(e) => Err(e),
+                                },
                                 Err(e) => Err(e),
                             },
                         );
@@ -588,11 +600,18 @@ where
                     }
                     Ok(Some(DisplayUpdate::Resized(size))) => {
                         #[cfg(feature = "gfx")]
-                        if let (Some(gfx), Some(mux)) = (gfx_session.as_ref(), dvc.as_ref())
+                        let resize_gfx_frames = if let (Some(gfx), Some(mux)) =
+                            (gfx_session.as_ref(), dvc.as_ref())
                             && let Some(payloads) = gfx.resize(size.width, size.height)
                         {
-                            let _ = send_gfx_payloads(mux, &frame_sender, payloads);
                             last_gfx_data = None;
+                            build_gfx_frames(mux, payloads).ok()
+                        } else {
+                            None
+                        };
+                        #[cfg(feature = "gfx")]
+                        if let Some(frames) = resize_gfx_frames {
+                            let _ = send_gfx_frames(&frame_sender, frames).await;
                         }
                         match acceptor.begin_resize(size.width, size.height) {
                             Ok(response) => {

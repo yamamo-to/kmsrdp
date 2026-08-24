@@ -52,6 +52,21 @@ impl FrameSender {
         })
     }
 
+    /// Enqueues a frame, waiting for space instead of dropping it if the
+    /// corresponding bounded queue is momentarily full. Use this for frames
+    /// that must all arrive together as one logical update (e.g. a
+    /// BEGIN/tiles/END bitmap sequence) - unlike `send`, a transiently full
+    /// queue never causes a frame in the middle of such a sequence to be
+    /// silently dropped. Returns `Err` only once the writer has actually
+    /// shut down.
+    pub async fn send_all(&self, frame: Frame) -> Result<(), Frame> {
+        let tx = match frame.priority {
+            Priority::Latency => &self.latency,
+            Priority::Bulk => &self.bulk,
+        };
+        tx.send(frame).await.map_err(|e| e.0)
+    }
+
     /// Replaces any unread live-audio wave with `frames` (one RDPSND Wave
     /// split into SVC chunks). Returns `false` only when the writer is gone.
     /// Unread older waves are dropped — the intended trade for live A/V.
@@ -218,6 +233,39 @@ mod tests {
         assert_eq!(accepted, BULK_QUEUE_CAP);
         assert!(dropped >= 8);
         drop(writer);
+    }
+
+    #[tokio::test]
+    async fn send_all_waits_for_space_instead_of_dropping() {
+        // A tiny duplex buffer forces the writer to apply real backpressure,
+        // so pushing more than BULK_QUEUE_CAP frames via send_all only
+        // succeeds if it actually waits for space rather than dropping
+        // (unlike plain `send`, exercised by `bulk_send_drops_when_queue_is_full`).
+        let (client_side, server_side) = tokio::io::duplex(64);
+        let (writer, sender) = ConnectionWriter::new(server_side);
+        let run_handle = tokio::spawn(writer.run());
+
+        let total = BULK_QUEUE_CAP + 50;
+        let send_task = tokio::spawn(async move {
+            for _ in 0..total {
+                sender
+                    .send_all(Frame {
+                        channel: ChannelKey::Io,
+                        priority: Priority::Bulk,
+                        bytes: vec![0u8],
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut received = Vec::new();
+        let mut client_side = client_side;
+        client_side.read_to_end(&mut received).await.unwrap();
+
+        send_task.await.unwrap();
+        run_handle.await.unwrap().unwrap();
+        assert_eq!(received.len(), total);
     }
 
     #[tokio::test]
