@@ -38,6 +38,11 @@ pub struct DrmCapturer {
     primary_plane_cache: HashMap<(usize, crtc::Handle), plane::Handle>,
     cached_heads: Vec<EnumeratedHead>,
     last_head_refresh: Option<Instant>,
+    /// Reused across `capture_head` calls (heads are captured one at a
+    /// time, sequentially, and this buffer's contents are fully consumed
+    /// into an owned `Arc<[u8]>` by `take_pixels` before the next head
+    /// reuses it) instead of a fresh multi-megabyte allocation per tick.
+    detile_scratch: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -80,6 +85,7 @@ impl DrmCapturer {
             primary_plane_cache: HashMap::new(),
             cached_heads: heads,
             last_head_refresh: Some(Instant::now()),
+            detile_scratch: Vec::new(),
         })
     }
 
@@ -302,7 +308,7 @@ impl DrmCapturer {
                     "tiled framebuffer missing DRM modifier",
                 )
             })?;
-            let detiled = gpu_detile::detile_to_bgrx(
+            gpu_detile::detile_to_bgrx(
                 &card_ctx.path,
                 fd.as_raw_fd(),
                 fourcc,
@@ -311,10 +317,17 @@ impl DrmCapturer {
                 height,
                 offsets[0],
                 pitches[0],
+                &mut self.detile_scratch,
             )?;
             let stride = width as usize * 4;
-            let (data, unchanged, dirty_rects) =
-                take_pixels(&detiled, stride, width, height, force_full, hint);
+            let (data, unchanged, dirty_rects) = take_pixels(
+                &self.detile_scratch,
+                stride,
+                width,
+                height,
+                force_full,
+                hint,
+            );
             (stride, data, unchanged, dirty_rects)
         } else {
             return Err(io::Error::new(

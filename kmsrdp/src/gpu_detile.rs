@@ -482,7 +482,8 @@ impl GpuDetiler {
         height: u32,
         offset: u32,
         pitch: u32,
-    ) -> io::Result<Vec<u8>> {
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
         self.ensure_current()?;
         self.resize(width, height);
 
@@ -520,17 +521,18 @@ impl GpuDetiler {
             )
             .map_err(|e| io::Error::other(format!("eglCreateImage failed: {e:?}")))?;
 
-        let result = self.draw_and_read(image);
+        let result = self.draw_and_read(image, out);
 
         let _ = self.egl.destroy_image(self.display, image);
         result
     }
 
-    fn draw_and_read(&self, image: egl::Image) -> io::Result<Vec<u8>> {
+    fn draw_and_read(&self, image: egl::Image, out: &mut Vec<u8>) -> io::Result<()> {
         let gl = &self.gl;
         // SAFETY: the EGL context is current (`ensure_current`); GL object
         // names were created in `new` and are still owned by this detiler;
-        // `out` is large enough for width*height*4 RGBA8.
+        // `out` is resized just below to width*height*4 RGBA8 before the
+        // write.
         unsafe {
             (gl.active_texture)(GL_TEXTURE0);
             (gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, self.external_tex);
@@ -579,7 +581,8 @@ impl GpuDetiler {
 
             (gl.draw_arrays)(GL_TRIANGLE_STRIP, 0, 4);
 
-            let mut out = vec![0u8; self.width as usize * self.height as usize * 4];
+            out.clear();
+            out.resize(self.width as usize * self.height as usize * 4, 0);
             (gl.read_pixels)(
                 0,
                 0,
@@ -597,7 +600,7 @@ impl GpuDetiler {
             if err != 0 {
                 return Err(io::Error::other(format!("GL error {err:#x} during detile")));
             }
-            Ok(out)
+            Ok(())
         }
     }
 }
@@ -654,8 +657,11 @@ const DETILER_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 static DETILERS: LazyLock<Mutex<HashMap<String, DetilerSlot>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Detile a single-plane RGB(A) dma-buf via GBM/EGL and return tightly
-/// packed BGRX8888 bytes (stride == `width * 4`).
+/// Detile a single-plane RGB(A) dma-buf via GBM/EGL into tightly packed
+/// BGRX8888 bytes (stride == `width * 4`), written into `out` (cleared and
+/// resized, reusing its capacity) instead of returning a fresh allocation -
+/// pass a scratch buffer the caller keeps across calls to avoid allocating
+/// a fresh multi-megabyte buffer on every capture tick.
 ///
 /// Only single-plane formats are supported (`XRGB8888`/`ARGB8888` with a
 /// vendor modifier) - multi-plane YUV framebuffers aren't handled since
@@ -670,7 +676,8 @@ pub fn detile_to_bgrx(
     height: u32,
     offset: u32,
     pitch: u32,
-) -> io::Result<Vec<u8>> {
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
     let mut slots = DETILERS.lock().unwrap_or_else(|e| e.into_inner());
     let slot = slots.entry(card_path.to_owned()).or_insert(DetilerSlot {
         detiler: None,
@@ -699,8 +706,8 @@ pub fn detile_to_bgrx(
             "GPU detiler unexpectedly missing after successful init",
         ));
     };
-    match detiler.detile(fd, fourcc, modifier, width, height, offset, pitch) {
-        Ok(data) => Ok(data),
+    match detiler.detile(fd, fourcc, modifier, width, height, offset, pitch, out) {
+        Ok(()) => Ok(()),
         Err(e) => {
             // EGL/GL context might be left in an inconsistent state; drop the detiler
             // so a clean context is recreated on the next attempt after backoff.

@@ -139,6 +139,7 @@ fn main() {
         u64::from(DrmModifier::Linear)
     );
 
+    let mut data = Vec::new();
     let result = gpu_detile::detile_to_bgrx(
         &card_path,
         dma_fd as RawFd,
@@ -148,6 +149,7 @@ fn main() {
         H,
         0,
         stride,
+        &mut data,
     );
 
     unsafe {
@@ -157,7 +159,7 @@ fn main() {
     }
 
     match result {
-        Ok(data) => {
+        Ok(()) => {
             let px = &data[0..4];
             println!("readback pixel 0: {px:02x?} (expected [00, 00, ff, ..])");
             assert_eq!(
