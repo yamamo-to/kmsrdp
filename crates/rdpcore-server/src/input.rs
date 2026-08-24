@@ -82,19 +82,31 @@ impl ConnectionScopedInput {
 
 impl RdpServerInputHandler for ConnectionScopedInput {
     fn keyboard(&mut self, event: KeyboardEvent) {
-        match event {
-            KeyboardEvent::Pressed { code, extended } => {
-                self.pressed_keys.insert((code, extended));
-            }
+        // A held key's client-side autorepeat resends `Pressed` for the
+        // same (code, extended) many times before the one matching
+        // `Released` - real PC/AT hardware and RDP's Fast-Path scancode
+        // protocol both work this way (there's no separate "repeat"
+        // event). Only forward the FIRST `Pressed` per hold: the shared
+        // handler's refcounted inject_held expects exactly one
+        // Pressed/Released pair per connection per hold, and forwarding
+        // every repeat inflates that refcount so the single real
+        // `Released` can never bring it back to zero - the key then
+        // stays "down" at the uinput/evdev level forever, and X11's own
+        // key-repeat retypes it indefinitely.
+        let forward = match event {
+            KeyboardEvent::Pressed { code, extended } => self.pressed_keys.insert((code, extended)),
             KeyboardEvent::Released { code, extended } => {
                 self.pressed_keys.remove(&(code, extended));
+                true
             }
-            KeyboardEvent::UnicodePressed(_) => {}
+            KeyboardEvent::UnicodePressed(_) => true,
+        };
+        if forward {
+            self.inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keyboard(event);
         }
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .keyboard(event);
     }
 
     fn mouse(&mut self, event: MouseEvent) {
@@ -165,6 +177,41 @@ mod tests {
         fn reset(&mut self) {
             self.reset_calls += 1;
         }
+    }
+
+    #[test]
+    fn autorepeat_presses_of_an_already_held_key_are_not_forwarded() {
+        let shared = Arc::new(Mutex::new(RecordingHandler::default()));
+        let mut conn = ConnectionScopedInput::new(shared.clone());
+
+        let key = KeyboardEvent::Pressed {
+            code: 0x2D, // 'x'
+            extended: false,
+        };
+        // Client-side autorepeat: many Presseds while the key is held,
+        // then exactly one Released - this is normal RDP/PC-AT behavior,
+        // not malformed input.
+        for _ in 0..5 {
+            conn.keyboard(key);
+        }
+        conn.keyboard(KeyboardEvent::Released {
+            code: 0x2D,
+            extended: false,
+        });
+
+        let rec = shared.lock().unwrap();
+        assert_eq!(
+            rec.keys,
+            vec![
+                key,
+                KeyboardEvent::Released {
+                    code: 0x2D,
+                    extended: false,
+                },
+            ],
+            "only the first Pressed and the Released should reach the shared handler, \
+             or a repeat-happy client leaves the shared refcount unable to reach zero"
+        );
     }
 
     #[test]
