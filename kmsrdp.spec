@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.55
+Version:        0.1.56
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,15 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Mon Aug 24 2026 kmsrdp contributors <noreply@example.com> - 0.1.56-1
+- Close remaining bulk-queue-full mid-sequence truncation gaps; bound
+  send_all's wait so a hung client can't wedge the connection forever
+- Fix WavePublisher::publish's mutex-poisoning inconsistency
+- Reuse the I420 scratch buffer in the OpenH264 GFX path per frame
+- Recycle per-tile bitmap buffers across frames instead of cloning
+- Move the GFX H.264 encoder to its own lock, out from under session state
+- Reuse the GPU-detile readback buffer instead of allocating per tick
+
 * Mon Aug 24 2026 kmsrdp contributors <noreply@example.com> - 0.1.55-1
 - Fix RDPSND live-slot clobber and WaveConfirm RTT poisoning
 - Add no-panic proptest coverage for virtual-channel decoders

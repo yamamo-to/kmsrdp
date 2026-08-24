@@ -1,3 +1,21 @@
+kmsrdp (0.1.56) unstable; urgency=medium
+
+  * Close remaining bulk-queue-full mid-sequence truncation gaps (cliprdr,
+    RDPSND/DVC/RDPDR channel responses); bound send_all's wait so a hung
+    client can't wedge the connection forever.
+  * Fix WavePublisher::publish's mutex-poisoning inconsistency.
+  * Reuse the I420 scratch buffer in the OpenH264 GFX path instead of
+    allocating one per frame.
+  * Recycle per-tile bitmap buffers across frames instead of cloning
+    fresh ones on every raw/incompressible tile.
+  * Move the GFX H.264 encoder to its own lock, out from under session
+    state, so FrameAcknowledge/CapsAdvertise handling no longer blocks on
+    the CPU-bound encode.
+  * Reuse the GPU-detile readback buffer instead of allocating one per
+    capture tick.
+
+ -- kmsrdp contributors <noreply@example.com>  Mon, 24 Aug 2026 15:00:00 +0900
+
 kmsrdp (0.1.55) unstable; urgency=medium
 
   * Fix RDPSND live-slot clobber and WaveConfirm RTT poisoning.
