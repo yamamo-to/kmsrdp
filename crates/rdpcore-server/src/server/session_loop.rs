@@ -39,19 +39,37 @@ use super::frame_pump::{
 use super::input_handler::dispatch_input_event;
 use super::metrics::SessionBitmapMetrics;
 
+/// Per-connection dependencies and feature toggles for [`run_steady_state`].
+/// One instance is built per accepted connection from the server's shared
+/// factories/handles.
 pub struct SteadyStateParams {
+    /// Display backend this connection reads captured frames from.
     pub display: Arc<dyn RdpServerDisplay>,
+    /// Shared input handler; wrapped per-connection so this session's
+    /// `reset()` only releases keys/buttons it itself is holding.
     pub input: Arc<Mutex<dyn RdpServerInputHandler>>,
+    /// `None` disables RDPSND for this connection (no audio channel).
     pub sound_factory: Option<Arc<dyn SoundServerFactory>>,
+    /// `None` disables CLIPRDR (clipboard) for this connection.
     pub cliprdr_factory: Option<Arc<dyn CliprdrBackendFactory>>,
+    /// `None` disables RDPEAI (microphone redirection) for this connection.
     pub audio_input_factory: Option<Arc<dyn AudioInputBackendFactory>>,
+    /// `None` disables RDPDR drive redirection for this connection.
     pub drive_factory: Option<Arc<dyn DriveConsumerFactory>>,
     #[cfg(feature = "gfx")]
+    /// Whether to attempt MS-RDPEGFX/AVC420 for this connection; falls
+    /// back to Planar/NSCodec if the client doesn't negotiate GFX.
     pub gfx_enabled: bool,
     #[cfg(feature = "dvc-echo")]
+    /// Test-only: exercises the DVC echo channel at connect time.
     pub echo_smoke_test: bool,
 }
 
+/// Runs one accepted connection's steady state to completion: dispatches
+/// Fast-Path input and virtual-channel PDUs, pumps display updates and
+/// audio, and handles resize, until the client disconnects or a fatal
+/// error occurs. Returns `Ok(())` for a normal or writer-closed
+/// disconnect (see [`crate::error::finish_session`]).
 pub async fn run_steady_state<S>(
     params: SteadyStateParams,
     _peer: SocketAddr,
@@ -700,6 +718,8 @@ async fn recv_optional<T>(rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<T
     }
 }
 
+/// Aborts the wrapped task when dropped, instead of letting it run
+/// detached forever after this connection ends.
 pub struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -708,6 +728,9 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Calls `reset()` on the wrapped input handler when dropped, so a
+/// connection that ends (normally, on error, or via panic) always
+/// releases whatever keys/buttons it was holding.
 pub struct ResetInputOnDrop(pub Arc<Mutex<dyn RdpServerInputHandler>>);
 
 impl Drop for ResetInputOnDrop {
