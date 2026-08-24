@@ -15,7 +15,9 @@ use rdpcore_rdpegfx::{GfxSession, select_h264_encoder};
 use rdpcore_rdpsnd::{RdpsndChannel, RdpsndServerMessage, SoundServerFactory, wave_channel};
 use rdpcore_transport::{ChannelKey, ConnectionWriter, Frame, Priority};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::{debug, info, warn};
+#[cfg(any(feature = "gfx", feature = "dvc-echo"))]
+use tracing::info;
+use tracing::{debug, warn};
 
 use crate::display::{BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay};
 use crate::encode::{

@@ -1,4 +1,4 @@
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::encode::BitmapWireStats;
 
@@ -21,7 +21,7 @@ impl SessionBitmapMetrics {
         self.encoded_bytes += stats.encoded_bytes as u64;
         self.update_batches += u64::from(stats.update_batches);
         if self.frames.is_multiple_of(30) {
-            self.log("periodic");
+            self.emit_debug("periodic");
         }
     }
 
@@ -30,6 +30,19 @@ impl SessionBitmapMetrics {
             return;
         }
         info!(
+            reason,
+            frames = self.frames,
+            tiles = self.tiles,
+            compressed_tiles = self.compressed_tiles,
+            raw_tiles = self.raw_tiles,
+            encoded_bytes = self.encoded_bytes,
+            update_batches = self.update_batches,
+            "session bitmap metrics"
+        );
+    }
+
+    fn emit_debug(&self, reason: &'static str) {
+        debug!(
             reason,
             frames = self.frames,
             tiles = self.tiles,
