@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rdpcore_dvc::DvcHandler;
 use tracing::{debug, info, warn};
 
-use crate::encoder::{H264Encoder, MockH264Encoder};
+use crate::encoder::{EncodedAu, H264Encoder, MockH264Encoder};
 use crate::pdu::{self, ClientMessage, MonitorDef, RawCapabilitySet, select_avc420_capability};
 
 /// Recover from a poisoned `Mutex` so one panicked encoder/ack path cannot
@@ -58,14 +58,13 @@ struct Inner {
     next_frame_id: u32,
     frames_in_flight: u32,
     frames_sent: u64,
-    encoder: Box<dyn H264Encoder>,
     force_next_idr: bool,
     timestamp_ms: u32,
     encode_failures: u32,
 }
 
 impl Inner {
-    fn new(encoder: Box<dyn H264Encoder>, width: u16, height: u16) -> Self {
+    fn new(width: u16, height: u16) -> Self {
         Self {
             state: State::WaitCaps,
             surface_configured: false,
@@ -75,7 +74,6 @@ impl Inner {
             next_frame_id: 1,
             frames_in_flight: 0,
             frames_sent: 0,
-            encoder,
             force_next_idr: true,
             timestamp_ms: 0,
             encode_failures: 0,
@@ -86,7 +84,11 @@ impl Inner {
         self.state == State::Ready
     }
 
-    fn on_caps(&mut self, sets: &[RawCapabilitySet]) -> Vec<Vec<u8>> {
+    fn on_caps(
+        &mut self,
+        sets: &[RawCapabilitySet],
+        encoder: &Mutex<Box<dyn H264Encoder>>,
+    ) -> Vec<Vec<u8>> {
         let Some(selected) = select_avc420_capability(sets) else {
             self.state = State::Failed;
             warn!("GFX CapsAdvertise has no AVC420; falling back to Planar/NSCodec");
@@ -117,7 +119,7 @@ impl Inner {
         self.frames_in_flight = 0;
         self.frames_sent = 0;
         self.encode_failures = 0;
-        self.encoder.reset();
+        recover_lock(encoder).reset();
         info!(
             version = format_args!("0x{:08x}", selected.version),
             width = self.width,
@@ -175,14 +177,19 @@ impl Inner {
         );
     }
 
-    fn resize(&mut self, width: u16, height: u16) -> Option<Vec<Vec<u8>>> {
+    fn resize(
+        &mut self,
+        width: u16,
+        height: u16,
+        encoder: &Mutex<Box<dyn H264Encoder>>,
+    ) -> Option<Vec<Vec<u8>>> {
         if width == 0 || height == 0 {
             return None;
         }
         if self.surface_configured && self.width == width && self.height == height {
             return None;
         }
-        self.encoder.reset();
+        recover_lock(encoder).reset();
         let old_surface = self.surface_id;
         let had_surface = self.surface_configured;
         self.width = width;
@@ -241,30 +248,36 @@ impl Inner {
         GfxFrameResult::Skip
     }
 
-    fn encode_frame(
+    /// Session-state prep for one frame: readiness/resize/backpressure
+    /// checks and the `force_idr` decision. Split out from the actual
+    /// encode so the caller doesn't need to hold this session's lock for
+    /// the CPU-bound `H264Encoder::encode_bgrx` call - see
+    /// [`GfxSession::encode_frame`]'s doc comment for why that matters.
+    /// Returns `Err(result)` for an early return (skip/fallback), or
+    /// `Ok((prefix, force_idr))` when the caller should go on to encode.
+    fn begin_encode(
         &mut self,
         width: u16,
         height: u16,
-        stride: usize,
-        pixels: &[u8],
-    ) -> GfxFrameResult {
+        encoder: &Mutex<Box<dyn H264Encoder>>,
+    ) -> Result<(Vec<Vec<u8>>, bool), GfxFrameResult> {
         if self.state != State::Ready {
-            return GfxFrameResult::Skip;
+            return Err(GfxFrameResult::Skip);
         }
         if width == 0 || height == 0 {
-            return GfxFrameResult::Skip;
+            return Err(GfxFrameResult::Skip);
         }
 
         let mut prefix = Vec::new();
         if !self.surface_configured || self.width != width || self.height != height {
-            match self.resize(width, height) {
+            match self.resize(width, height, encoder) {
                 Some(pdus) => prefix = pdus,
-                None if self.state != State::Ready => return GfxFrameResult::Skip,
+                None if self.state != State::Ready => return Err(GfxFrameResult::Skip),
                 None => {}
             }
         }
         if !self.surface_configured {
-            return GfxFrameResult::Skip;
+            return Err(GfxFrameResult::Skip);
         }
 
         if self.frames_in_flight >= MAX_FRAMES_IN_FLIGHT {
@@ -275,32 +288,19 @@ impl Inner {
         let force_idr = self.force_next_idr
             || self.frames_sent == 0
             || self.frames_sent.is_multiple_of(IDR_INTERVAL_FRAMES);
-        let encoded = match self
-            .encoder
-            .encode_bgrx(width, height, stride, pixels, force_idr)
-        {
-            Ok(au) if !au.annex_b.is_empty() => au,
-            Ok(_) | Err(_) => {
-                // Soft skip / transient RC failure: force an IDR and retry once
-                // instead of falling through to Planar (which leaves the GFX
-                // surface black while FrameAcks keep arriving).
-                self.force_next_idr = true;
-                match self
-                    .encoder
-                    .encode_bgrx(width, height, stride, pixels, true)
-                {
-                    Ok(au) if !au.annex_b.is_empty() => au,
-                    Ok(_) => {
-                        debug!("GFX H.264 encode skipped (empty bitstream)");
-                        return self.record_encode_failure();
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "GFX H.264 encode failed");
-                        return self.record_encode_failure();
-                    }
-                }
-            }
-        };
+        Ok((prefix, force_idr))
+    }
+
+    /// Finalizes bookkeeping and builds the wire PDUs for a successful
+    /// encode. Called after the encoder lock (held only for the encode
+    /// itself) has already been released.
+    fn finish_encode(
+        &mut self,
+        width: u16,
+        height: u16,
+        encoded: &EncodedAu,
+        force_idr: bool,
+    ) -> Vec<Vec<u8>> {
         self.encode_failures = 0;
         self.force_next_idr = false;
 
@@ -314,7 +314,7 @@ impl Inner {
         let bitmap =
             pdu::encode_avc420_bitmap_stream(width, height, encoded.qp, 100, &encoded.annex_b);
 
-        prefix.extend([
+        let frames = vec![
             pdu::encode_segmented_single(&pdu::encode_start_frame(self.timestamp_ms, frame_id)),
             pdu::encode_segmented_single(&pdu::encode_wire_to_surface_1_avc420(
                 self.surface_id,
@@ -323,7 +323,7 @@ impl Inner {
                 &bitmap,
             )),
             pdu::encode_segmented_single(&pdu::encode_end_frame(frame_id)),
-        ]);
+        ];
         if self.frames_sent == 1 || force_idr || self.frames_sent.is_multiple_of(300) {
             debug!(
                 frames_sent = self.frames_sent,
@@ -333,15 +333,24 @@ impl Inner {
                 "GFX frame sent"
             );
         }
-        GfxFrameResult::Frames(prefix)
+        frames
     }
 }
 
 /// Shared GFX session used both as a [`DvcHandler`] (inbound Caps/Ack) and
 /// from the connection loop (outbound frames).
+///
+/// The encoder lives in its own `Mutex`, separate from `inner`'s session
+/// state. `encode_frame` releases `inner`'s lock before running the
+/// CPU-bound `H264Encoder::encode_bgrx` - otherwise a `FrameAcknowledge`
+/// (arriving on the async connection task, not the blocking pool the
+/// encode itself runs on) would block on `inner`'s `std::sync::Mutex` for
+/// the full encode duration, stalling whichever tokio worker thread
+/// handles it - and worker threads are shared across connections.
 #[derive(Clone)]
 pub struct GfxSession {
     inner: Arc<Mutex<Inner>>,
+    encoder: Arc<Mutex<Box<dyn H264Encoder>>>,
 }
 
 impl core::fmt::Debug for GfxSession {
@@ -353,7 +362,8 @@ impl core::fmt::Debug for GfxSession {
 impl GfxSession {
     pub fn new(encoder: Box<dyn H264Encoder>, width: u16, height: u16) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner::new(encoder, width, height))),
+            inner: Arc::new(Mutex::new(Inner::new(width, height))),
+            encoder: Arc::new(Mutex::new(encoder)),
         }
     }
 
@@ -376,22 +386,67 @@ impl GfxSession {
         stride: usize,
         pixels: &[u8],
     ) -> GfxFrameResult {
-        recover_lock(&self.inner).encode_frame(width, height, stride, pixels)
+        let (prefix, force_idr) =
+            match recover_lock(&self.inner).begin_encode(width, height, &self.encoder) {
+                Ok(v) => v,
+                Err(result) => return result,
+            };
+
+        // The encoder lock is held only for the encode itself - `inner`'s
+        // lock is not held here, so FrameAcknowledge/CapsAdvertise handling
+        // on the connection task isn't blocked behind this.
+        let mut retried_idr = false;
+        let encode_once =
+            |idr: bool| recover_lock(&self.encoder).encode_bgrx(width, height, stride, pixels, idr);
+        let encoded = match encode_once(force_idr) {
+            Ok(au) if !au.annex_b.is_empty() => Ok(au),
+            Ok(_) | Err(_) => {
+                // Soft skip / transient RC failure: force an IDR and retry once
+                // instead of falling through to Planar (which leaves the GFX
+                // surface black while FrameAcks keep arriving).
+                retried_idr = true;
+                match encode_once(true) {
+                    Ok(au) if !au.annex_b.is_empty() => Ok(au),
+                    Ok(_) => Err(None),
+                    Err(e) => Err(Some(e)),
+                }
+            }
+        };
+
+        let mut inner = recover_lock(&self.inner);
+        let encoded = match encoded {
+            Ok(au) => au,
+            Err(e) => {
+                match e {
+                    Some(e) => warn!(error = %e, "GFX H.264 encode failed"),
+                    None => debug!("GFX H.264 encode skipped (empty bitstream)"),
+                }
+                if retried_idr {
+                    inner.force_next_idr = true;
+                }
+                return inner.record_encode_failure();
+            }
+        };
+        let mut frames = prefix;
+        frames.extend(inner.finish_encode(width, height, &encoded, force_idr));
+        GfxFrameResult::Frames(frames)
     }
 
     pub fn resize(&self, width: u16, height: u16) -> Option<Vec<Vec<u8>>> {
-        recover_lock(&self.inner).resize(width, height)
+        recover_lock(&self.inner).resize(width, height, &self.encoder)
     }
 
     pub fn dvc_handler(&self) -> GfxDvcHandler {
         GfxDvcHandler {
             inner: Arc::clone(&self.inner),
+            encoder: Arc::clone(&self.encoder),
         }
     }
 }
 
 pub struct GfxDvcHandler {
     inner: Arc<Mutex<Inner>>,
+    encoder: Arc<Mutex<Box<dyn H264Encoder>>>,
 }
 
 impl core::fmt::Debug for GfxDvcHandler {
@@ -427,7 +482,9 @@ impl DvcHandler for GfxDvcHandler {
 
             let mut inner = recover_lock(&self.inner);
             match msg {
-                ClientMessage::CapsAdvertise { sets } => out.extend(inner.on_caps(&sets)),
+                ClientMessage::CapsAdvertise { sets } => {
+                    out.extend(inner.on_caps(&sets, &self.encoder))
+                }
                 ClientMessage::FrameAcknowledge {
                     queue_depth,
                     frame_id,
@@ -705,6 +762,73 @@ mod tests {
         }
 
         fn reset(&mut self) {}
+    }
+
+    struct BlockingEncoder {
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl H264Encoder for BlockingEncoder {
+        fn encode_bgrx(
+            &mut self,
+            _width: u16,
+            _height: u16,
+            _stride: usize,
+            _pixels: &[u8],
+            _force_idr: bool,
+        ) -> Result<EncodedAu, EncoderError> {
+            let _ = self.started.send(());
+            let _ = self.release.recv();
+            Ok(EncodedAu {
+                annex_b: vec![0, 0, 0, 1, 0x65],
+                qp: 22,
+            })
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn encode_frame_does_not_hold_inner_lock_during_the_encode() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let session = GfxSession::new(
+            Box::new(BlockingEncoder {
+                started: started_tx,
+                release: release_rx,
+            }),
+            16,
+            16,
+        );
+        let mut handler = session.dvc_handler();
+        let advertise = encode_caps_advertise_for_test(&[RawCapabilitySet::flags_only(
+            CAP_VERSION_81,
+            CAPS_FLAG_AVC420_ENABLED,
+        )]);
+        let _ = handler.on_data(&advertise);
+
+        let pixels = vec![0u8; 16 * 16 * 4];
+        let encode_session = session.clone();
+        let encode_thread = std::thread::spawn(move || {
+            expect_frames(encode_session.encode_frame(16, 16, 16 * 4, &pixels))
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("encode_bgrx should have started");
+
+        // If encode_frame still held `inner`'s lock while the CPU-bound
+        // encode above is blocked, this would deadlock (is_ready also
+        // locks `inner`) instead of returning immediately.
+        assert!(
+            session.is_ready(),
+            "inner's lock must not be held during the encode"
+        );
+
+        release_tx.send(()).unwrap();
+        let frames = encode_thread.join().unwrap();
+        assert_eq!(frames.len(), 3);
     }
 
     #[test]
