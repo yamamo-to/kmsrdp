@@ -248,4 +248,11 @@ mod tests {
         let decoded = decode_client_message(&out).unwrap();
         assert_eq!(decoded, ClientMessage::FormatList(vec![1, CF_UNICODETEXT]));
     }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_decode_client_message_does_not_panic(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
+            let _ = decode_client_message(&data);
+        }
+    }
 }

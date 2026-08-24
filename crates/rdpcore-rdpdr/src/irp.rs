@@ -633,4 +633,14 @@ mod tests {
         let buf = rename_information_buffer("\\new.txt", false);
         assert_eq!(buf[0], 0);
     }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_decode_replies_do_not_panic(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
+            let _ = decode_create_reply(&data);
+            let _ = decode_read_reply(&data);
+            let _ = decode_write_reply(&data);
+            let _ = decode_query_directory_reply(&data);
+        }
+    }
 }

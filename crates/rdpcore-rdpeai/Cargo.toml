@@ -9,3 +9,6 @@ description = "From-scratch MS-RDPEAI (audio input / microphone redirection) ove
 rdpcore-dvc = { path = "../rdpcore-dvc" }
 rdpcore-pdu = { path = "../rdpcore-pdu" }
 rdpcore-rdpsnd = { path = "../rdpcore-rdpsnd" }
+
+[dev-dependencies]
+proptest = "1.6"

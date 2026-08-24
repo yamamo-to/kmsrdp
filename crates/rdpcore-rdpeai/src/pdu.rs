@@ -213,4 +213,11 @@ mod tests {
         let raw = vec![0xFF];
         assert_eq!(decode_client_message(&raw).unwrap(), ClientMessage::Other);
     }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_decode_client_message_does_not_panic(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
+            let _ = decode_client_message(&data);
+        }
+    }
 }

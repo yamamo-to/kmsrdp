@@ -11,3 +11,6 @@ echo = []
 
 [dependencies]
 rdpcore-pdu = { path = "../rdpcore-pdu" }
+
+[dev-dependencies]
+proptest = "1.6"

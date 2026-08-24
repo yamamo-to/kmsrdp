@@ -2596,6 +2596,7 @@ dependencies = [
 name = "rdpcore-cliprdr"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "rdpcore-pdu",
  "tokio",
 ]
@@ -2612,6 +2613,7 @@ dependencies = [
 name = "rdpcore-dvc"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "rdpcore-pdu",
 ]
 
@@ -2627,6 +2629,7 @@ dependencies = [
 name = "rdpcore-rdpdr"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "rdpcore-pdu",
  "tokio",
  "tracing",
@@ -2636,6 +2639,7 @@ dependencies = [
 name = "rdpcore-rdpeai"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "rdpcore-dvc",
  "rdpcore-pdu",
  "rdpcore-rdpsnd",
@@ -2649,6 +2653,7 @@ dependencies = [
  "libloading 0.9.0",
  "nvenc",
  "openh264",
+ "proptest",
  "rdpcore-dvc",
  "rdpcore-pdu",
  "thiserror 2.0.18",
@@ -2659,6 +2664,7 @@ dependencies = [
 name = "rdpcore-rdpsnd"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "rdpcore-pdu",
  "tokio",
 ]

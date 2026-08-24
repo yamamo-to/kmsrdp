@@ -507,4 +507,11 @@ mod tests {
         assert_eq!(negotiated[0].format_no, 1); // index into the client's list
         assert_eq!(negotiated[0].format, server[0]);
     }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_decode_client_message_does_not_panic(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
+            let _ = decode_client_message(&data);
+        }
+    }
 }
