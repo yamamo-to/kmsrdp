@@ -59,10 +59,7 @@ impl WavePublisher {
     /// Stores `wave` as the newest sample and wakes the subscriber.
     /// Returns `false` only when the subscriber has been dropped.
     pub fn publish(&self, wave: RdpsndServerMessage) -> bool {
-        match self.latest.lock() {
-            Ok(mut slot) => *slot = Some(wave),
-            Err(_) => return false,
-        }
+        *self.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(wave);
         match self.notify.try_send(()) {
             Ok(()) => true,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => true,
