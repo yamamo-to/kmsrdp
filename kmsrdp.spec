@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.56
+Version:        0.1.57
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,13 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Mon Aug 24 2026 kmsrdp contributors <noreply@example.com> - 0.1.57-1
+- Validate NvFBC's returned frame length instead of trusting it blindly
+- Fix stuck-key bug: autorepeat Presseds no longer inflate the shared
+  uinput hold refcount (X11 could retype a held key indefinitely)
+- Blank IME Unicode-injection scratch keycodes after use
+- Split large source files and add documentation (no behavior change)
+
 * Mon Aug 24 2026 kmsrdp contributors <noreply@example.com> - 0.1.56-1
 - Close remaining bulk-queue-full mid-sequence truncation gaps; bound
   send_all's wait so a hung client can't wedge the connection forever

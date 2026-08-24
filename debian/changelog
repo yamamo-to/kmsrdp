@@ -1,3 +1,18 @@
+kmsrdp (0.1.57) unstable; urgency=medium
+
+  * Validate NvFBC's returned frame length instead of trusting it blindly.
+  * Fix stuck-key bug: don't forward client autorepeat Presseds to the
+    shared uinput hold refcount, which could never reach zero and leave
+    a key physically "down" (X11 then retyping it indefinitely).
+  * Blank IME Unicode-injection scratch keycodes after use instead of
+    leaving stale text that could resurface on a future timing race.
+  * Split several large source files (rdpcore-connector, rdpcore-rdpdr,
+    rdpcore-rdpegfx, session_loop) and add documentation (client
+    interoperability matrix, rustdoc, QUALITY.md snapshot) - no behavior
+    change.
+
+ -- kmsrdp contributors <noreply@example.com>  Mon, 24 Aug 2026 16:00:00 +0900
+
 kmsrdp (0.1.56) unstable; urgency=medium
 
   * Close remaining bulk-queue-full mid-sequence truncation gaps (cliprdr,
