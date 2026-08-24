@@ -690,8 +690,14 @@ fn send_wave_frames(
     timestamp_ms: u32,
 ) {
     let channel_id = channel.channel_id();
-    let frames = channel
-        .encode_wave(pcm, timestamp_ms)
+    let encoded = channel.encode_wave(pcm, timestamp_ms);
+    if encoded.is_empty() {
+        // Nothing to send this tick (not negotiated yet, or throttled by
+        // should_skip_send). Leave the live slot alone - a prior wave may
+        // still be sitting there unread, and it's still valid audio.
+        return;
+    }
+    let frames = encoded
         .into_iter()
         .map(|bytes| Frame {
             channel: ChannelKey::Static(channel_id),

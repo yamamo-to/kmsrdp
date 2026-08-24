@@ -134,6 +134,11 @@ pub struct RdpsndChannel {
     outstanding: u8,
     last_send: Option<Instant>,
     sent_at_ms: [u32; 256],
+    /// Guards `sent_at_ms`: only a block we actually sent and haven't yet
+    /// confirmed may feed the RTT baseline. Without this, a confirm for a
+    /// block_no we never sent (or already confirmed) would read a stale
+    /// `sent_at_ms` entry and poison `best_confirm_rtt_ms`.
+    block_pending: [bool; 256],
     clock: Instant,
     best_confirm_rtt_ms: Option<u32>,
     last_confirm_rtt_ms: Option<u32>,
@@ -164,6 +169,7 @@ impl RdpsndChannel {
                 outstanding: 0,
                 last_send: None,
                 sent_at_ms: [0; 256],
+                block_pending: [false; 256],
                 clock: Instant::now(),
                 best_confirm_rtt_ms: None,
                 last_confirm_rtt_ms: None,
@@ -189,6 +195,13 @@ impl RdpsndChannel {
     }
 
     fn on_wave_confirm(&mut self, block_no: u8) {
+        if !self.block_pending[block_no as usize] {
+            // Confirm for a block we never sent, or already confirmed
+            // (stale/duplicate/out-of-order). Ignore it rather than
+            // trusting a stale sent_at_ms entry for the RTT baseline.
+            return;
+        }
+        self.block_pending[block_no as usize] = false;
         let rtt = self
             .now_ms()
             .saturating_sub(self.sent_at_ms[block_no as usize]);
@@ -222,6 +235,7 @@ impl RdpsndChannel {
 
     fn note_send(&mut self, block_no: u8) {
         self.sent_at_ms[block_no as usize] = self.now_ms();
+        self.block_pending[block_no as usize] = true;
         self.last_send = Some(Instant::now());
         self.outstanding = self.outstanding.saturating_add(1);
     }
