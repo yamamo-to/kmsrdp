@@ -90,8 +90,35 @@ impl Capturer {
 
         match crate::nvfbc::capture_bgrx() {
             Ok((width, height, grabbed)) => {
+                let stride = match check_nvfbc_frame_len(width, height, grabbed.len()) {
+                    Ok(stride) => stride,
+                    Err(expected_len) => {
+                        // NvFBC's ToSys grab is documented to return a
+                        // tightly packed buffer (see `nvfbc::capture_bgrx`'s
+                        // doc comment); we trust that contract for `stride`
+                        // since there's no independent pitch field to
+                        // cross-check it against. If a driver version or
+                        // config ever violates it, treating the mismatched
+                        // bytes as tightly-packed BGRX would misalign every
+                        // row after the first - fail loudly instead of
+                        // handing the encoder a sheared frame it has no way
+                        // to detect.
+                        tracing::warn!(
+                            "kmsrdp: NvFBC returned {} bytes for a {width}x{height} tightly-packed \
+                             BGRX frame (expected {expected_len}); treating as a capture failure",
+                            grabbed.len()
+                        );
+                        return Err(annotate_capture_error(
+                            io::Error::other(format!(
+                                "NvFBC frame size mismatch: got {} bytes, expected {expected_len} \
+                                 for {width}x{height} BGRX",
+                                grabbed.len()
+                            )),
+                            CapturePhase::Frame,
+                        ));
+                    }
+                };
                 self.note_backend("NvFBC");
-                let stride = width as usize * 4;
                 let (data, unchanged, dirty_rects) =
                     pixel_diff::take_pixels(&grabbed, stride, width, height, false, prev);
                 Ok(RawFrame {
@@ -183,6 +210,19 @@ pub(crate) fn annotate_capture_error(err: io::Error, phase: CapturePhase) -> io:
     io::Error::new(err.kind(), format!("{msg} (hint: {})", hints.join("; ")))
 }
 
+/// Checks that an NvFBC grab's byte length matches a tightly packed
+/// `width`x`height` BGRX8888 buffer. Returns the stride (`width * 4`) on a
+/// match, or the expected length on a mismatch.
+fn check_nvfbc_frame_len(width: u32, height: u32, len: usize) -> Result<usize, usize> {
+    let stride = width as usize * 4;
+    let expected_len = stride.saturating_mul(height as usize);
+    if len == expected_len {
+        Ok(stride)
+    } else {
+        Err(expected_len)
+    }
+}
+
 /// One-shot compatibility helper for demos and diagnostics. The production
 /// display loop owns one [`Capturer`] and reuses it instead.
 pub fn capture_raw_bgrx() -> io::Result<RawFrame> {
@@ -208,6 +248,30 @@ pub fn capture_frame() -> io::Result<image::RgbImage> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn check_nvfbc_frame_len_accepts_tightly_packed_bgrx() {
+        assert_eq!(
+            check_nvfbc_frame_len(1920, 1080, 1920 * 1080 * 4),
+            Ok(1920 * 4)
+        );
+        assert_eq!(check_nvfbc_frame_len(0, 0, 0), Ok(0));
+    }
+
+    #[test]
+    fn check_nvfbc_frame_len_rejects_short_or_padded_buffers() {
+        // Shorter than expected (e.g. a driver returning a partial frame).
+        assert_eq!(
+            check_nvfbc_frame_len(1920, 1080, 1920 * 1080 * 4 - 1),
+            Err(1920 * 1080 * 4)
+        );
+        // Longer than expected (e.g. a driver padding rows to some
+        // alignment instead of the documented tightly-packed layout).
+        assert_eq!(
+            check_nvfbc_frame_len(1920, 1080, 1920 * 1080 * 4 + 1),
+            Err(1920 * 1080 * 4)
+        );
+    }
 
     #[test]
     fn empty_or_all_display_mode_composites_all() {
