@@ -153,21 +153,26 @@ fn for_each_block(
 }
 
 /// Convert a BGRX32 framebuffer into planar I420, padding to `out_w`×`out_h`
-/// (both even; typically 16-aligned). Padding pixels are black.
-pub fn bgrx_to_i420(
+/// (both even; typically 16-aligned), writing into `out` instead of
+/// allocating - clears and reuses `out`'s existing capacity across calls so
+/// a caller with a persistent scratch buffer allocates only on the first
+/// call or a resolution change. Padding pixels are black.
+pub fn bgrx_to_i420_into(
     width: u16,
     height: u16,
     stride: usize,
     pixels: &[u8],
     out_w: u16,
     out_h: u16,
-) -> Result<Vec<u8>, EncoderError> {
+    out: &mut Vec<u8>,
+) -> Result<(), EncoderError> {
     let (w, h, ow, oh) = check_bgrx_geometry(width, height, stride, pixels, out_w, out_h)?;
 
     let y_size = ow * oh;
     let uv_w = ow / 2;
     let uv_size = uv_w * (oh / 2);
-    let mut out = vec![0u8; y_size + 2 * uv_size];
+    out.clear();
+    out.resize(y_size + 2 * uv_size, 0);
     let (y_plane, rest) = out.split_at_mut(y_size);
     let (u_plane, v_plane) = rest.split_at_mut(uv_size);
 
@@ -185,6 +190,21 @@ pub fn bgrx_to_i420(
         },
     );
 
+    Ok(())
+}
+
+/// Convert a BGRX32 framebuffer into planar I420, padding to `out_w`×`out_h`
+/// (both even; typically 16-aligned). Padding pixels are black.
+pub fn bgrx_to_i420(
+    width: u16,
+    height: u16,
+    stride: usize,
+    pixels: &[u8],
+    out_w: u16,
+    out_h: u16,
+) -> Result<Vec<u8>, EncoderError> {
+    let mut out = Vec::new();
+    bgrx_to_i420_into(width, height, stride, pixels, out_w, out_h, &mut out)?;
     Ok(out)
 }
 

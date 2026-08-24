@@ -6,7 +6,7 @@ use openh264::encoder::{
 };
 use openh264::formats::YUVSource;
 
-use crate::encoder::{EncodedAu, H264Encoder, align16, bgrx_to_i420};
+use crate::encoder::{EncodedAu, H264Encoder, align16, bgrx_to_i420_into};
 use crate::error::EncoderError;
 
 /// Thin [`YUVSource`] over a contiguous I420 buffer produced by [`bgrx_to_i420`].
@@ -50,6 +50,9 @@ pub struct OpenH264Encoder {
     qp: u8,
     /// Monotonic frame time for OpenH264 RC (must not stay at ZERO).
     next_ts_ms: u64,
+    /// Reused across `encode_bgrx` calls (see AGENTS.md's zero-allocation
+    /// hot-path rule) instead of allocating a fresh I420 buffer every frame.
+    i420_scratch: Vec<u8>,
 }
 
 impl OpenH264Encoder {
@@ -60,13 +63,24 @@ impl OpenH264Encoder {
             coded_h: 0,
             qp: 22,
             next_ts_ms: 0,
+            i420_scratch: Vec::new(),
         })
     }
 
-    fn ensure_encoder(&mut self, coded_w: u16, coded_h: u16) -> Result<&mut Encoder, EncoderError> {
-        if self.inner.is_none() || self.coded_w != coded_w || self.coded_h != coded_h {
+    /// Takes disjoint field borrows (rather than `&mut self`) so a caller
+    /// can hold an unrelated immutable borrow of `self.i420_scratch` (e.g.
+    /// an `I420Frame` built just before this call) across this call.
+    fn ensure_encoder<'a>(
+        inner: &'a mut Option<Encoder>,
+        coded_w: &mut u16,
+        coded_h: &mut u16,
+        next_ts_ms: &mut u64,
+        want_w: u16,
+        want_h: u16,
+    ) -> Result<&'a mut Encoder, EncoderError> {
+        if inner.is_none() || *coded_w != want_w || *coded_h != want_h {
             // Desktop bitrates: ~1.5 bpp/s at 30fps floor, min 2 Mbps.
-            let bps = (u32::from(coded_w) * u32::from(coded_h)).max(2_000_000);
+            let bps = (u32::from(want_w) * u32::from(want_h)).max(2_000_000);
             let config = EncoderConfig::new()
                 .max_frame_rate(FrameRate::from_hz(30.0))
                 .bitrate(BitRate::from_bps(bps))
@@ -79,12 +93,12 @@ impl OpenH264Encoder {
                 .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(30));
             let enc = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
                 .map_err(|e| EncoderError::InitFailed(format!("openh264 init: {e}")))?;
-            self.inner = Some(enc);
-            self.coded_w = coded_w;
-            self.coded_h = coded_h;
-            self.next_ts_ms = 0;
+            *inner = Some(enc);
+            *coded_w = want_w;
+            *coded_h = want_h;
+            *next_ts_ms = 0;
         }
-        self.inner
+        inner
             .as_mut()
             .ok_or_else(|| EncoderError::InitFailed("openh264 encoder missing".to_string()))
     }
@@ -104,17 +118,32 @@ impl H264Encoder for OpenH264Encoder {
         }
         let coded_w = align16(width).max(16);
         let coded_h = align16(height).max(16);
-        let i420 = bgrx_to_i420(width, height, stride, pixels, coded_w, coded_h)?;
+        bgrx_to_i420_into(
+            width,
+            height,
+            stride,
+            pixels,
+            coded_w,
+            coded_h,
+            &mut self.i420_scratch,
+        )?;
         let frame = I420Frame {
             width: usize::from(coded_w),
             height: usize::from(coded_h),
-            data: &i420,
+            data: &self.i420_scratch,
         };
 
         let ts_ms = self.next_ts_ms;
         self.next_ts_ms = self.next_ts_ms.saturating_add(33);
 
-        let enc = self.ensure_encoder(coded_w, coded_h)?;
+        let enc = Self::ensure_encoder(
+            &mut self.inner,
+            &mut self.coded_w,
+            &mut self.coded_h,
+            &mut self.next_ts_ms,
+            coded_w,
+            coded_h,
+        )?;
         if force_idr {
             enc.force_intra_frame();
         }
