@@ -23,6 +23,7 @@ mod handshake;
 mod input_handler;
 mod metrics;
 mod session_loop;
+mod slow_path;
 
 #[cfg(test)]
 pub(crate) use frame_pump::gfx_already_sent_frame;
