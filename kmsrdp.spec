@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.57
+Version:        0.1.58
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,12 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Tue Aug 25 2026 kmsrdp contributors <noreply@example.com> - 0.1.58-1
+- Keep RDPSND at the live capture edge (Pulse flush, 1x, newest 20 ms)
+- Gate Wave2 sends on measured client play-queue hold, not receive-acks
+- Read WaveConfirms during full-screen bitmap send so the unacked window
+  cannot grow while graphics blocks the session loop
+
 * Mon Aug 24 2026 kmsrdp contributors <noreply@example.com> - 0.1.57-1
 - Validate NvFBC's returned frame length instead of trusting it blindly
 - Fix stuck-key bug: autorepeat Presseds no longer inflate the shared

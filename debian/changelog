@@ -1,3 +1,12 @@
+kmsrdp (0.1.58) unstable; urgency=medium
+
+  * Keep RDPSND at the live capture edge (Pulse flush, 1x, newest 20 ms).
+  * Gate Wave2 sends on measured client play-queue hold, not receive-acks.
+  * Read WaveConfirms during full-screen bitmap send so the unacked window
+    cannot grow while graphics blocks the session loop.
+
+ -- kmsrdp contributors <noreply@example.com>  Tue, 25 Aug 2026 04:01:42 +0900
+
 kmsrdp (0.1.57) unstable; urgency=medium
 
   * Validate NvFBC's returned frame length instead of trusting it blindly.
