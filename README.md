@@ -40,7 +40,8 @@ VNC. The RDP stack lives in `crates/rdpcore-*` (no `ironrdp` dependency).
   requests it; persisted self-signed cert by default (`StateDirectory` or
   `KMSRDP_TLS_*`); configurable listen address (`KMSRDP_BIND`, default
   `127.0.0.1` / `KMSRDP_PORT`); NLA required by default
-  (`KMSRDP_REQUIRE_NLA=0` to allow TLS-only Client Info auth); one
+  (`KMSRDP_REQUIRE_NLA=0`, or the legacy alias `KMSRDP_FORCE_NLA`, to allow
+  TLS-only Client Info auth); one
   authenticated session by default (`KMSRDP_MAX_SESSIONS`); password from
   `KMSRDP_PASSWORD`, `KMSRDP_PASSWORD_FILE`, or systemd
   `LoadCredential=kmsrdp.password`; structured logs
@@ -86,7 +87,8 @@ framebuffer). It does **not** create a virtual desktop.
 
 **Tested:** Proxmox VM (VirtIO-GPU/QXL) via Guacamole and direct clients;
 NVIDIA/Xorg via NvFBC fallback; macOS Windows App (NSCodec). See module docs
-for NvFBC / GBM details.
+for NvFBC / GBM details. See `ARCHITECTURE.md` § Client Interoperability for
+what's been confirmed against which client and what hasn't.
 
 ## Quick start
 
