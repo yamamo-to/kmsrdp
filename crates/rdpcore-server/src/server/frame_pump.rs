@@ -36,13 +36,17 @@ pub async fn send_all_or_timeout(
     }
 }
 
-pub async fn send_outbound_bitmap(
+/// Encodes one Planar/NSCodec update to wire frames without sending.
+///
+/// Send via [`send_frames`] / [`spawn_send_frames`] so the session loop can
+/// keep reading WaveConfirms while a full-screen bulk burst waits for
+/// queue space.
+pub async fn encode_outbound_bitmap(
     bitmap: &BitmapUpdate,
-    frame_sender: &FrameSender,
     policy: &BitmapEncodePolicy,
     frame_id: &mut u32,
     metrics: &mut SessionBitmapMetrics,
-) -> Result<(), SessionError> {
+) -> Result<Vec<Frame>, SessionError> {
     // Planar/NSCodec encoding is CPU-bound and was previously run inline on
     // this connection's steady-state select! task, stalling input dispatch
     // and every other channel for the full encode duration on every frame
@@ -77,50 +81,85 @@ pub async fn send_outbound_bitmap(
         policy.max_request_size,
     );
 
-    for wire_frame in begin
+    Ok(begin
         .into_iter()
         .chain(batches.into_iter().flatten())
         .chain(end)
-    {
+        .map(|bytes| Frame {
+            channel: ChannelKey::Io,
+            priority: Priority::Bulk,
+            bytes,
+        })
+        .collect())
+}
+
+pub async fn send_frames(
+    frame_sender: &FrameSender,
+    frames: Vec<Frame>,
+) -> Result<(), SessionError> {
+    for frame in frames {
         // A momentarily full bulk queue must not truncate this update
         // partway through (e.g. dropping the tail rows of a full-screen
         // refresh) or tear down the session - wait for space instead
         // (bounded, so a genuinely hung client still gets reaped).
-        send_all_or_timeout(
-            frame_sender,
-            Frame {
-                channel: ChannelKey::Io,
-                priority: Priority::Bulk,
-                bytes: wire_frame,
-            },
-        )
-        .await?;
+        send_all_or_timeout(frame_sender, frame).await?;
     }
     Ok(())
 }
 
-/// Prefer GFX AVC420 when negotiated; otherwise Planar/NSCodec Fast-Path.
-/// GFX work is synchronous so `&DvcMux` is never held across an await.
+/// Sends already-encoded graphics off the session loop. Only one of these
+/// should be in flight per connection so BEGIN/tiles/END (or GFX) sequences
+/// stay ordered. The loop keeps polling `read_steady_state_frame` while
+/// this waits on [`send_all_or_timeout`].
+pub fn spawn_send_frames(
+    frame_sender: FrameSender,
+    frames: Vec<Frame>,
+) -> tokio::task::JoinHandle<Result<(), SessionError>> {
+    tokio::spawn(async move { send_frames(&frame_sender, frames).await })
+}
+
+/// Encodes Planar/NSCodec if GFX did not handle the frame, then starts at
+/// most one in-flight bulk send. If a send is already running, `bitmap` is
+/// kept as latest-wins instead of queueing a second burst.
 #[allow(clippy::too_many_arguments)]
-pub async fn send_outbound_frame(
+pub async fn encode_and_queue_bitmap(
+    bitmap: BitmapUpdate,
+    frame_sender: &FrameSender,
+    policy: &BitmapEncodePolicy,
+    frame_id: &mut u32,
+    metrics: &mut SessionBitmapMetrics,
+    bulk_send: &mut Option<tokio::task::JoinHandle<Result<(), SessionError>>>,
+    deferred_bitmap: &mut Option<BitmapUpdate>,
+    gfx_frames: Vec<Frame>,
+    gfx_handled: bool,
+) -> Result<(), SessionError> {
+    if bulk_send.is_some() {
+        *deferred_bitmap = Some(bitmap);
+        return Ok(());
+    }
+    let frames = if gfx_handled {
+        gfx_frames
+    } else {
+        let mut frames = gfx_frames;
+        frames.extend(encode_outbound_bitmap(&bitmap, policy, frame_id, metrics).await?);
+        frames
+    };
+    if frames.is_empty() {
+        return Ok(());
+    }
+    *bulk_send = Some(spawn_send_frames(frame_sender.clone(), frames));
+    Ok(())
+}
+
+pub async fn send_outbound_bitmap(
     bitmap: &BitmapUpdate,
     frame_sender: &FrameSender,
     policy: &BitmapEncodePolicy,
     frame_id: &mut u32,
-    latest_full: Option<&BitmapUpdate>,
     metrics: &mut SessionBitmapMetrics,
-    #[cfg(feature = "gfx")] gfx_attempt: Option<Result<bool, SessionError>>,
 ) -> Result<(), SessionError> {
-    #[cfg(feature = "gfx")]
-    if let Some(result) = gfx_attempt {
-        match result {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    let _ = latest_full;
-    send_outbound_bitmap(bitmap, frame_sender, policy, frame_id, metrics).await
+    let frames = encode_outbound_bitmap(bitmap, policy, frame_id, metrics).await?;
+    send_frames(frame_sender, frames).await
 }
 
 /// Outcome of attempting the GFX path for one frame - kept separate from
@@ -266,10 +305,7 @@ pub async fn send_gfx_frames(
     frame_sender: &FrameSender,
     frames: Vec<Frame>,
 ) -> Result<(), SessionError> {
-    for frame in frames {
-        send_all_or_timeout(frame_sender, frame).await?;
-    }
-    Ok(())
+    send_frames(frame_sender, frames).await
 }
 
 pub async fn flush_pending_resize_bitmap(
@@ -288,4 +324,61 @@ pub async fn flush_pending_resize_bitmap(
         return Ok(());
     };
     send_outbound_bitmap(&bitmap, frame_sender, policy, frame_id, metrics).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::display::{BitmapUpdate, PixelFormat};
+    use crate::encode::bitmap_encode_policy;
+    use std::num::{NonZeroU16, NonZeroUsize};
+
+    fn tiny_bitmap() -> BitmapUpdate {
+        let width = NonZeroU16::new(1).unwrap();
+        let height = NonZeroU16::new(1).unwrap();
+        let stride = NonZeroUsize::new(4).unwrap();
+        BitmapUpdate {
+            x: 0,
+            y: 0,
+            width,
+            height,
+            format: PixelFormat::BgrX32,
+            data: std::sync::Arc::from(vec![0u8; 4]),
+            stride,
+            src_x: 0,
+            src_y: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn encode_and_queue_keeps_latest_bitmap_when_a_send_is_in_flight() {
+        let (_writer, sender) = rdpcore_transport::ConnectionWriter::new(tokio::io::sink());
+        let mut bulk_send = Some(tokio::spawn(async {
+            std::future::pending::<Result<(), SessionError>>().await
+        }));
+        let mut deferred = None;
+        let mut frame_id = 1u32;
+        let mut metrics = SessionBitmapMetrics::default();
+        let policy = bitmap_encode_policy("test", None, 8192);
+
+        encode_and_queue_bitmap(
+            tiny_bitmap(),
+            &sender,
+            &policy,
+            &mut frame_id,
+            &mut metrics,
+            &mut bulk_send,
+            &mut deferred,
+            Vec::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(deferred.is_some(), "in-flight send must latest-wins defer");
+        assert_eq!(frame_id, 1, "deferred path must not consume a frame id");
+        if let Some(handle) = bulk_send.take() {
+            handle.abort();
+        }
+    }
 }

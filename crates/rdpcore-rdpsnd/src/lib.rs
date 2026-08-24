@@ -1,8 +1,33 @@
 //! MS-RDPEA audio-output virtual channel: PDU codec (`pdu`) plus the
 //! connection-scoped state machine (`RdpsndChannel`) and backend trait
-//! (`RdpsndServerHandler`) a server plugs an audio source into. Shaped
-//! close to a real implementation's own trait so an existing backend
-//! (e.g. kmsrdp's libpulse-based monitor capture) ports with import-path changes only.
+//! (`RdpsndServerHandler`) a server plugs an audio source into.
+//!
+//! # Live-edge model
+//!
+//! Remote desktop is not a media player. Video is latest-frame. Audio must
+//! match that contract on the *server*: capture publishes only the newest
+//! 20 ms, never faster than wall-clock 1×, never a catch-up burst after a
+//! stall. What the client already queued, the server cannot drop —
+//! mstsc's `CRdpWinAudioWaveoutPlayback` plays every sample and never
+//! skips (the protocol has timestamps; that client ignores them for
+//! catch-up). Skipping sends for seconds to "drain" that FIFO underruns,
+//! the client re-prerolls, and delay returns. That is not a control loop.
+//!
+//! WaveConfirm is the spec's play-queue meter only when the client
+//! confirms *after emit*. mstsc often confirms on receive (wall RTT
+//! 0–5 ms); those acks do not measure the FIFO. FreeRDP sends a second
+//! confirm with render latency — we accept that duplicate and use
+//! `wTimeStamp` when it is a plausible hold time.
+//!
+//! Send policy is therefore exactly:
+//! 1. At most [`RdpsndChannel::MAX_UNACKED_BLOCKS`] unacked Wave PDUs
+//!    (80 ms of in-flight). Spec clients that confirm after play: this
+//!    *is* the jitter buffer. Receive-ack clients: the window never
+//!    fills; we do not invent extra skipping.
+//! 2. Playback-shaped confirms (RTT or client `wTimeStamp` ≥ one chunk)
+//!    measure the play FIFO. Receive-acks (0–5 ms) must not overwrite that
+//!    measurement. While estimated hold exceeds 80 ms we stop sending so
+//!    the FIFO plays down at 1×; capture stays latest-wins so resume is live.
 
 pub mod pdu;
 
@@ -126,7 +151,6 @@ pub struct RdpsndChannel {
     /// when this is at least [`pdu::VERSION_V8`].
     client_version: u16,
     block_no: u8,
-    last_send: Option<Instant>,
     sent_at_ms: [u32; 256],
     /// Guards `sent_at_ms`: only a block we actually sent and haven't yet
     /// confirmed may feed the RTT baseline. Without this, a confirm for a
@@ -139,12 +163,38 @@ pub struct RdpsndChannel {
     clock: Instant,
     best_confirm_rtt_ms: Option<u32>,
     last_confirm_rtt_ms: Option<u32>,
-    /// Set once a WaveConfirm for a block we actually sent has arrived.
-    confirming_client: bool,
-    /// Clients that never WaveConfirm: after [`Self::CONFIRM_STALL_MS`]
-    /// send open-loop (capture-side pacing still caps to 1x). Never set
-    /// for [`Self::confirming_client`].
-    open_loop: bool,
+    /// Low 16 bits of the Wave `wTimeStamp` we put on the wire, so a
+    /// confirm's `wTimeStamp` (spec: original + client-side delay) can
+    /// be turned back into a hold time.
+    sent_wtimestamp: [u16; 256],
+    receive_ack_count: u32,
+    /// Last playback-shaped hold (confirm RTT or client timestamp delay).
+    /// Receive-acks do not clear this; they would hide a 1.7 s FIFO behind
+    /// `last=6` and we would keep filling it.
+    playback_hold_ms: Option<u32>,
+    hold_at_ms: u32,
+    sent_ms_at_hold: u32,
+    total_sent_ms: u32,
+}
+
+/// Snapshot of the unacked Wave window. `last_confirm_rtt_ms` is wall
+/// time from send to the client's "finished emitting" confirm — for
+/// mstsc that is play-queue depth plus network, not capture latency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayQueueStats {
+    pub pending_blocks: u8,
+    pub last_confirm_rtt_ms: Option<u32>,
+    pub best_confirm_rtt_ms: Option<u32>,
+    pub ready: bool,
+    pub rtt_behind: bool,
+    /// Confirms faster than one chunk (`< MIN_PLAYBACK_RTT_MS`). High
+    /// means the client is confirm-on-receive; the unacked window will
+    /// not bound its play FIFO.
+    pub receive_ack_count: u32,
+    /// Play FIFO estimated from the last playback-shaped confirm, plus
+    /// PCM sent since then, minus wall time (1× play). This is what
+    /// actually gates sending.
+    pub estimated_hold_ms: u32,
 }
 
 impl RdpsndChannel {
@@ -169,14 +219,17 @@ impl RdpsndChannel {
                 negotiated: None,
                 client_version: 0,
                 block_no: 0,
-                last_send: None,
                 sent_at_ms: [0; 256],
                 block_pending: [false; 256],
                 clock: Instant::now(),
                 best_confirm_rtt_ms: None,
                 last_confirm_rtt_ms: None,
-                confirming_client: false,
-                open_loop: false,
+                sent_wtimestamp: [0; 256],
+                receive_ack_count: 0,
+                playback_hold_ms: None,
+                hold_at_ms: 0,
+                sent_ms_at_hold: 0,
+                total_sent_ms: 0,
             },
             initial,
         )
@@ -186,13 +239,34 @@ impl RdpsndChannel {
         self.channel_id
     }
 
+    pub fn play_queue_stats(&self) -> PlayQueueStats {
+        PlayQueueStats {
+            pending_blocks: self.pending_count(),
+            last_confirm_rtt_ms: self.last_confirm_rtt_ms,
+            best_confirm_rtt_ms: self.best_confirm_rtt_ms,
+            ready: matches!(self.state, State::Ready),
+            rtt_behind: self.confirm_rtt_is_behind(),
+            receive_ack_count: self.receive_ack_count,
+            estimated_hold_ms: self.estimated_hold_ms(),
+        }
+    }
+
     /// Spec: confirm after the client has *finished emitting* the sample.
     /// Four unacked 20 ms blocks is 80 ms of play-queue — enough jitter,
     /// not enough to accumulate seconds of lag. xrdp uses the same
     /// confirm-RTT vs best-RTT idea (they drop when RTT is 250 ms worse).
-    const MAX_UNACKED_BLOCKS: u8 = 4;
-    const CONFIRM_SLACK_MS: u32 = 80;
-    const CONFIRM_STALL_MS: u32 = 500;
+    pub const MAX_UNACKED_BLOCKS: u8 = 4;
+    /// Confirms faster than one chunk are "I got the PDU", not "I finished
+    /// playing it". A same-millisecond LAN ack sets `best=0`, and a later
+    /// 180 ms playback confirm then looks 80 ms "behind" forever so we
+    /// stop sending (the capture log stays live while `skipped≈50/s`).
+    const MIN_PLAYBACK_RTT_MS: u32 = 40;
+    /// Client `wTimeStamp` wrapping subtraction above this is almost
+    /// certainly a test fixture or an unrelated tick, not a hold time.
+    const MAX_PLAUSIBLE_HOLD_MS: u32 = 5_000;
+    /// Target client play-queue. Above this we stop sending so it plays
+    /// down; capture remains latest-wins.
+    const TARGET_HOLD_MS: u32 = 80;
 
     fn now_ms(&self) -> u32 {
         self.clock.elapsed().as_millis() as u32
@@ -205,70 +279,93 @@ impl RdpsndChannel {
             .count() as u8
     }
 
-    fn confirm_rtt_is_behind(&self) -> bool {
-        matches!(
-            (self.best_confirm_rtt_ms, self.last_confirm_rtt_ms),
-            (Some(best), Some(last)) if last > best.saturating_add(Self::CONFIRM_SLACK_MS)
-        )
+    fn pcm_duration_ms(&self, bytes: usize) -> u32 {
+        let Some(negotiated) = self.negotiated.as_ref() else {
+            return 0;
+        };
+        let bps = u64::from(negotiated.format.n_avg_bytes_per_sec.max(1));
+        (bytes as u64 * 1000 / bps) as u32
     }
 
-    fn on_wave_confirm(&mut self, block_no: u8) {
-        if !self.block_pending[block_no as usize] {
-            // Confirm for a block we never sent, or already confirmed
-            // (stale/duplicate/out-of-order). Ignore it rather than
-            // trusting a stale sent_at_ms entry for the RTT baseline.
-            return;
-        }
-        self.block_pending[block_no as usize] = false;
-        self.confirming_client = true;
-        self.open_loop = false;
-        let rtt = self
-            .now_ms()
-            .saturating_sub(self.sent_at_ms[block_no as usize]);
+    fn estimated_hold_ms(&self) -> u32 {
+        let Some(hold) = self.playback_hold_ms else {
+            return 0;
+        };
+        let sent = self.total_sent_ms.saturating_sub(self.sent_ms_at_hold);
+        let wall = self.now_ms().saturating_sub(self.hold_at_ms);
+        hold.saturating_add(sent).saturating_sub(wall)
+    }
+
+    fn confirm_rtt_is_behind(&self) -> bool {
+        self.estimated_hold_ms() > Self::TARGET_HOLD_MS
+    }
+
+    fn note_receive_ack(&mut self, rtt: u32) {
         self.last_confirm_rtt_ms = Some(rtt);
+        self.receive_ack_count = self.receive_ack_count.saturating_add(1);
+        if self.best_confirm_rtt_ms.is_none() {
+            self.best_confirm_rtt_ms = Some(rtt);
+        }
+    }
+
+    fn note_playback_hold(&mut self, rtt: u32) {
+        self.last_confirm_rtt_ms = Some(rtt);
+        self.playback_hold_ms = Some(rtt);
+        self.hold_at_ms = self.now_ms();
+        self.sent_ms_at_hold = self.total_sent_ms;
         self.best_confirm_rtt_ms = Some(match self.best_confirm_rtt_ms {
+            Some(best) if best < Self::MIN_PLAYBACK_RTT_MS => rtt,
             Some(best) => best.min(rtt),
             None => rtt,
         });
     }
 
-    fn should_skip_send(&mut self) -> bool {
-        let pending = self.pending_count();
-        if self.confirming_client {
-            // Never invent a free window. Zeroing an independent counter
-            // (the old CONFIRM_STALL_MS path) let WaveConfirms that sat
-            // unread — typically while the session loop blocked in
-            // `send_all` on a full graphics queue — decrement *new*
-            // blocks. Each such stall added ~80 ms to mstsc's FIFO, and
-            // 1x pacing meant that lag never drained.
-            if pending >= Self::MAX_UNACKED_BLOCKS {
-                return true;
+    fn on_wave_confirm(&mut self, block_no: u8, timestamp: u16) {
+        let idx = block_no as usize;
+        let hold_from_ts = u32::from(timestamp.wrapping_sub(self.sent_wtimestamp[idx]));
+        let plausible_hold = (hold_from_ts <= Self::MAX_PLAUSIBLE_HOLD_MS).then_some(hold_from_ts);
+
+        if self.block_pending[idx] {
+            self.block_pending[idx] = false;
+            let wall_rtt = self.now_ms().saturating_sub(self.sent_at_ms[idx]);
+            let rtt = match plausible_hold {
+                Some(hold) => wall_rtt.max(hold),
+                None => wall_rtt,
+            };
+            if rtt >= Self::MIN_PLAYBACK_RTT_MS {
+                self.note_playback_hold(rtt);
+            } else {
+                self.note_receive_ack(rtt);
             }
-            return self.confirm_rtt_is_behind();
+            return;
         }
-        if pending >= Self::MAX_UNACKED_BLOCKS {
-            if self
-                .last_send
-                .is_some_and(|t| t.elapsed().as_millis() as u32 > Self::CONFIRM_STALL_MS)
-            {
-                // No WaveConfirm at all (old client). Capture pacing still
-                // caps to 1x. Do not clear `block_pending`: a late confirm
-                // must not look like a drained window.
-                self.open_loop = true;
-                return false;
-            }
-            return true;
+        // Duplicate confirm: FreeRDP/mstsc render latency in wTimeStamp.
+        if let Some(hold) = plausible_hold
+            && hold >= Self::MIN_PLAYBACK_RTT_MS
+        {
+            self.note_playback_hold(hold);
         }
-        if self.open_loop {
-            return false;
-        }
-        self.confirm_rtt_is_behind()
     }
 
-    fn note_send(&mut self, block_no: u8) {
+    fn should_skip_send(&self) -> bool {
+        if self.pending_count() >= Self::MAX_UNACKED_BLOCKS {
+            return true;
+        }
+        // Measured play FIFO above the jitter target. Do not add more PCM;
+        // estimated hold decays at 1× wall while we skip. pending=0 is
+        // fine — we do not need a new confirm to unstick (that exception
+        // used to keep filling a 1.7 s FIFO because receive-acks reset
+        // last_rtt to 0–6 ms every chunk).
+        self.estimated_hold_ms() > Self::TARGET_HOLD_MS
+    }
+
+    fn note_send(&mut self, block_no: u8, timestamp_ms: u32, pcm_bytes: usize) {
         self.sent_at_ms[block_no as usize] = self.now_ms();
+        self.sent_wtimestamp[block_no as usize] = timestamp_ms as u16;
         self.block_pending[block_no as usize] = true;
-        self.last_send = Some(Instant::now());
+        self.total_sent_ms = self
+            .total_sent_ms
+            .saturating_add(self.pcm_duration_ms(pcm_bytes));
     }
 
     fn training_frames(&self) -> Vec<Vec<u8>> {
@@ -317,8 +414,14 @@ impl RdpsndChannel {
                 self.state = State::Ready;
                 Ok(Vec::new())
             }
-            (pdu::ClientMessage::WaveConfirm { block_no, .. }, _) => {
-                self.on_wave_confirm(block_no);
+            (
+                pdu::ClientMessage::WaveConfirm {
+                    block_no,
+                    timestamp,
+                },
+                _,
+            ) => {
+                self.on_wave_confirm(block_no, timestamp);
                 Ok(Vec::new())
             }
             // Late Quality Mode or anything arriving out of the expected
@@ -335,7 +438,7 @@ impl RdpsndChannel {
     /// legacy WaveInfo + Wave pair. A `pcm` larger than one PDU can carry
     /// (its `BodySize` is a `u16`) is split across multiple PDUs rather
     /// than silently truncating the wire length field.
-    pub fn encode_wave(&mut self, pcm: Vec<u8>, timestamp_ms: u32) -> Vec<Vec<u8>> {
+    pub fn encode_wave(&mut self, pcm: Vec<u8>, _capture_timestamp_ms: u32) -> Vec<Vec<u8>> {
         if !matches!(self.state, State::Ready) {
             return Vec::new();
         }
@@ -345,6 +448,9 @@ impl RdpsndChannel {
         let Some(format_no) = self.negotiated.as_ref().map(|n| n.format_no) else {
             return Vec::new();
         };
+        // MS-RDPEA: wTimeStamp SHOULD be when this PDU is built (GetTickCount),
+        // not elapsed-from-capture-zero which mstsc can treat as a preroll clock.
+        let timestamp_ms = self.now_ms();
         if self.client_version >= pdu::VERSION_V8 {
             self.encode_wave2_frames(pcm, format_no, timestamp_ms)
         } else {
@@ -370,7 +476,7 @@ impl RdpsndChannel {
             if self.should_skip_send() {
                 break;
             }
-            self.note_send(self.block_no);
+            self.note_send(self.block_no, timestamp_ms, chunk.len());
             let body = pdu::encode_wave2(format_no, self.block_no, timestamp_ms, chunk);
             self.block_no = self.block_no.wrapping_add(1);
             out.extend(wrap_indication(self.user_channel_id, self.channel_id, body));
@@ -406,7 +512,7 @@ impl RdpsndChannel {
             } else {
                 chunk
             };
-            self.note_send(self.block_no);
+            self.note_send(self.block_no, timestamp_ms, chunk.len());
             let info = pdu::encode_wave_info(format_no, self.block_no, ts16, chunk);
             let rest = pdu::encode_wave_rest(chunk);
             self.block_no = self.block_no.wrapping_add(1);
@@ -604,16 +710,249 @@ mod tests {
         );
     }
 
-    fn wave_confirm_payload(block_no: u8) -> Vec<u8> {
+    fn wave_confirm_payload_with_ts(block_no: u8, timestamp: u16) -> Vec<u8> {
         use rdpcore_pdu::cursor::WriteBuf;
         let mut wave_confirm = Vec::new();
         wave_confirm.write_u8(pdu::SNDC_WAVECONFIRM);
         wave_confirm.write_u8(0);
         wave_confirm.write_u16_le(4);
-        wave_confirm.write_u16_le(0);
+        wave_confirm.write_u16_le(timestamp);
         wave_confirm.write_u8(block_no);
         wave_confirm.write_u8(0);
         as_single_incoming_chunk(&wave_confirm)
+    }
+
+    fn wave_confirm_payload(block_no: u8) -> Vec<u8> {
+        wave_confirm_payload_with_ts(block_no, 0)
+    }
+
+    #[test]
+    fn play_queue_stats_tracks_pending_and_confirm_rtt() {
+        let formats = vec![pdu::AudioFormat::pcm(2, 48000, 16)];
+        let handler = Box::new(FakeHandler {
+            formats: formats.clone(),
+            ..Default::default()
+        });
+        let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
+        complete_v8_negotiation(&mut channel, &formats);
+        assert_eq!(channel.play_queue_stats().pending_blocks, 0);
+        assert!(!channel.encode_wave(vec![0x11; 64], 0).is_empty());
+        let stats = channel.play_queue_stats();
+        assert_eq!(stats.pending_blocks, 1);
+        assert!(stats.ready);
+        assert!(stats.last_confirm_rtt_ms.is_none());
+        assert!(
+            channel
+                .on_channel_data(&wave_confirm_payload(0))
+                .unwrap()
+                .is_empty()
+        );
+        let stats = channel.play_queue_stats();
+        assert_eq!(stats.pending_blocks, 0);
+        assert!(stats.last_confirm_rtt_ms.is_some());
+        assert!(!stats.rtt_behind);
+    }
+
+    #[test]
+    fn same_ms_confirm_must_not_freeze_sends_after_a_slow_confirm() {
+        // Production logs: best=0 (LAN ack in the same millisecond) then
+        // last=182 (playback-timed confirm) → skipped≈50/s forever.
+        let formats = vec![pdu::AudioFormat::pcm(2, 48000, 16)];
+        let handler = Box::new(FakeHandler {
+            formats: formats.clone(),
+            ..Default::default()
+        });
+        let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
+        complete_v8_negotiation(&mut channel, &formats);
+
+        assert!(!channel.encode_wave(vec![0x11; 64], 0).is_empty());
+        assert!(
+            channel
+                .on_channel_data(&wave_confirm_payload(0))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!channel.encode_wave(vec![0x11; 64], 0).is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(180));
+        assert!(
+            channel
+                .on_channel_data(&wave_confirm_payload(1))
+                .unwrap()
+                .is_empty()
+        );
+        let stats = channel.play_queue_stats();
+        assert!(
+            stats.last_confirm_rtt_ms.unwrap_or(0) >= 150,
+            "slow confirm must be visible in last RTT, got {stats:?}"
+        );
+        assert!(
+            stats.estimated_hold_ms >= 150,
+            "playback confirm must set hold, got {stats:?}"
+        );
+        assert!(
+            channel.encode_wave(vec![0x22; 64], 0).is_empty(),
+            "hold above 80 ms must pause sending: {stats:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert!(
+            !channel.encode_wave(vec![0x33; 64], 0).is_empty(),
+            "hold must decay at 1× while we skip, then send live"
+        );
+    }
+
+    #[test]
+    fn confirm_on_receive_does_not_invent_a_drain() {
+        // mstsc confirms in 0–5 ms. That is not a play-queue meter, so
+        // a streak of receive-acks must not stop the live 1× send.
+        let formats = vec![pdu::AudioFormat::pcm(2, 48000, 16)];
+        let handler = Box::new(FakeHandler {
+            formats: formats.clone(),
+            ..Default::default()
+        });
+        let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
+        complete_v8_negotiation(&mut channel, &formats);
+
+        for block in 0..8u8 {
+            assert!(!channel.encode_wave(vec![0x11; 64], 0).is_empty());
+            assert!(
+                channel
+                    .on_channel_data(&wave_confirm_payload(block))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let stats = channel.play_queue_stats();
+        assert!(
+            stats.receive_ack_count >= 8,
+            "instant confirms must count as receive-acks: {stats:?}"
+        );
+        assert!(
+            !channel.encode_wave(vec![0x22; 64], 0).is_empty(),
+            "receive-ack clients must keep sending the live edge"
+        );
+    }
+
+    #[test]
+    fn second_wave_confirm_can_report_render_hold() {
+        // FreeRDP: first confirm on receive, second with wTimeStamp += latency.
+        let formats = vec![pdu::AudioFormat::pcm(2, 48000, 16)];
+        let handler = Box::new(FakeHandler {
+            formats: formats.clone(),
+            ..Default::default()
+        });
+        let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
+        complete_v8_negotiation(&mut channel, &formats);
+
+        assert!(!channel.encode_wave(vec![0x11; 64], 0).is_empty());
+        assert!(
+            channel
+                .on_channel_data(&wave_confirm_payload(0))
+                .unwrap()
+                .is_empty()
+        );
+        let sent_ts = channel.sent_wtimestamp[0];
+        let render_ts = sent_ts.wrapping_add(120);
+        assert!(
+            channel
+                .on_channel_data(&wave_confirm_payload_with_ts(0, render_ts))
+                .unwrap()
+                .is_empty()
+        );
+        let stats = channel.play_queue_stats();
+        assert_eq!(stats.pending_blocks, 0);
+        assert!(
+            stats.last_confirm_rtt_ms.unwrap_or(0) >= 120,
+            "render confirm must become last RTT, got {stats:?}"
+        );
+        assert!(
+            stats.estimated_hold_ms >= 120,
+            "render confirm must set estimated hold, got {stats:?}"
+        );
+    }
+
+    #[test]
+    fn receive_acks_must_not_clear_playback_hold() {
+        // Production: last=1672 then last=6 receive_ack_count+=47 — the
+        // 1.7 s FIFO was overwritten by confirm-on-receive and we kept
+        // sending 1× into it.
+        let formats = vec![pdu::AudioFormat::pcm(2, 48000, 16)];
+        let handler = Box::new(FakeHandler {
+            formats: formats.clone(),
+            ..Default::default()
+        });
+        let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
+        complete_v8_negotiation(&mut channel, &formats);
+
+        assert!(!channel.encode_wave(vec![0x11; 64], 0).is_empty());
+        assert!(
+            channel
+                .on_channel_data(&wave_confirm_payload(0))
+                .unwrap()
+                .is_empty()
+        );
+        let sent_ts = channel.sent_wtimestamp[0];
+        assert!(
+            channel
+                .on_channel_data(&wave_confirm_payload_with_ts(0, sent_ts.wrapping_add(1700)))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(channel.play_queue_stats().estimated_hold_ms >= 1600);
+        assert!(
+            channel.encode_wave(vec![0x22; 64], 0).is_empty(),
+            "1.7 s hold must skip"
+        );
+        // Receive-ack on the already-confirmed block must not clear hold.
+        assert!(
+            channel
+                .on_channel_data(&wave_confirm_payload(0))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            channel.play_queue_stats().estimated_hold_ms > 80,
+            "receive-ack must not erase playback hold: {:?}",
+            channel.play_queue_stats()
+        );
+        assert!(channel.encode_wave(vec![0x44; 64], 0).is_empty());
+    }
+
+    #[test]
+    fn playback_hold_decays_without_a_new_confirm() {
+        let formats = vec![pdu::AudioFormat::pcm(2, 48000, 16)];
+        let handler = Box::new(FakeHandler {
+            formats: formats.clone(),
+            ..Default::default()
+        });
+        let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
+        complete_v8_negotiation(&mut channel, &formats);
+
+        assert!(!channel.encode_wave(vec![0x11; 64], 0).is_empty());
+        assert!(
+            channel
+                .on_channel_data(&wave_confirm_payload(0))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!channel.encode_wave(vec![0x11; 64], 0).is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            channel
+                .on_channel_data(&wave_confirm_payload(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(channel.play_queue_stats().rtt_behind);
+        assert_eq!(channel.play_queue_stats().pending_blocks, 0);
+        assert!(
+            channel.encode_wave(vec![0x22; 64], 0).is_empty(),
+            "measured hold above target must skip even with an empty window"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !channel.encode_wave(vec![0x33; 64], 0).is_empty(),
+            "hold decaying at 1× must resume live sends without a new confirm"
+        );
     }
 
     #[test]
@@ -704,9 +1043,7 @@ mod tests {
             "window must be full before the stall"
         );
 
-        std::thread::sleep(std::time::Duration::from_millis(
-            u64::from(RdpsndChannel::CONFIRM_STALL_MS) + 50,
-        ));
+        std::thread::sleep(std::time::Duration::from_millis(550));
         assert!(
             channel.encode_wave(vec![0x22; 64], 1).is_empty(),
             "a confirming client must not get a free window after a stall"
@@ -715,6 +1052,29 @@ mod tests {
             channel.pending_count(),
             RdpsndChannel::MAX_UNACKED_BLOCKS,
             "stall must not drop in-flight blocks from the pending set"
+        );
+    }
+
+    #[test]
+    fn missing_wave_confirms_must_not_open_loop_after_a_stall() {
+        // Before the first confirm is read (session loop blocked in
+        // send_all on the initial full-screen refresh), the old path
+        // switched to open-loop after 500 ms and filled mstsc's FIFO.
+        let formats = vec![pdu::AudioFormat::pcm(2, 48000, 16)];
+        let handler = Box::new(FakeHandler {
+            formats: formats.clone(),
+            ..Default::default()
+        });
+        let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
+        complete_v8_negotiation(&mut channel, &formats);
+
+        for _ in 0..usize::from(RdpsndChannel::MAX_UNACKED_BLOCKS) {
+            assert!(!channel.encode_wave(vec![0x11; 64], 0).is_empty());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(550));
+        assert!(
+            channel.encode_wave(vec![0x22; 64], 1).is_empty(),
+            "no confirms at all must still keep the 80 ms window"
         );
     }
 

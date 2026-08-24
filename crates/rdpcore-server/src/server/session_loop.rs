@@ -15,9 +15,7 @@ use rdpcore_rdpegfx::{GfxSession, select_h264_encoder};
 use rdpcore_rdpsnd::{RdpsndChannel, RdpsndServerMessage, SoundServerFactory, wave_channel};
 use rdpcore_transport::{ChannelKey, ConnectionWriter, Frame, Priority};
 use tokio::io::{AsyncRead, AsyncWrite};
-#[cfg(any(feature = "gfx", feature = "dvc-echo"))]
-use tracing::info;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::display::{BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay};
 use crate::encode::{
@@ -31,7 +29,9 @@ use crate::transport::{SteadyStateFrame, read_steady_state_frame};
 use super::frame_pump::{
     apply_gfx_encode_outcome, build_gfx_frames, send_gfx_frames, try_encode_gfx_frame,
 };
-use super::frame_pump::{flush_pending_resize_bitmap, send_all_or_timeout, send_outbound_frame};
+use super::frame_pump::{
+    encode_and_queue_bitmap, flush_pending_resize_bitmap, send_all_or_timeout,
+};
 use super::input_handler::dispatch_input_event;
 use super::metrics::SessionBitmapMetrics;
 use super::slow_path::handle_slow_path_frame;
@@ -122,16 +122,17 @@ where
     };
 
     // Wave chunks are pumped by a dedicated task rather than the
-    // steady-state loop below: GFX/bitmap encode there is necessarily
-    // synchronous (see `try_encode_gfx_frame`'s doc comment), and a
-    // select!-branch-only audio path would stall for the full encode
-    // duration every time one runs. Locking `rdpsnd` from here never
+    // steady-state loop below: GFX/bitmap *encode* there is necessarily
+    // awaited on this task (see `try_encode_gfx_frame`'s doc comment),
+    // but the subsequent `send_all` of a full-screen burst is spawned so
+    // WaveConfirm can still be read. Locking `rdpsnd` from here never
     // contends with the loop below - the loop only ever touches it for
     // `on_channel_data`, briefly and never across an await.
     let _audio_task = match (rdpsnd.clone(), rdpsnd_audio_rx.take()) {
         (Some(channel), Some(mut audio_rx)) => {
             let sender = frame_sender.clone();
             Some(AbortOnDrop(tokio::spawn(async move {
+                let mut diag = PlayQueueDiag::default();
                 while let Some(RdpsndServerMessage::Wave(pcm, timestamp_ms)) = audio_rx.recv().await
                 {
                     let mut channel = channel.lock().await;
@@ -141,7 +142,7 @@ where
                     // would otherwise stop dead with no log line at all.
                     if let Err(panic) =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            send_wave_frames(&mut channel, &sender, pcm, timestamp_ms);
+                            send_wave_frames(&mut channel, &sender, pcm, timestamp_ms, &mut diag);
                         }))
                     {
                         warn!("rdpsnd: audio task panicked in send_wave_frames: {panic:?}");
@@ -368,8 +369,16 @@ where
     let mut pending_after_resize: Option<BitmapUpdate> = None;
     #[cfg(feature = "gfx")]
     let mut last_gfx_data: Option<std::sync::Arc<[u8]>> = None;
+    // In-flight bulk graphics `send_all`. Kept off this select! so
+    // WaveConfirm is still read during the first full-screen refresh
+    // (otherwise the 80 ms unacked window fills and mstsc's FIFO holds
+    // those samples until confirms arrive, which looks like ~1 s of
+    // A/V offset from connect). Abort on session end so the spawned
+    // task cannot keep the writer alive after we return.
+    let mut bulk_send = AbortHandleOnDrop::default();
 
     loop {
+        let mut bitmap_to_pump: Option<BitmapUpdate> = None;
         tokio::select! {
             biased;
             frame = read_steady_state_frame(&mut read_half) => {
@@ -517,48 +526,21 @@ where
                     }
                 }
             }
+            join = async { bulk_send.0.as_mut().unwrap().await }, if bulk_send.0.is_some() => {
+                bulk_send.0 = None;
+                match join {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return finish_session(Err(e)),
+                    Err(_) => return finish_session(Err(SessionError::EncodeJoin)),
+                }
+                if display_updates_allowed && bitmap_gate_open {
+                    bitmap_to_pump = deferred_bitmap.take();
+                }
+            }
             _ = &mut bitmap_gate, if !bitmap_gate_open => {
                 bitmap_gate_open = true;
-                if display_updates_allowed
-                    && let Some(bitmap) = deferred_bitmap.take()
-                {
-                    let full = updates.latest_full_frame();
-                    #[cfg(feature = "gfx")]
-                    let gfx_attempt = Some(
-                        match try_encode_gfx_frame(
-                            gfx_session.as_ref(),
-                            &mut last_gfx_data,
-                            full.as_ref(),
-                            &bitmap,
-                        )
-                        .await
-                        {
-                            Ok(outcome) => match apply_gfx_encode_outcome(outcome, dvc.as_ref()) {
-                                Ok((handled, frames)) => {
-                                    match send_gfx_frames(&frame_sender, frames).await {
-                                        Ok(()) => Ok(handled),
-                                        Err(e) => Err(e),
-                                    }
-                                }
-                                Err(e) => Err(e),
-                            },
-                            Err(e) => Err(e),
-                        },
-                    );
-                    if let Err(e) = send_outbound_frame(
-                        &bitmap,
-                        &frame_sender,
-                        &bitmap_policy,
-                        &mut frame_id,
-                        full.as_ref(),
-                        &mut metrics,
-                        #[cfg(feature = "gfx")]
-                        gfx_attempt,
-                    )
-                    .await
-                    {
-                        return finish_session(Err(e));
-                    }
+                if display_updates_allowed {
+                    bitmap_to_pump = deferred_bitmap.take();
                 }
             }
             update = updates.next_update() => {
@@ -577,43 +559,7 @@ where
                     }
                     Ok(Some(DisplayUpdate::Bitmap(_))) if !display_updates_allowed => {}
                     Ok(Some(DisplayUpdate::Bitmap(bitmap))) => {
-                        let full = updates.latest_full_frame();
-                        #[cfg(feature = "gfx")]
-                        let gfx_attempt = Some(
-                            match try_encode_gfx_frame(
-                                gfx_session.as_ref(),
-                                &mut last_gfx_data,
-                                full.as_ref(),
-                                &bitmap,
-                            )
-                            .await
-                            {
-                                Ok(outcome) => match apply_gfx_encode_outcome(outcome, dvc.as_ref()) {
-                                    Ok((handled, frames)) => {
-                                        match send_gfx_frames(&frame_sender, frames).await {
-                                            Ok(()) => Ok(handled),
-                                            Err(e) => Err(e),
-                                        }
-                                    }
-                                    Err(e) => Err(e),
-                                },
-                                Err(e) => Err(e),
-                            },
-                        );
-                        if let Err(e) = send_outbound_frame(
-                            &bitmap,
-                            &frame_sender,
-                            &bitmap_policy,
-                            &mut frame_id,
-                            full.as_ref(),
-                            &mut metrics,
-                            #[cfg(feature = "gfx")]
-                            gfx_attempt,
-                        )
-                        .await
-                        {
-                            return finish_session(Err(e));
-                        }
+                        bitmap_to_pump = Some(bitmap);
                     }
                     Ok(Some(DisplayUpdate::Resized(size))) if resizing => {
                         debug!("dropping resize to {}x{}: a previous resize is still in flight", size.width, size.height);
@@ -638,6 +584,7 @@ where
                                 resizing = true;
                                 resize_desktop = size;
                                 pending_after_resize = None;
+                                deferred_bitmap = None;
                                 if frame_sender.send(Frame { channel: ChannelKey::Io, priority: Priority::Latency, bytes: response }).is_err() {
                                     return finish_session(Err(SessionError::WriterClosed));
                                 }
@@ -687,6 +634,49 @@ where
                 }
             }
         }
+
+        if let Some(bitmap) = bitmap_to_pump {
+            if bulk_send.0.is_some() {
+                deferred_bitmap = Some(bitmap);
+                continue;
+            }
+            let full = updates.latest_full_frame();
+            #[cfg(feature = "gfx")]
+            let (gfx_handled, gfx_frames) = match try_encode_gfx_frame(
+                gfx_session.as_ref(),
+                &mut last_gfx_data,
+                full.as_ref(),
+                &bitmap,
+            )
+            .await
+            {
+                Ok(outcome) => match apply_gfx_encode_outcome(outcome, dvc.as_ref()) {
+                    Ok(pair) => pair,
+                    Err(e) => return finish_session(Err(e)),
+                },
+                Err(e) => return finish_session(Err(e)),
+            };
+            #[cfg(not(feature = "gfx"))]
+            let (gfx_handled, gfx_frames) = {
+                let _ = full;
+                (false, Vec::new())
+            };
+            if let Err(e) = encode_and_queue_bitmap(
+                bitmap,
+                &frame_sender,
+                &bitmap_policy,
+                &mut frame_id,
+                &mut metrics,
+                &mut bulk_send.0,
+                &mut deferred_bitmap,
+                gfx_frames,
+                gfx_handled,
+            )
+            .await
+            {
+                return finish_session(Err(e));
+            }
+        }
     }
 }
 
@@ -725,6 +715,20 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Same as [`AbortOnDrop`], but for a bulk-graphics send that the session
+/// loop also awaits. Dropping the handle without abort would detach the
+/// task and keep the connection writer alive after the session returns.
+#[derive(Default)]
+struct AbortHandleOnDrop(Option<tokio::task::JoinHandle<Result<(), SessionError>>>);
+
+impl Drop for AbortHandleOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// Calls `reset()` on the wrapped input handler when dropped, so a
 /// connection that ends (normally, on error, or via panic) always
 /// releases whatever keys/buttons it was holding.
@@ -741,13 +745,13 @@ fn send_wave_frames(
     frame_sender: &rdpcore_transport::FrameSender,
     pcm: Vec<u8>,
     timestamp_ms: u32,
+    diag: &mut PlayQueueDiag,
 ) {
     let channel_id = channel.channel_id();
     let encoded = channel.encode_wave(pcm, timestamp_ms);
+    let stats = channel.play_queue_stats();
     if encoded.is_empty() {
-        // Nothing to send this tick (not negotiated yet, or throttled by
-        // should_skip_send). Leave the live slot alone - a prior wave may
-        // still be sitting there unread, and it's still valid audio.
+        diag.note_skip(&stats);
         return;
     }
     let frames = encoded
@@ -759,4 +763,76 @@ fn send_wave_frames(
         })
         .collect();
     let _ = frame_sender.send_live(frames);
+    diag.note_send(&stats);
+}
+
+struct PlayQueueDiag {
+    first_send: Option<std::time::Instant>,
+    logged_first_confirm: bool,
+    last_log: std::time::Instant,
+    sent: u32,
+    skipped: u32,
+}
+
+impl Default for PlayQueueDiag {
+    fn default() -> Self {
+        Self {
+            first_send: None,
+            logged_first_confirm: false,
+            last_log: std::time::Instant::now(),
+            sent: 0,
+            skipped: 0,
+        }
+    }
+}
+
+impl PlayQueueDiag {
+    fn note_skip(&mut self, stats: &rdpcore_rdpsnd::PlayQueueStats) {
+        self.skipped = self.skipped.saturating_add(1);
+        self.maybe_log(stats);
+    }
+
+    fn note_send(&mut self, stats: &rdpcore_rdpsnd::PlayQueueStats) {
+        if self.first_send.is_none() {
+            self.first_send = Some(std::time::Instant::now());
+        }
+        self.sent = self.sent.saturating_add(1);
+        self.maybe_log(stats);
+    }
+
+    fn maybe_log(&mut self, stats: &rdpcore_rdpsnd::PlayQueueStats) {
+        if !self.logged_first_confirm
+            && let Some(rtt_ms) = stats.last_confirm_rtt_ms
+        {
+            self.logged_first_confirm = true;
+            let wait_ms = self
+                .first_send
+                .map(|t| t.elapsed().as_millis())
+                .unwrap_or(0);
+            debug!(
+                wait_ms,
+                rtt_ms,
+                pending_blocks = stats.pending_blocks,
+                "rdpsnd: first WaveConfirm (wait_ms ≈ client preroll; rtt_ms ≈ play-queue depth)"
+            );
+        }
+        if self.last_log.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        debug!(
+            sent = self.sent,
+            skipped = self.skipped,
+            pending_blocks = stats.pending_blocks,
+            last_confirm_rtt_ms = stats.last_confirm_rtt_ms,
+            best_confirm_rtt_ms = stats.best_confirm_rtt_ms,
+            ready = stats.ready,
+            rtt_behind = stats.rtt_behind,
+            receive_ack_count = stats.receive_ack_count,
+            estimated_hold_ms = stats.estimated_hold_ms,
+            "rdpsnd: play-queue (estimated_hold_ms is measured FIFO; last_confirm_rtt_ms is the latest ack and may be a 0 ms receive-ack)"
+        );
+        self.last_log = std::time::Instant::now();
+        self.sent = 0;
+        self.skipped = 0;
+    }
 }
