@@ -83,6 +83,21 @@ pub(crate) struct EncodeScratch {
     pub(crate) rectangles: Vec<fastpath::BitmapRect>,
     pub(crate) tile_scratch: Vec<u8>,
     pub(crate) batches: Vec<Vec<Vec<u8>>>,
+    /// Freelist of previous frames' `BitmapRect::data` buffers. Each tile
+    /// needs its own owned buffer (many tiles are alive at once in
+    /// `rectangles` before being wired out), so `tile_scratch` alone can't
+    /// be reused for this - recycling last frame's now-unused buffers
+    /// avoids a fresh heap allocation per tile instead.
+    pub(crate) buffer_pool: Vec<Vec<u8>>,
+}
+
+/// Returns an owned copy of `src`, preferring a recycled buffer from `pool`
+/// (cleared and refilled, reusing its capacity) over a fresh allocation.
+fn pooled_copy(pool: &mut Vec<Vec<u8>>, src: &[u8]) -> Vec<u8> {
+    let mut buf = pool.pop().unwrap_or_default();
+    buf.clear();
+    buf.extend_from_slice(src);
+    buf
 }
 
 /// Splits one `BitmapUpdate` into wire-ready `FastPathOutput` byte buffers,
@@ -98,7 +113,11 @@ pub(crate) fn encode_bitmap_update(
     let width = bitmap.width.get();
     let height = bitmap.height.get();
 
-    scratch.rectangles.clear();
+    // Recycle last frame's per-tile buffers before dropping the rects that
+    // own them, instead of letting `clear()` deallocate each one.
+    scratch
+        .buffer_pool
+        .extend(scratch.rectangles.drain(..).map(|r| r.data));
     scratch.batches.clear();
     let mut stats = BitmapWireStats::default();
     scratch.tile_scratch.clear();
@@ -118,6 +137,7 @@ pub(crate) fn encode_bitmap_update(
                     tile_height,
                     policy,
                     &mut scratch.tile_scratch,
+                    &mut scratch.buffer_pool,
                     &mut scratch.rectangles,
                     &mut stats,
                 );
@@ -140,6 +160,7 @@ pub(crate) fn encode_bitmap_update(
                 th,
                 policy,
                 &mut scratch.tile_scratch,
+                &mut scratch.buffer_pool,
                 &mut scratch.rectangles,
                 &mut stats,
             );
@@ -168,6 +189,7 @@ fn push_bitmap_rect(
     tile_height: u16,
     policy: &BitmapEncodePolicy,
     tile_scratch: &mut Vec<u8>,
+    buffer_pool: &mut Vec<Vec<u8>>,
     rectangles: &mut Vec<fastpath::BitmapRect>,
     stats: &mut BitmapWireStats,
 ) {
@@ -196,10 +218,10 @@ fn push_bitmap_rect(
             // Bytes, not pixels — see BitmapRect docs (MS-RDPBCGR vs mstsc).
             (compressed, Some(tile_width * 4))
         } else {
-            (tile_scratch.clone(), None)
+            (pooled_copy(buffer_pool, tile_scratch), None)
         }
     } else {
-        (tile_scratch.clone(), None)
+        (pooled_copy(buffer_pool, tile_scratch), None)
     };
 
     stats.tiles += 1;
@@ -391,6 +413,34 @@ mod tests {
         assert_eq!(stats.tiles, 150); // 1200 / 8 scanline strips
         assert_eq!(stats.update_batches, 5); // ceil(150 / 32)
         assert_eq!(stats.raw_tiles, 150);
+    }
+
+    #[test]
+    fn buffer_pool_recycles_the_same_allocation_across_frames() {
+        // Raw path (m1-mac-mini forces it): every tile goes through
+        // pooled_copy, never the compressed-planar branch.
+        let policy = bitmap_encode_policy("m1-mac-mini", None, 8 * 1024 * 1024);
+        let mut scratch = EncodeScratch::default();
+
+        // 4x4 fits in a single raw strip, so each frame produces exactly
+        // one BitmapRect - simplest case to check allocation identity.
+        let frame1 = bitmap(0, 0, 4, 4, 0xAA);
+        encode_bitmap_update(&frame1, &policy, &mut scratch);
+        assert_eq!(scratch.rectangles.len(), 1);
+        let first_ptr = scratch.rectangles[0].data.as_ptr();
+
+        let frame2 = bitmap(0, 0, 4, 4, 0xBB);
+        encode_bitmap_update(&frame2, &policy, &mut scratch);
+        assert_eq!(scratch.rectangles.len(), 1);
+        assert_eq!(
+            scratch.rectangles[0].data.as_ptr(),
+            first_ptr,
+            "second frame's tile buffer should reuse the first frame's allocation"
+        );
+        assert!(
+            scratch.rectangles[0].data.iter().all(|&b| b == 0xBB),
+            "reused buffer must not leak stale bytes from the previous frame"
+        );
     }
 
     #[test]
