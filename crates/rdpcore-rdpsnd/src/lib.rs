@@ -126,19 +126,25 @@ pub struct RdpsndChannel {
     /// when this is at least [`pdu::VERSION_V8`].
     client_version: u16,
     block_no: u8,
-    /// Blocks sent and not yet WaveConfirmed. MS-RDPEA confirms after the
-    /// client has finished emitting the sample, so this is the play queue.
-    outstanding: u8,
     last_send: Option<Instant>,
     sent_at_ms: [u32; 256],
     /// Guards `sent_at_ms`: only a block we actually sent and haven't yet
     /// confirmed may feed the RTT baseline. Without this, a confirm for a
     /// block_no we never sent (or already confirmed) would read a stale
     /// `sent_at_ms` entry and poison `best_confirm_rtt_ms`.
+    /// Also the source of truth for the unacked play-queue depth — a
+    /// separate counter that can be zeroed independently of these bits
+    /// lets late confirms free *new* blocks and the client FIFO grows.
     block_pending: [bool; 256],
     clock: Instant,
     best_confirm_rtt_ms: Option<u32>,
     last_confirm_rtt_ms: Option<u32>,
+    /// Set once a WaveConfirm for a block we actually sent has arrived.
+    confirming_client: bool,
+    /// Clients that never WaveConfirm: after [`Self::CONFIRM_STALL_MS`]
+    /// send open-loop (capture-side pacing still caps to 1x). Never set
+    /// for [`Self::confirming_client`].
+    open_loop: bool,
 }
 
 impl RdpsndChannel {
@@ -163,13 +169,14 @@ impl RdpsndChannel {
                 negotiated: None,
                 client_version: 0,
                 block_no: 0,
-                outstanding: 0,
                 last_send: None,
                 sent_at_ms: [0; 256],
                 block_pending: [false; 256],
                 clock: Instant::now(),
                 best_confirm_rtt_ms: None,
                 last_confirm_rtt_ms: None,
+                confirming_client: false,
+                open_loop: false,
             },
             initial,
         )
@@ -191,6 +198,20 @@ impl RdpsndChannel {
         self.clock.elapsed().as_millis() as u32
     }
 
+    fn pending_count(&self) -> u8 {
+        self.block_pending
+            .iter()
+            .filter(|&&pending| pending)
+            .count() as u8
+    }
+
+    fn confirm_rtt_is_behind(&self) -> bool {
+        matches!(
+            (self.best_confirm_rtt_ms, self.last_confirm_rtt_ms),
+            (Some(best), Some(last)) if last > best.saturating_add(Self::CONFIRM_SLACK_MS)
+        )
+    }
+
     fn on_wave_confirm(&mut self, block_no: u8) {
         if !self.block_pending[block_no as usize] {
             // Confirm for a block we never sent, or already confirmed
@@ -199,6 +220,8 @@ impl RdpsndChannel {
             return;
         }
         self.block_pending[block_no as usize] = false;
+        self.confirming_client = true;
+        self.open_loop = false;
         let rtt = self
             .now_ms()
             .saturating_sub(self.sent_at_ms[block_no as usize]);
@@ -207,34 +230,45 @@ impl RdpsndChannel {
             Some(best) => best.min(rtt),
             None => rtt,
         });
-        self.outstanding = self.outstanding.saturating_sub(1);
     }
 
     fn should_skip_send(&mut self) -> bool {
-        if self.outstanding >= Self::MAX_UNACKED_BLOCKS {
+        let pending = self.pending_count();
+        if self.confirming_client {
+            // Never invent a free window. Zeroing an independent counter
+            // (the old CONFIRM_STALL_MS path) let WaveConfirms that sat
+            // unread — typically while the session loop blocked in
+            // `send_all` on a full graphics queue — decrement *new*
+            // blocks. Each such stall added ~80 ms to mstsc's FIFO, and
+            // 1x pacing meant that lag never drained.
+            if pending >= Self::MAX_UNACKED_BLOCKS {
+                return true;
+            }
+            return self.confirm_rtt_is_behind();
+        }
+        if pending >= Self::MAX_UNACKED_BLOCKS {
             if self
                 .last_send
                 .is_some_and(|t| t.elapsed().as_millis() as u32 > Self::CONFIRM_STALL_MS)
             {
-                // Client is not confirming (or confirms were lost). Do not
-                // deadlock the stream open-loop; the next confirm window
-                // can tighten again.
-                self.outstanding = 0;
+                // No WaveConfirm at all (old client). Capture pacing still
+                // caps to 1x. Do not clear `block_pending`: a late confirm
+                // must not look like a drained window.
+                self.open_loop = true;
                 return false;
             }
             return true;
         }
-        matches!(
-            (self.best_confirm_rtt_ms, self.last_confirm_rtt_ms),
-            (Some(best), Some(last)) if last > best.saturating_add(Self::CONFIRM_SLACK_MS)
-        )
+        if self.open_loop {
+            return false;
+        }
+        self.confirm_rtt_is_behind()
     }
 
     fn note_send(&mut self, block_no: u8) {
         self.sent_at_ms[block_no as usize] = self.now_ms();
         self.block_pending[block_no as usize] = true;
         self.last_send = Some(Instant::now());
-        self.outstanding = self.outstanding.saturating_add(1);
     }
 
     fn training_frames(&self) -> Vec<Vec<u8>> {
@@ -627,6 +661,60 @@ mod tests {
         assert!(
             !channel.encode_wave(vec![0x11; 64], 1).is_empty(),
             "confirming the window must allow another wave"
+        );
+    }
+
+    #[test]
+    fn stall_must_not_let_late_confirms_enlarge_the_play_queue() {
+        // Models v0.1.55: the session loop blocks in send_all (full bulk
+        // graphics queue) so WaveConfirms sit unread. The old stall path
+        // zeroed `outstanding` after 500 ms, sent a new window, then the
+        // late confirms decremented that new window and the client FIFO
+        // grew by ~80 ms per stall.
+        let formats = vec![pdu::AudioFormat::pcm(2, 48000, 16)];
+        let handler = Box::new(FakeHandler {
+            formats: formats.clone(),
+            ..Default::default()
+        });
+        let (mut channel, _initial) = RdpsndChannel::new(1004, 1002, handler);
+        complete_v8_negotiation(&mut channel, &formats);
+
+        for _ in 0..usize::from(RdpsndChannel::MAX_UNACKED_BLOCKS) {
+            assert!(!channel.encode_wave(vec![0x11; 64], 0).is_empty());
+        }
+        // Two confirms so this is a confirming client with a full window
+        // after we refill.
+        assert!(
+            channel
+                .on_channel_data(&wave_confirm_payload(0))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            channel
+                .on_channel_data(&wave_confirm_payload(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!channel.encode_wave(vec![0x11; 64], 0).is_empty());
+        assert!(!channel.encode_wave(vec![0x11; 64], 0).is_empty());
+        assert_eq!(
+            channel.pending_count(),
+            RdpsndChannel::MAX_UNACKED_BLOCKS,
+            "window must be full before the stall"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(
+            u64::from(RdpsndChannel::CONFIRM_STALL_MS) + 50,
+        ));
+        assert!(
+            channel.encode_wave(vec![0x22; 64], 1).is_empty(),
+            "a confirming client must not get a free window after a stall"
+        );
+        assert_eq!(
+            channel.pending_count(),
+            RdpsndChannel::MAX_UNACKED_BLOCKS,
+            "stall must not drop in-flight blocks from the pending set"
         );
     }
 
