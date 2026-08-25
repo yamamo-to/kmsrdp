@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.58
+Version:        0.1.59
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,13 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Tue Aug 25 2026 kmsrdp contributors <noreply@example.com> - 0.1.59-1
+- Add Prometheus metrics HTTP endpoint (/metrics, /healthz)
+- Add lock-free global metrics collection and Prometheus text exporter
+- Add GFX (H.264 AVC420) frame and byte telemetry in SessionBitmapMetrics
+- Add in-process mock client E2E tests for MS-RDPEAI and MS-RDPDR
+- Prevent X11 fake key injection side effects on active desktop during tests
+
 * Tue Aug 25 2026 kmsrdp contributors <noreply@example.com> - 0.1.58-1
 - Keep RDPSND at the live capture edge (Pulse flush, 1x, newest 20 ms)
 - Gate Wave2 sends on measured client play-queue hold, not receive-acks

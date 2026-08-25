@@ -1,3 +1,13 @@
+kmsrdp (0.1.59) unstable; urgency=medium
+
+  * Add Prometheus metrics HTTP endpoint (/metrics, /healthz).
+  * Add lock-free global metrics collection and Prometheus text exporter.
+  * Add GFX (H.264 AVC420) frame and byte telemetry in SessionBitmapMetrics.
+  * Add in-process mock client E2E tests for MS-RDPEAI and MS-RDPDR.
+  * Prevent X11 fake key injection side effects on active desktop during tests.
+
+ -- kmsrdp contributors <noreply@example.com>  Tue, 25 Aug 2026 11:15:00 +0900
+
 kmsrdp (0.1.58) unstable; urgency=medium
 
   * Keep RDPSND at the live capture edge (Pulse flush, 1x, newest 20 ms).
