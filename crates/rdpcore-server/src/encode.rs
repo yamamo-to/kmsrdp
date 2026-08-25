@@ -209,15 +209,18 @@ fn push_bitmap_rect(
 
     let planar_ok = policy.use_rdp6_planar && tile_width.is_multiple_of(4);
     let (data, compressed_scan_width) = if planar_ok {
-        let compressed = rdpcore_pdu::rdp6::encode(
+        let mut compressed = buffer_pool.pop().unwrap_or_default();
+        rdpcore_pdu::rdp6::encode_to(
             tile_scratch,
             usize::from(tile_width),
             usize::from(tile_height),
+            &mut compressed,
         );
         if compressed.len() < tile_scratch.len() {
             // Bytes, not pixels — see BitmapRect docs (MS-RDPBCGR vs mstsc).
             (compressed, Some(tile_width * 4))
         } else {
+            buffer_pool.push(compressed);
             (pooled_copy(buffer_pool, tile_scratch), None)
         }
     } else {
@@ -440,6 +443,31 @@ mod tests {
         assert!(
             scratch.rectangles[0].data.iter().all(|&b| b == 0xBB),
             "reused buffer must not leak stale bytes from the previous frame"
+        );
+    }
+
+    #[test]
+    fn buffer_pool_recycles_compressed_allocation_across_frames() {
+        // Planar compressed path (MSTSC uses it for 64x64 tiles with compressible data).
+        let policy = bitmap_encode_policy("MSTSC", None, 8 * 1024 * 1024);
+        assert!(policy.use_rdp6_planar);
+        let mut scratch = EncodeScratch::default();
+
+        // 64x64 single-color tile compresses down to ~10-20 bytes (much smaller than 64*64*4 raw).
+        let frame1 = bitmap(0, 0, 64, 64, 0x11);
+        let stats1 = encode_bitmap_update(&frame1, &policy, &mut scratch);
+        assert_eq!(stats1.compressed_tiles, 1);
+        assert_eq!(scratch.rectangles.len(), 1);
+        let first_ptr = scratch.rectangles[0].data.as_ptr();
+
+        let frame2 = bitmap(0, 0, 64, 64, 0x22);
+        let stats2 = encode_bitmap_update(&frame2, &policy, &mut scratch);
+        assert_eq!(stats2.compressed_tiles, 1);
+        assert_eq!(scratch.rectangles.len(), 1);
+        assert_eq!(
+            scratch.rectangles[0].data.as_ptr(),
+            first_ptr,
+            "second frame's compressed tile buffer should reuse the first frame's allocation"
         );
     }
 

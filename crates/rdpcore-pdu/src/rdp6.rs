@@ -22,18 +22,26 @@ pub const FORMAT_HEADER_RLE_NO_ALPHA_ARGB: u8 = 0x30;
 const MAX_STACK_PIXELS: usize = 4096;
 
 /// Encodes one BGRX32 tile (4 bytes/pixel, X ignored) into an RDP6 Planar
-/// bitmap stream: `[FormatHeader][R-plane][G-plane][B-plane]`. `bgrx` must
-/// already be in the same row order the caller intends the decoder to
-/// reconstruct (this codec has no notion of "bottom-up" itself - that's
-/// purely a `TS_BITMAP_DATA`-level convention the caller is responsible
-/// for, see `rdpcore_server::encode_bitmap_update`).
-pub fn encode(bgrx: &[u8], width: usize, height: usize) -> Vec<u8> {
+/// bitmap stream: `[FormatHeader][R-plane][G-plane][B-plane]`, writing into
+/// the caller-provided `out` buffer (cleared before writing) to avoid
+/// per-frame heap allocations on hot paths.
+///
+/// `bgrx` must already be in the same row order the caller intends the
+/// decoder to reconstruct (this codec has no notion of "bottom-up" itself -
+/// that's purely a `TS_BITMAP_DATA`-level convention the caller is
+/// responsible for, see `rdpcore_server::encode_bitmap_update`).
+pub fn encode_to(bgrx: &[u8], width: usize, height: usize, out: &mut Vec<u8>) {
+    out.clear();
     let pixel_count = width * height;
     if pixel_count == 0 {
         // Nothing to encode — return just the format header.
-        return vec![FORMAT_HEADER_RLE_NO_ALPHA_ARGB];
+        out.push(FORMAT_HEADER_RLE_NO_ALPHA_ARGB);
+        return;
     }
-    let mut out = Vec::with_capacity(1 + pixel_count * 3 / 2);
+    let needed_cap = 1 + pixel_count * 3 / 2;
+    if out.capacity() < needed_cap {
+        out.reserve(needed_cap - out.capacity());
+    }
     out.push(FORMAT_HEADER_RLE_NO_ALPHA_ARGB);
 
     if pixel_count <= MAX_STACK_PIXELS {
@@ -50,9 +58,9 @@ pub fn encode(bgrx: &[u8], width: usize, height: usize) -> Vec<u8> {
             *g_i = px[1];
             *r_i = px[2];
         }
-        encode_plane_stack(&r[..pixel_count], width, height, &mut out);
-        encode_plane_stack(&g[..pixel_count], width, height, &mut out);
-        encode_plane_stack(&b[..pixel_count], width, height, &mut out);
+        encode_plane_stack(&r[..pixel_count], width, height, out);
+        encode_plane_stack(&g[..pixel_count], width, height, out);
+        encode_plane_stack(&b[..pixel_count], width, height, out);
     } else {
         let mut r = vec![0u8; pixel_count];
         let mut g = vec![0u8; pixel_count];
@@ -65,10 +73,16 @@ pub fn encode(bgrx: &[u8], width: usize, height: usize) -> Vec<u8> {
             *g_i = px[1];
             *r_i = px[2];
         }
-        encode_plane_heap(&r, width, height, &mut out);
-        encode_plane_heap(&g, width, height, &mut out);
-        encode_plane_heap(&b, width, height, &mut out);
+        encode_plane_heap(&r, width, height, out);
+        encode_plane_heap(&g, width, height, out);
+        encode_plane_heap(&b, width, height, out);
     }
+}
+
+/// Convenience wrapper around [`encode_to`] returning a fresh `Vec<u8>`.
+pub fn encode(bgrx: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + width * height * 3 / 2);
+    encode_to(bgrx, width, height, &mut out);
     out
 }
 
