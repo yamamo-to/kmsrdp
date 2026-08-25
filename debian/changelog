@@ -1,3 +1,12 @@
+kmsrdp (0.1.60) unstable; urgency=medium
+
+  * Fix Guacamole clipboard synchronization and echo loop suppression.
+  * Support CF_TEXT and CF_OEMTEXT formats alongside CF_UNICODETEXT.
+  * Keep persistent arboard Clipboard instance in dedicated worker thread.
+  * Fix X11 Unicode Japanese text input keycode clearing race condition.
+
+ -- kmsrdp contributors <noreply@example.com>  Tue, 25 Aug 2026 12:14:00 +0900
+
 kmsrdp (0.1.59) unstable; urgency=medium
 
   * Add Prometheus metrics HTTP endpoint (/metrics, /healthz).

@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.59
+Version:        0.1.60
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,12 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Tue Aug 25 2026 kmsrdp contributors <noreply@example.com> - 0.1.60-1
+- Fix Guacamole clipboard synchronization and echo loop suppression
+- Support CF_TEXT and CF_OEMTEXT formats alongside CF_UNICODETEXT
+- Keep persistent arboard Clipboard instance in dedicated worker thread
+- Fix X11 Unicode Japanese text input keycode clearing race condition
+
 * Tue Aug 25 2026 kmsrdp contributors <noreply@example.com> - 0.1.59-1
 - Add Prometheus metrics HTTP endpoint (/metrics, /healthz)
 - Add lock-free global metrics collection and Prometheus text exporter
