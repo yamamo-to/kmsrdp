@@ -335,6 +335,20 @@ where
     // (merge/resync) still applies as normal during this window - only the
     // quality escalation is held off.
     let mut sent_first_frame = false;
+    // `MISSED_BEFORE_RESYNC` is a cheap, frequently-true threshold by
+    // design (3 dirty-rect messages arriving while one send is still in
+    // flight is routine - a single capture tick commonly emits several
+    // separate `DisplayUpdate::Bitmap` messages for different changed
+    // regions, all faster than one encode+send cycle). That's fine for
+    // choosing union-vs-resync, but degrading visual quality every time it
+    // fires is not: observed live, ~8000 bumps in 3 minutes of ordinary
+    // use, permanently pinning color_loss at max from routine bursts that
+    // never reflected sustained trouble. Rate-limit the *quality* side
+    // effect to real elapsed time instead - a burst within one capture
+    // tick can cost at most one step; only backlog that's still there
+    // `MIN_COLOR_LOSS_BUMP_INTERVAL` later earns another.
+    let mut last_color_loss_bump: Option<std::time::Instant> = None;
+    const MIN_COLOR_LOSS_BUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(750);
     // Above this many bytes still unacknowledged in the kernel's TCP send
     // buffer, treat the connection as busy regardless of what our own
     // `bulk_send` bookkeeping thinks - see `socket_backlog`'s doc comment.
@@ -690,11 +704,15 @@ where
                                 // cascading color_loss to max in one burst
                                 // instead of one step per real escalation.
                                 missed_since_last_send = 0;
-                                if sent_first_frame {
+                                if sent_first_frame
+                                    && last_color_loss_bump
+                                        .is_none_or(|t| t.elapsed() >= MIN_COLOR_LOSS_BUMP_INTERVAL)
+                                {
                                     current_color_loss =
                                         bump_color_loss_on_backlog(current_color_loss);
                                     set_color_loss_level(&mut bitmap_policy, current_color_loss);
                                     clean_sends_since_backlog = 0;
+                                    last_color_loss_bump = Some(std::time::Instant::now());
                                     debug!(color_loss_level = current_color_loss, "NSCodec backlog: raised color_loss_level");
                                 }
                             } else {
@@ -740,6 +758,7 @@ where
                                 current_color_loss = negotiated_color_loss.unwrap_or(0);
                                 clean_sends_since_backlog = 0;
                                 sent_first_frame = false;
+                                last_color_loss_bump = None;
                                 set_color_loss_level(&mut bitmap_policy, current_color_loss);
                                 if frame_sender.send(Frame { channel: ChannelKey::Io, priority: Priority::Latency, bytes: response }).is_err() {
                                     return finish_session(Err(SessionError::WriterClosed));
@@ -818,10 +837,14 @@ where
                         // re-triggers this branch instead of needing a
                         // fresh run of misses.
                         missed_since_last_send = 0;
-                        if sent_first_frame {
+                        if sent_first_frame
+                            && last_color_loss_bump
+                                .is_none_or(|t| t.elapsed() >= MIN_COLOR_LOSS_BUMP_INTERVAL)
+                        {
                             current_color_loss = bump_color_loss_on_backlog(current_color_loss);
                             set_color_loss_level(&mut bitmap_policy, current_color_loss);
                             clean_sends_since_backlog = 0;
+                            last_color_loss_bump = Some(std::time::Instant::now());
                             debug!(
                                 color_loss_level = current_color_loss,
                                 "NSCodec backlog: raised color_loss_level"
