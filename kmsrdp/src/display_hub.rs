@@ -162,6 +162,7 @@ impl DisplayHub {
 
             match result {
                 Ok(raw) => {
+                    crate::metrics::GLOBAL_METRICS.inc_frames_captured();
                     if consecutive_failures > 0 {
                         tracing::warn!(
                             "kmsrdp: capture recovered after {consecutive_failures} failure(s);"
@@ -399,6 +400,30 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
     }
 }
 
+struct SessionMetricGuard;
+
+impl Drop for SessionMetricGuard {
+    fn drop(&mut self) {
+        crate::metrics::GLOBAL_METRICS.dec_active_sessions();
+    }
+}
+
+pub struct TrackedDisplayUpdates {
+    inner: DisplayUpdates,
+    _guard: SessionMetricGuard,
+}
+
+#[async_trait::async_trait]
+impl RdpServerDisplayUpdates for TrackedDisplayUpdates {
+    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>, rdpcore_server::DisplayError> {
+        self.inner.next_update().await
+    }
+
+    fn latest_full_frame(&self) -> Option<BitmapUpdate> {
+        self.inner.latest_full_frame()
+    }
+}
+
 #[async_trait::async_trait]
 impl RdpServerDisplay for Display {
     async fn size(&self) -> DesktopSize {
@@ -408,7 +433,11 @@ impl RdpServerDisplay for Display {
     async fn updates(
         &self,
     ) -> Result<Box<dyn RdpServerDisplayUpdates>, rdpcore_server::DisplayError> {
-        Ok(Box::new(self.hub.subscribe()))
+        crate::metrics::GLOBAL_METRICS.inc_active_sessions();
+        Ok(Box::new(TrackedDisplayUpdates {
+            inner: self.hub.subscribe(),
+            _guard: SessionMetricGuard,
+        }))
     }
 
     fn monitor_layout(&self) -> Vec<MonitorLayoutEntry> {

@@ -334,6 +334,7 @@ mod tests {
             clipboard: ClipboardMode::Bidirectional,
             gfx_enabled: false,
             frame_interval: DEFAULT_FRAME_INTERVAL,
+            metrics_listen: None,
         }
     }
 

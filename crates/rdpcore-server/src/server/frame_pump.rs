@@ -138,6 +138,8 @@ pub async fn encode_and_queue_bitmap(
         return Ok(());
     }
     let frames = if gfx_handled {
+        let gfx_bytes: usize = gfx_frames.iter().map(|f| f.bytes.len()).sum();
+        metrics.record_gfx(gfx_bytes);
         gfx_frames
     } else {
         let mut frames = gfx_frames;

@@ -37,6 +37,7 @@ pub struct Config {
     /// [`rdpcore_server::RdpServerBuilder::with_gfx`], not `std::env`.
     pub gfx_enabled: bool,
     pub frame_interval: Duration,
+    pub metrics_listen: Option<SocketAddr>,
 }
 
 impl fmt::Debug for Config {
@@ -51,6 +52,7 @@ impl fmt::Debug for Config {
             .field("clipboard", &self.clipboard)
             .field("gfx_enabled", &self.gfx_enabled)
             .field("frame_interval", &self.frame_interval)
+            .field("metrics_listen", &self.metrics_listen)
             .finish()
     }
 }
@@ -73,6 +75,7 @@ impl Config {
         let clipboard = parse_clipboard_mode();
         let gfx_enabled = parse_bool_env("KMSRDP_GFX").unwrap_or(false);
         let frame_interval = parse_frame_interval();
+        let metrics_listen = parse_metrics_listen()?;
         Ok(Self {
             listen,
             require_nla,
@@ -83,8 +86,40 @@ impl Config {
             clipboard,
             gfx_enabled,
             frame_interval,
+            metrics_listen,
         })
     }
+}
+
+fn parse_metrics_listen() -> Result<Option<SocketAddr>> {
+    let raw = match std::env::var("KMSRDP_METRICS_LISTEN")
+        .or_else(|_| std::env::var("KMSRDP_METRICS_ADDR"))
+    {
+        Ok(val) if !val.trim().is_empty() => val,
+        _ => return Ok(None),
+    };
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("disabled")
+        || trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("false")
+    {
+        return Ok(None);
+    }
+    if let Ok(port) = trimmed.parse::<u16>() {
+        if port == 0 {
+            anyhow::bail!("KMSRDP_METRICS_LISTEN port must be non-zero");
+        }
+        return Ok(Some(SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port,
+        )));
+    }
+    let addr: SocketAddr = trimmed.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "KMSRDP_METRICS_LISTEN must be a SocketAddr (e.g. 127.0.0.1:9100) or port number, got {raw:?}"
+        )
+    })?;
+    Ok(Some(addr))
 }
 
 fn parse_max_sessions() -> Result<usize> {
@@ -426,6 +461,7 @@ mod tests {
             clipboard: ClipboardMode::Bidirectional,
             gfx_enabled: false,
             frame_interval: DEFAULT_FRAME_INTERVAL,
+            metrics_listen: None,
         };
         let formatted = format!("{cfg:?}");
         assert!(!formatted.contains("super_secret_password"));

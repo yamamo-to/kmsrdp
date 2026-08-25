@@ -102,11 +102,15 @@ impl RdpServerInputHandler for SharedInput {
 impl RdpServerInputHandler for Input {
     fn keyboard(&mut self, event: KeyboardEvent) {
         let scancode = match event {
-            KeyboardEvent::Pressed { code, extended } => Some((code, extended, true)),
+            KeyboardEvent::Pressed { code, extended } => {
+                kmsrdp::metrics::GLOBAL_METRICS.inc_input_keyboard();
+                Some((code, extended, true))
+            }
             KeyboardEvent::Released { code, extended } => Some((code, extended, false)),
             // IME-composed text (e.g. CJK input) has no scancode at all;
             // inject via X11 keymap-remap trick. Only act on press.
             KeyboardEvent::UnicodePressed(codepoint) => {
+                kmsrdp::metrics::GLOBAL_METRICS.inc_input_unicode();
                 self.x11_typer.type_char(codepoint.into());
                 None
             }
@@ -129,6 +133,7 @@ impl RdpServerInputHandler for Input {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
+        kmsrdp::metrics::GLOBAL_METRICS.inc_input_mouse();
         let button = match event {
             MouseEvent::LeftPressed | MouseEvent::LeftReleased => Some(uinput::BTN_LEFT),
             MouseEvent::RightPressed | MouseEvent::RightReleased => Some(uinput::BTN_RIGHT),
@@ -406,6 +411,18 @@ async fn main() -> Result<()> {
         .with_gfx(cfg.gfx_enabled)
         .build();
 
+    let (metrics_shutdown_tx, metrics_shutdown_rx) = tokio::sync::watch::channel(false);
+    if let Some(metrics_addr) = cfg.metrics_listen {
+        let metrics_listener = tokio::net::TcpListener::bind(metrics_addr)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("failed to bind metrics listener on {metrics_addr}: {e}")
+            })?;
+        tokio::spawn(async move {
+            kmsrdp::metrics_server::run_metrics_server(metrics_listener, metrics_shutdown_rx).await;
+        });
+    }
+
     let nla_desc = if cfg.require_nla {
         "TLS + required NLA"
     } else {
@@ -419,14 +436,19 @@ async fn main() -> Result<()> {
     // wait for DRM `spawn_blocking` / FUSE threads and can hang host
     // shutdown; `process::exit` after a short cleanup is still the backstop.
     tokio::select! {
-        result = server.run() => Ok(result?),
+        result = server.run() => {
+            let _ = metrics_shutdown_tx.send(true);
+            Ok(result?)
+        }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("SIGINT, shutting down");
+            let _ = metrics_shutdown_tx.send(true);
             graceful_shutdown(&input_for_shutdown, fuse_shutdown.as_ref());
             std::process::exit(0);
         }
         _ = sigterm() => {
             tracing::info!("SIGTERM, shutting down");
+            let _ = metrics_shutdown_tx.send(true);
             graceful_shutdown(&input_for_shutdown, fuse_shutdown.as_ref());
             std::process::exit(0);
         }
