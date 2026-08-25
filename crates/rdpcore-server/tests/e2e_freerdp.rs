@@ -191,3 +191,71 @@ async fn test_freerdp_e2e_connection() {
         Err(_) => panic!("xfreerdp timed out (NLA auth-only took > 10s)"),
     }
 }
+
+#[tokio::test]
+async fn test_freerdp_e2e_streaming() {
+    if !command_exists("xfreerdp") || !command_exists("Xvfb") {
+        eprintln!("xfreerdp or Xvfb not available, skipping test");
+        return;
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let (tls, pub_key) = create_tls_acceptor_and_pubkey();
+    let creds = Credentials {
+        username: "testuser".to_string(),
+        password: "testpassword".to_string(),
+        domain: None,
+    };
+    let validator = Arc::new(ExactMatchCredentialValidator::new(creds.clone()));
+    let input = TestInputHandler::default();
+
+    let server = RdpServer::builder()
+        .with_listener(listener)
+        .with_tls(tls)
+        .with_tls_public_key(pub_key)
+        .with_display_handler(DummyDisplay)
+        .with_input_handler(input)
+        .with_credential_validator(Some(validator))
+        .with_nla_credentials(Some(creds))
+        .with_require_nla(true)
+        .build();
+
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let display_num = 99 + (port % 500) as i32;
+    let display_str = format!(":{display_num}");
+    let mut xvfb = Command::new("Xvfb")
+        .arg(&display_str)
+        .arg("-screen")
+        .arg("0")
+        .arg("1024x768x24")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start Xvfb");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut client = Command::new("xfreerdp")
+        .env("DISPLAY", &display_str)
+        .arg(format!("/v:127.0.0.1:{port}"))
+        .arg("/u:testuser")
+        .arg("/p:testpassword")
+        .arg("/cert:ignore")
+        .arg("/bpp:32")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn xfreerdp");
+
+    // Let it stream frames for 2 seconds
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let _ = client.kill().await;
+    let _ = xvfb.kill().await;
+    server_task.abort();
+}
