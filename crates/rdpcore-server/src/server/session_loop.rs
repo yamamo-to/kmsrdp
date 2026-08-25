@@ -21,7 +21,8 @@ use tracing::{debug, warn};
 
 use crate::display::{BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay};
 use crate::encode::{
-    bitmap_encode_policy, client_needs_compat_workarounds, covers_desktop, resync_bitmap,
+    BitmapEncodePolicy, bitmap_encode_policy, bump_color_loss_on_backlog,
+    client_needs_compat_workarounds, covers_desktop, decay_color_loss_after_catchup, resync_bitmap,
     retain_bitmap_during_resize,
 };
 use crate::error::{SessionError, finish_session};
@@ -305,8 +306,17 @@ where
         .unwrap_or(server_mfu)
         .min(server_mfu)
         .max(fastpath::MAX_FASTPATH_CHUNK_SIZE as u32);
-    let bitmap_policy =
+    let mut bitmap_policy =
         bitmap_encode_policy(client_label, accepted.nscodec, max_request_size as usize);
+    // The color_loss_level the client actually negotiated - the floor
+    // `decay_color_loss_after_catchup` claws back down to, never below it.
+    let negotiated_color_loss = bitmap_policy.nscodec.map(|(_, cll)| cll);
+    let mut current_color_loss = negotiated_color_loss.unwrap_or(0);
+    // Consecutive clean (non-deferred) pumps since the last backlog-driven
+    // quality bump - `DECAY_AFTER_CLEAN_SENDS` of these earns one step back
+    // toward `negotiated_color_loss`.
+    let mut clean_sends_since_backlog: u32 = 0;
+    const DECAY_AFTER_CLEAN_SENDS: u32 = 60;
     // Scopes every catch-up-path behavior change below to NSCodec clients
     // (macOS "Windows App") - the ones actually affected by the residual-
     // pixel/growing-latency issues this exists to fix, since NSCodec's
@@ -640,6 +650,9 @@ where
                             if missed_since_last_send >= MISSED_BEFORE_RESYNC {
                                 pending_resync = true;
                                 deferred_bitmap = None;
+                                current_color_loss = bump_color_loss_on_backlog(current_color_loss);
+                                set_color_loss_level(&mut bitmap_policy, current_color_loss);
+                                clean_sends_since_backlog = 0;
                             } else {
                                 deferred_bitmap = Some(match deferred_bitmap.take() {
                                     Some(prev) => prev.union(bitmap),
@@ -680,6 +693,9 @@ where
                                 pending_resync = false;
                                 last_synced_full = None;
                                 resync_target = None;
+                                current_color_loss = negotiated_color_loss.unwrap_or(0);
+                                clean_sends_since_backlog = 0;
+                                set_color_loss_level(&mut bitmap_policy, current_color_loss);
                                 if frame_sender.send(Frame { channel: ChannelKey::Io, priority: Priority::Latency, bytes: response }).is_err() {
                                     return finish_session(Err(SessionError::WriterClosed));
                                 }
@@ -739,6 +755,9 @@ where
                     if missed_since_last_send >= MISSED_BEFORE_RESYNC {
                         pending_resync = true;
                         deferred_bitmap = None;
+                        current_color_loss = bump_color_loss_on_backlog(current_color_loss);
+                        set_color_loss_level(&mut bitmap_policy, current_color_loss);
+                        clean_sends_since_backlog = 0;
                     } else {
                         deferred_bitmap = Some(match deferred_bitmap.take() {
                             Some(prev) => prev.union(bitmap),
@@ -749,6 +768,17 @@ where
                 continue;
             }
             missed_since_last_send = 0;
+            if let Some(floor) = negotiated_color_loss {
+                clean_sends_since_backlog += 1;
+                if clean_sends_since_backlog >= DECAY_AFTER_CLEAN_SENDS {
+                    clean_sends_since_backlog = 0;
+                    let decayed = decay_color_loss_after_catchup(current_color_loss, floor);
+                    if decayed != current_color_loss {
+                        current_color_loss = decayed;
+                        set_color_loss_level(&mut bitmap_policy, current_color_loss);
+                    }
+                }
+            }
             if use_resync_catchup {
                 if let Some(synced) = resync_target.take() {
                     last_synced_full = Some(synced);
@@ -802,6 +832,14 @@ where
 
 fn trim_client_name(name: &str) -> &str {
     name.trim_end_matches('\0').trim()
+}
+
+/// Applies a new NSCodec color_loss_level to `policy` in place. No-op for
+/// non-NSCodec clients (`policy.nscodec` is `None`).
+fn set_color_loss_level(policy: &mut BitmapEncodePolicy, level: u8) {
+    if let Some((codec_id, _)) = policy.nscodec {
+        policy.nscodec = Some((codec_id, level));
+    }
 }
 
 /// Consumes a pending catch-up flag and turns it into a bitmap to send (via

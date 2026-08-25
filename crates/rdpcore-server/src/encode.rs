@@ -423,9 +423,31 @@ pub(crate) fn resync_bitmap(
     })
 }
 
+/// NSCodec's own clamp ceiling (see [`rdpcore_pdu::nscodec::encode`]) - the
+/// most lossy (smallest-output) setting the wire format allows.
+pub(crate) const MAX_COLOR_LOSS_LEVEL: u8 = 7;
+
+/// A resync just fired: the bytes this session has been sending clearly
+/// cost more than the link/decoder can sustain right now. Trade quality for
+/// size one step at a time so the next few cycles have a real chance of
+/// draining instead of triggering another resync immediately.
+pub(crate) fn bump_color_loss_on_backlog(current: u8) -> u8 {
+    current.saturating_add(1).min(MAX_COLOR_LOSS_LEVEL)
+}
+
+/// The session has kept up cleanly for a while - claw quality back one step
+/// at a time, never below what the client originally negotiated (going
+/// lower than that wasn't asked for and isn't this mechanism's job).
+pub(crate) fn decay_color_loss_after_catchup(current: u8, negotiated_floor: u8) -> u8 {
+    current.saturating_sub(1).max(negotiated_floor)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{covers_desktop, resync_bitmap, retain_bitmap_during_resize};
+    use super::{
+        bump_color_loss_on_backlog, covers_desktop, decay_color_loss_after_catchup, resync_bitmap,
+        retain_bitmap_during_resize,
+    };
     use crate::display::{BitmapUpdate, PixelFormat};
     use core::num::{NonZeroU16, NonZeroUsize};
 
@@ -572,6 +594,20 @@ mod tests {
         let resized = bitmap(0, 0, 128, 64, 2);
         let result = resync_bitmap(Some(&old), &resized).unwrap();
         assert!(covers_desktop(&result, 128, 64));
+    }
+
+    #[test]
+    fn color_loss_bumps_up_to_a_max_of_seven() {
+        assert_eq!(bump_color_loss_on_backlog(3), 4);
+        assert_eq!(bump_color_loss_on_backlog(7), 7);
+        assert_eq!(bump_color_loss_on_backlog(8), 7);
+    }
+
+    #[test]
+    fn color_loss_decays_down_to_the_negotiated_floor_but_no_further() {
+        assert_eq!(decay_color_loss_after_catchup(5, 3), 4);
+        assert_eq!(decay_color_loss_after_catchup(3, 3), 3);
+        assert_eq!(decay_color_loss_after_catchup(2, 3), 3);
     }
 
     #[test]
