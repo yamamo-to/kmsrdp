@@ -318,10 +318,12 @@ mod tests {
 
     #[test]
     fn session_change_clears_cached_connection() {
-        let (tx, rx) = watch::channel(Some(sample_session(Some(":0"))));
+        // Use non-existent display numbers (:254, :255) so the test never connects
+        // to a live X11 desktop and never injects keystrokes into the user's screen.
+        let (tx, rx) = watch::channel(Some(sample_session(Some(":254"))));
         let mut typer = X11UnicodeWorker::new(rx);
         typer.type_char('x' as u32);
-        tx.send(Some(sample_session(Some(":1"))))
+        tx.send(Some(sample_session(Some(":255"))))
             .expect("session switch");
         typer.type_char('y' as u32);
     }

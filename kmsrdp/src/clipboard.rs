@@ -526,7 +526,7 @@ mod tests {
         let subscribers = Arc::new(Mutex::new(Vec::<UnboundedSender<ClipboardMessage>>::new()));
         spawn_shared_clipboard_watcher(Arc::clone(&subscribers), session_rx);
         session_tx
-            .send(Some(test_session(Some(":0"))))
+            .send(Some(test_session(Some(":254"))))
             .expect("send session");
         tokio::time::sleep(Duration::from_millis(20)).await;
         session_tx.send(None).expect("clear session");
