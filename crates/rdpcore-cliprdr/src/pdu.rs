@@ -263,6 +263,15 @@ mod tests {
         assert_eq!(decoded, ClientMessage::FormatList(vec![1, CF_UNICODETEXT]));
     }
 
+    #[test]
+    fn decode_text_body_handles_ansi_and_unicode() {
+        let ansi_bytes = b"hello_ansi\0";
+        assert_eq!(decode_text_body(ansi_bytes), "hello_ansi");
+
+        let unicode_bytes = rdpcore_pdu::utf16::encode_units("hello_unicode");
+        assert_eq!(decode_text_body(&unicode_bytes), "hello_unicode");
+    }
+
     proptest::proptest! {
         #[test]
         fn prop_decode_client_message_does_not_panic(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {

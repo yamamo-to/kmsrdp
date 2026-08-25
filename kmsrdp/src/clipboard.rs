@@ -636,6 +636,26 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    #[tokio::test]
+    async fn on_format_data_response_updates_last_written() {
+        let factory = LocalClipboardFactory::new(session_rx(), ClipboardMode::default());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut backend = factory.build_cliprdr_backend(tx);
+        backend.on_format_data_response(FormatDataResponse::new_unicode_string("hello_from_client"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let last = factory.last_written.lock().unwrap().clone();
+        assert_eq!(last, Some("hello_from_client".to_string()));
+    }
+
+    #[test]
+    fn select_text_format_prioritizes_unicode_over_ansi() {
+        let formats = vec![ClipboardFormat { id: CF_TEXT }, ClipboardFormat { id: CF_UNICODETEXT }];
+        assert_eq!(select_text_format(&formats), Some(CF_UNICODETEXT));
+
+        let formats_ansi = vec![ClipboardFormat { id: CF_OEMTEXT }, ClipboardFormat { id: CF_TEXT }];
+        assert_eq!(select_text_format(&formats_ansi), Some(CF_TEXT));
+    }
+
     #[test]
     fn test_arboard_clipboard_real() {
         if std::env::var("DISPLAY").is_ok() {
