@@ -25,8 +25,79 @@ use tokio::sync::watch;
 
 use crate::session::Session;
 
+enum ClipboardReq {
+    SetText(String),
+    GetText(tokio::sync::oneshot::Sender<Option<String>>),
+    ResetSession,
+}
+
+struct HostClipboard {
+    sender: tokio::sync::mpsc::UnboundedSender<ClipboardReq>,
+}
+
+static HOST_CLIPBOARD: std::sync::OnceLock<HostClipboard> = std::sync::OnceLock::new();
+
+fn get_host_clipboard() -> &'static HostClipboard {
+    HOST_CLIPBOARD.get_or_init(spawn_host_clipboard_worker)
+}
+
+fn spawn_host_clipboard_worker() -> HostClipboard {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ClipboardReq>();
+    std::thread::Builder::new()
+        .name("kmsrdp-clip-worker".into())
+        .spawn(move || {
+            let mut clipboard: Option<arboard::Clipboard> = arboard::Clipboard::new().ok();
+            while let Some(req) = rx.blocking_recv() {
+                match req {
+                    ClipboardReq::SetText(text) => {
+                        if text.len() > MAX_HOST_CLIPBOARD_BYTES {
+                            tracing::warn!(
+                                len = text.len(),
+                                max = MAX_HOST_CLIPBOARD_BYTES,
+                                "dropping client clipboard: exceeds host size cap"
+                            );
+                            continue;
+                        }
+                        if clipboard.is_none() {
+                            clipboard = arboard::Clipboard::new().ok();
+                        }
+                        let mut set_ok = false;
+                        if let Some(ref mut cb) = clipboard
+                            && cb.set_text(text.clone()).is_ok()
+                        {
+                            set_ok = true;
+                        }
+                        if !set_ok {
+                            clipboard = arboard::Clipboard::new().ok();
+                            if let Some(ref mut cb) = clipboard {
+                                let _ = cb.set_text(text);
+                            }
+                        }
+                    }
+                    ClipboardReq::GetText(reply) => {
+                        if clipboard.is_none() {
+                            clipboard = arboard::Clipboard::new().ok();
+                        }
+                        let text = clipboard.as_mut().and_then(|cb| cb.get_text().ok());
+                        let _ = reply.send(text);
+                    }
+                    ClipboardReq::ResetSession => {
+                        clipboard = None;
+                    }
+                }
+            }
+        })
+        .expect("spawn kmsrdp-clip-worker");
+    HostClipboard { sender: tx }
+}
+
 fn local_text() -> Option<String> {
-    arboard::Clipboard::new().ok()?.get_text().ok()
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if get_host_clipboard().sender.send(ClipboardReq::GetText(tx)).is_ok() {
+        rx.blocking_recv().unwrap_or(None)
+    } else {
+        None
+    }
 }
 
 /// Cap on text written into the host clipboard from a client. The CLIPRDR
@@ -35,17 +106,7 @@ fn local_text() -> Option<String> {
 const MAX_HOST_CLIPBOARD_BYTES: usize = 1024 * 1024;
 
 fn set_local_text(text: String) {
-    if text.len() > MAX_HOST_CLIPBOARD_BYTES {
-        tracing::warn!(
-            len = text.len(),
-            max = MAX_HOST_CLIPBOARD_BYTES,
-            "dropping client clipboard: exceeds host size cap"
-        );
-        return;
-    }
-    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-        let _ = clipboard.set_text(text);
-    }
+    let _ = get_host_clipboard().sender.send(ClipboardReq::SetText(text));
 }
 
 fn advertise_unicode_formats(sender: &UnboundedSender<ClipboardMessage>) -> bool {
@@ -97,6 +158,7 @@ fn spawn_shared_clipboard_watcher(
                         xfixes_stop.store(true, Ordering::SeqCst);
                         break;
                     }
+                    let _ = get_host_clipboard().sender.send(ClipboardReq::ResetSession);
                     last = None;
                     xfixes_stop.store(true, Ordering::SeqCst);
                     xfixes_stop = Arc::new(AtomicBool::new(false));
@@ -572,5 +634,16 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         session_tx.send(None).expect("clear session");
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    #[test]
+    fn test_arboard_clipboard_real() {
+        if std::env::var("DISPLAY").is_ok() {
+            set_local_text("test_persistent_worker_text".into());
+            std::thread::sleep(Duration::from_millis(50));
+            if let Some(read) = local_text() {
+                assert_eq!(read, "test_persistent_worker_text");
+            }
+        }
     }
 }
