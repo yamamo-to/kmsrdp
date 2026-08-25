@@ -317,6 +317,9 @@ where
     // `decay_color_loss_after_catchup` claws back down to, never below it.
     let negotiated_color_loss = bitmap_policy.nscodec.map(|(_, cll)| cll);
     let mut current_color_loss = negotiated_color_loss.unwrap_or(0);
+    if let Some(cll) = negotiated_color_loss {
+        debug!(color_loss_level = cll, "NSCodec negotiated");
+    }
     // Consecutive clean (non-deferred) pumps since the last backlog-driven
     // quality bump - `DECAY_AFTER_CLEAN_SENDS` of these earns one step back
     // toward `negotiated_color_loss`.
@@ -672,6 +675,7 @@ where
                                 current_color_loss = bump_color_loss_on_backlog(current_color_loss);
                                 set_color_loss_level(&mut bitmap_policy, current_color_loss);
                                 clean_sends_since_backlog = 0;
+                                debug!(color_loss_level = current_color_loss, "NSCodec backlog: raised color_loss_level");
                             } else {
                                 deferred_bitmap = Some(match deferred_bitmap.take() {
                                     Some(prev) => prev.union(bitmap),
@@ -808,6 +812,10 @@ where
                     if decayed != current_color_loss {
                         current_color_loss = decayed;
                         set_color_loss_level(&mut bitmap_policy, current_color_loss);
+                        debug!(
+                            color_loss_level = current_color_loss,
+                            "NSCodec caught up: lowered color_loss_level"
+                        );
                     }
                 }
             }
