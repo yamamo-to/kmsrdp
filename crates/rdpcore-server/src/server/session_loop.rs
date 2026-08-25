@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use rdpcore_cliprdr::{CliprdrBackendFactory, CliprdrChannel};
@@ -79,7 +80,7 @@ pub async fn run_steady_state<S>(
     accepted: AcceptedConnection,
 ) -> Result<(), crate::error::ServerError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + AsRawFd + 'static,
 {
     // Per-connection wrapper so reset() releases only this session's
     // holds. Guarantees reset runs on every exit path.
@@ -88,6 +89,10 @@ where
     ));
     let _reset_input_on_drop = ResetInputOnDrop(Arc::clone(&connection_input));
 
+    // Captured before `stream` is split/moved below - `as_raw_fd` only
+    // reads the fd number, it doesn't take ownership. See `socket_backlog`
+    // for why this is needed alongside `bulk_send`.
+    let raw_fd = stream.as_raw_fd();
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (writer, frame_sender) = ConnectionWriter::new(write_half);
     // Detached: it keeps running/flushing until every `FrameSender`
@@ -317,6 +322,12 @@ where
     // toward `negotiated_color_loss`.
     let mut clean_sends_since_backlog: u32 = 0;
     const DECAY_AFTER_CLEAN_SENDS: u32 = 60;
+    // Above this many bytes still unacknowledged in the kernel's TCP send
+    // buffer, treat the connection as busy regardless of what our own
+    // `bulk_send` bookkeeping thinks - see `socket_backlog`'s doc comment.
+    // A few hundred KB is enough headroom for normal jitter on a healthy
+    // link while still catching a link that's genuinely fallen behind.
+    const KERNEL_SEND_BACKLOG_THRESHOLD_BYTES: u32 = 256 * 1024;
     // Scopes every catch-up-path behavior change below to NSCodec clients
     // (macOS "Windows App") - the ones actually affected by the residual-
     // pixel/growing-latency issues this exists to fix, since NSCodec's
@@ -747,7 +758,20 @@ where
         }
 
         if let Some(bitmap) = bitmap_to_pump {
-            if bulk_send.0.is_some() {
+            // `bulk_send.0.is_some()` only reflects whether *this process*
+            // has finished handing bytes to the kernel - the kernel's own
+            // TCP send buffer autotunes up to several MB and will keep
+            // accepting writes (making `bulk_send` complete) long after a
+            // lossy/slow link has stopped actually delivering anything to
+            // the client. Fast-Path bitmap updates have no client-side ack
+            // to fall back on, so treat a large kernel backlog exactly like
+            // a busy `bulk_send` - it feeds the same miss/resync/color-loss
+            // escalation below instead of silently piling more encodes on
+            // top of data the client hasn't received yet.
+            let kernel_backlog_high = use_resync_catchup
+                && crate::socket_backlog::outstanding_send_bytes(raw_fd)
+                    .is_some_and(|bytes| bytes > KERNEL_SEND_BACKLOG_THRESHOLD_BYTES);
+            if bulk_send.0.is_some() || kernel_backlog_high {
                 if !use_resync_catchup {
                     deferred_bitmap = Some(bitmap);
                 } else {

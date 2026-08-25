@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -388,7 +389,7 @@ impl Session {
         accepted: AcceptedConnection,
     ) -> Result<(), crate::error::ServerError>
     where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        S: AsyncRead + AsyncWrite + Unpin + Send + AsRawFd + 'static,
     {
         let params = session_loop::SteadyStateParams {
             display: Arc::clone(&self.display),

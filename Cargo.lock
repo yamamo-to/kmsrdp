@@ -2675,6 +2675,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "criterion",
+ "libc",
  "rcgen",
  "rdpcore-cliprdr",
  "rdpcore-connector",

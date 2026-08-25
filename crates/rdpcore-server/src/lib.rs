@@ -20,6 +20,7 @@ mod encode;
 mod error;
 mod input;
 mod server;
+mod socket_backlog;
 mod transport;
 
 pub use credentials::{CredentialValidator, Credentials, ExactMatchCredentialValidator};
