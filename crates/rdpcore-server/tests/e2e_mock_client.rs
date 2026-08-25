@@ -25,6 +25,10 @@ use rdpcore_pdu::mcs::{
 use rdpcore_pdu::rdp6;
 use rdpcore_pdu::svc;
 use rdpcore_pdu::x224::{self, ConnectionConfirm, ConnectionRequest, SecurityProtocol};
+use rdpcore_rdpdr::pdu as rdpdr_pdu;
+use rdpcore_rdpdr::{DriveCommand, DriveConsumer, DriveConsumerFactory};
+use rdpcore_rdpeai::pdu as rdpeai_pdu;
+use rdpcore_rdpeai::{AudioInputBackend, AudioInputBackendFactory};
 use rdpcore_rdpsnd::pdu as rdpsnd_pdu;
 use rdpcore_rdpsnd::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory, WavePublisher};
 use rdpcore_server::tokio_rustls::TlsAcceptor;
@@ -203,6 +207,7 @@ impl RdpServerDisplay for SingleFrameDisplay {
     }
 }
 
+#[allow(dead_code)]
 fn make_bitmap_update(width: u16, height: u16, data: Vec<u8>) -> BitmapUpdate {
     let w = core::num::NonZeroU16::new(width).unwrap();
     let h = core::num::NonZeroU16::new(height).unwrap();
@@ -242,12 +247,14 @@ impl RdpServerDisplayUpdates for ChannelDisplayUpdates {
     }
 }
 
+#[allow(dead_code)]
 struct ChannelDisplay {
     initial_width: u16,
     initial_height: u16,
     rx_slot: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<BitmapUpdate>>>>,
 }
 
+#[allow(dead_code)]
 impl ChannelDisplay {
     fn new(width: u16, height: u16) -> (Self, tokio::sync::mpsc::UnboundedSender<BitmapUpdate>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -384,6 +391,106 @@ impl CliprdrBackendFactory for MockCliprdrFactory {
         Box::new(MockCliprdrBackend {
             text: self.text.clone(),
             sender,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecordingAudioInputBackend {
+    received: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl AudioInputBackend for RecordingAudioInputBackend {
+    fn on_audio_data(&mut self, _format: &rdpeai_pdu::AudioFormat, data: &[u8]) {
+        self.received.lock().unwrap().push(data.to_vec());
+    }
+}
+
+struct RecordingAudioInputFactory {
+    received: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl AudioInputBackendFactory for RecordingAudioInputFactory {
+    fn build_backend(&self) -> Box<dyn AudioInputBackend> {
+        Box::new(RecordingAudioInputBackend {
+            received: Arc::clone(&self.received),
+        })
+    }
+}
+
+struct RecordingDriveConsumer {
+    ready_devices: Arc<Mutex<Vec<(u32, u32, String)>>>,
+}
+
+impl DriveConsumer for RecordingDriveConsumer {
+    fn on_device_ready(
+        &mut self,
+        device_id: u32,
+        device_type: u32,
+        dos_name: &str,
+    ) -> Vec<DriveCommand> {
+        self.ready_devices
+            .lock()
+            .unwrap()
+            .push((device_id, device_type, dos_name.to_string()));
+        Vec::new()
+    }
+
+    fn on_create_reply(
+        &mut self,
+        _request_tag: u64,
+        _result: Result<rdpcore_rdpdr::irp::CreateReply, u32>,
+    ) -> Vec<DriveCommand> {
+        Vec::new()
+    }
+    fn on_close_reply(&mut self, _request_tag: u64, _status: u32) -> Vec<DriveCommand> {
+        Vec::new()
+    }
+    fn on_read_reply(
+        &mut self,
+        _request_tag: u64,
+        _result: Result<Vec<u8>, u32>,
+    ) -> Vec<DriveCommand> {
+        Vec::new()
+    }
+    fn on_write_reply(
+        &mut self,
+        _request_tag: u64,
+        _result: Result<u32, u32>,
+    ) -> Vec<DriveCommand> {
+        Vec::new()
+    }
+    fn on_query_directory_reply(
+        &mut self,
+        _request_tag: u64,
+        _result: Result<Option<rdpcore_rdpdr::irp::DirectoryEntry>, u32>,
+    ) -> Vec<DriveCommand> {
+        Vec::new()
+    }
+    fn on_set_information_reply(
+        &mut self,
+        _request_tag: u64,
+        _result: Result<(), u32>,
+    ) -> Vec<DriveCommand> {
+        Vec::new()
+    }
+}
+
+struct RecordingDriveFactory {
+    ready_devices: Arc<Mutex<Vec<(u32, u32, String)>>>,
+}
+
+impl DriveConsumerFactory for RecordingDriveFactory {
+    fn supported_device_types(&self) -> u32 {
+        rdpcore_rdpdr::pdu::RDPDR_DTYP_FILESYSTEM
+    }
+
+    fn build_drive_consumer(
+        &self,
+        _wake: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> Box<dyn DriveConsumer> {
+        Box::new(RecordingDriveConsumer {
+            ready_devices: Arc::clone(&self.ready_devices),
         })
     }
 }
@@ -1472,7 +1579,6 @@ fn encode_gfx_frame_acknowledge(queue_depth: u32, frame_id: u32) -> Vec<u8> {
     out
 }
 
-#[cfg(feature = "gfx")]
 fn encode_dvc_data_pdu(channel_id: u32, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + payload.len());
     out.push(0x30); // CMD_DATA << 4 | 0
@@ -1481,7 +1587,6 @@ fn encode_dvc_data_pdu(channel_id: u32, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-#[cfg(feature = "gfx")]
 fn read_dvc_var(
     cursor: &mut rdpcore_pdu::cursor::ReadCursor<'_>,
     sel: u8,
@@ -2015,4 +2120,377 @@ async fn test_e2e_gfx_fallback_to_planar_on_unsupported_caps() {
         reconstructed, expected_image,
         "Reconstructed planar tiles must match"
     );
+}
+
+// =====================================================================
+// MS-RDPEAI Audio Input (Microphone) DVC E2E Tests
+// =====================================================================
+
+#[tokio::test]
+async fn test_e2e_rdpeai_microphone_streaming() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tls, pub_key) = create_tls_acceptor_and_pubkey();
+    let creds = Credentials {
+        username: "testuser".to_string(),
+        password: "testpassword".to_string(),
+        domain: None,
+    };
+    let validator = Arc::new(ExactMatchCredentialValidator::new(creds.clone()));
+
+    let (display, _display_tx) = ChannelDisplay::new(64, 64);
+    let received_audio = Arc::new(Mutex::new(Vec::new()));
+    let audio_factory = RecordingAudioInputFactory {
+        received: Arc::clone(&received_audio),
+    };
+
+    let server = RdpServer::builder()
+        .with_listener(listener)
+        .with_tls(tls)
+        .with_tls_public_key(pub_key)
+        .with_display_handler(display)
+        .with_input_handler(NoopInput)
+        .with_credential_validator(Some(validator))
+        .with_nla_credentials(Some(creds))
+        .with_audio_input_factory(Some(Box::new(audio_factory)))
+        .build();
+
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut client = MockRdpClient::connect(
+        addr,
+        64,
+        64,
+        "testuser",
+        "testpassword",
+        vec!["drdynvc".to_string()],
+    )
+    .await;
+
+    let drdynvc_channel_id = 1004;
+    let mut audio_channel_id: Option<u32> = None;
+    let mut sent_audio_stream = false;
+    let test_pcm_data = vec![0x42u8; 960]; // 10ms of 48kHz 16-bit stereo
+
+    let received_check = Arc::clone(&received_audio);
+    let success = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = client.read_frame().await;
+            if frame.len() > 10
+                && frame[0] == 0x03
+                && let Ok(send_data) = SendData::decode_indication(&frame[7..])
+                && send_data.channel_id == drdynvc_channel_id
+                && let Ok((_, _, payload)) = svc::dechunkify(&send_data.data)
+            {
+                let mut cursor = rdpcore_pdu::cursor::ReadCursor::new(payload);
+                let Ok(header) = cursor.read_u8() else {
+                    continue;
+                };
+                let cmd = header >> 4;
+                let cb_id = header & 0x03;
+
+                match cmd {
+                    0x05 => {
+                        // CMD_CAPABILITY: Reply with CapsVersion 2
+                        let resp = vec![0x50, 0x00, 0x02, 0x00];
+                        client.send_channel_data(drdynvc_channel_id, &resp).await;
+                    }
+                    0x01 => {
+                        // CMD_CREATE: Read channel_id and channel_name
+                        if let Ok(chan_id) = read_dvc_var(&mut cursor, cb_id) {
+                            let rest = cursor.read_rest();
+                            let name = String::from_utf8_lossy(rest);
+                            if name.starts_with("AUDIO_INPUT") {
+                                audio_channel_id = Some(chan_id);
+                                let mut resp = Vec::new();
+                                resp.push(0x10); // CMD_CREATE
+                                resp.push(chan_id as u8);
+                                resp.extend_from_slice(&0u32.to_le_bytes()); // Status = OK
+                                client.send_channel_data(drdynvc_channel_id, &resp).await;
+                            }
+                        }
+                    }
+                    0x03 => {
+                        // CMD_DATA: RDPEAI message
+                        if let Ok(chan_id) = read_dvc_var(&mut cursor, cb_id)
+                            && Some(chan_id) == audio_channel_id
+                        {
+                            let msg_data = cursor.read_rest();
+                            if !msg_data.is_empty() {
+                                if msg_data[0] == 0x03 {
+                                    // MSG_OPEN from server: reply with OpenReply (success = 0)
+                                    let mut reply = Vec::new();
+                                    reply.push(0x04); // MSG_OPEN_REPLY
+                                    reply.extend_from_slice(&0u32.to_le_bytes()); // Result = 0
+                                    let dvc = encode_dvc_data_pdu(chan_id, &reply);
+                                    client.send_channel_data(drdynvc_channel_id, &dvc).await;
+
+                                    // Send audio stream
+                                    if !sent_audio_stream {
+                                        sent_audio_stream = true;
+                                        let mut data_pdu = vec![0x06u8]; // MSG_DATA
+                                        data_pdu.extend_from_slice(&test_pcm_data);
+                                        let dvc_data = encode_dvc_data_pdu(chan_id, &data_pdu);
+                                        client
+                                            .send_channel_data(drdynvc_channel_id, &dvc_data)
+                                            .await;
+
+                                        for _ in 0..50 {
+                                            tokio::time::sleep(Duration::from_millis(10)).await;
+                                            if !received_check.lock().unwrap().is_empty() {
+                                                return true;
+                                            }
+                                        }
+                                    }
+                                } else if let Ok(msg) = rdpeai_pdu::decode_client_message(msg_data)
+                                {
+                                    match msg {
+                                        rdpeai_pdu::ClientMessage::Version { .. } => {
+                                            // Reply with client version 2
+                                            let ver =
+                                                rdpeai_pdu::encode_version(rdpeai_pdu::VERSION_2);
+                                            let dvc = encode_dvc_data_pdu(chan_id, &ver);
+                                            client
+                                                .send_channel_data(drdynvc_channel_id, &dvc)
+                                                .await;
+                                        }
+                                        rdpeai_pdu::ClientMessage::Formats { formats } => {
+                                            // Echo matching formats back
+                                            let fmt_reply = rdpeai_pdu::encode_formats(&formats);
+                                            let dvc = encode_dvc_data_pdu(chan_id, &fmt_reply);
+                                            client
+                                                .send_channel_data(drdynvc_channel_id, &dvc)
+                                                .await;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await;
+
+    server_task.abort();
+    assert!(
+        success.unwrap_or(false),
+        "RDPEAI microphone handshake timed out"
+    );
+    let rec = received_audio.lock().unwrap().clone();
+    assert_eq!(rec.len(), 1, "Server backend must receive 1 audio packet");
+    assert_eq!(
+        rec[0], test_pcm_data,
+        "Received PCM samples must match sent audio bytes"
+    );
+}
+
+// =====================================================================
+// MS-RDPDR Filesystem / Device Redirection E2E Tests
+// =====================================================================
+
+fn encode_rdpdr_announce_reply(client_id: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x4472u16.to_le_bytes()); // RDPDR_CTYP_CORE
+    out.extend_from_slice(&0x496Eu16.to_le_bytes()); // PAKID_CORE_SERVER_ANNOUNCE
+    out.extend_from_slice(&1u16.to_le_bytes()); // major
+    out.extend_from_slice(&0x000Cu16.to_le_bytes()); // minor
+    out.extend_from_slice(&client_id.to_le_bytes());
+    out
+}
+
+fn encode_rdpdr_client_name(name: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x4472u16.to_le_bytes()); // RDPDR_CTYP_CORE
+    out.extend_from_slice(&0x434Eu16.to_le_bytes()); // PAKID_CORE_CLIENT_NAME
+    out.extend_from_slice(&0u32.to_le_bytes()); // unicode flag = 0 (ascii)
+    out.extend_from_slice(&0u32.to_le_bytes()); // code page
+    let bytes = name.as_bytes();
+    out.extend_from_slice(&(bytes.len() as u32 + 1).to_le_bytes());
+    out.extend_from_slice(bytes);
+    out.push(0); // NUL terminator
+    out
+}
+
+fn encode_rdpdr_client_capability() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x4472u16.to_le_bytes()); // RDPDR_CTYP_CORE
+    out.extend_from_slice(&0x4350u16.to_le_bytes()); // PAKID_CORE_CLIENT_CAPABILITY
+    out.extend_from_slice(&2u16.to_le_bytes()); // num_capabilities = 2
+    out.extend_from_slice(&0u16.to_le_bytes()); // pad
+
+    // General capability
+    out.extend_from_slice(&1u16.to_le_bytes()); // CAP_GENERAL_TYPE
+    out.extend_from_slice(&(8u16 + 36).to_le_bytes()); // length
+    out.extend_from_slice(&2u32.to_le_bytes()); // version 2
+    out.extend_from_slice(&0u32.to_le_bytes()); // osType
+    out.extend_from_slice(&0u32.to_le_bytes()); // osVersion
+    out.extend_from_slice(&1u16.to_le_bytes()); // protocolMajor
+    out.extend_from_slice(&0x000Cu16.to_le_bytes()); // protocolMinor
+    out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // ioCode1
+    out.extend_from_slice(&0u32.to_le_bytes()); // ioCode2
+    out.extend_from_slice(&7u32.to_le_bytes()); // extendedPdu
+    out.extend_from_slice(&1u32.to_le_bytes()); // extraFlags1
+    out.extend_from_slice(&0u32.to_le_bytes()); // extraFlags2
+    out.extend_from_slice(&0u32.to_le_bytes()); // SpecialTypeDeviceCap
+
+    // Drive capability
+    out.extend_from_slice(&4u16.to_le_bytes()); // CAP_DRIVE_TYPE
+    out.extend_from_slice(&8u16.to_le_bytes()); // length
+    out.extend_from_slice(&2u32.to_le_bytes()); // version 2
+    out
+}
+
+fn encode_rdpdr_device_list_announce(device_id: u32, device_type: u32, dos_name: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x4472u16.to_le_bytes()); // RDPDR_CTYP_CORE
+    out.extend_from_slice(&0x4441u16.to_le_bytes()); // PAKID_CORE_DEVICELIST_ANNOUNCE
+    out.extend_from_slice(&1u32.to_le_bytes()); // device_count = 1
+
+    out.extend_from_slice(&device_type.to_le_bytes());
+    out.extend_from_slice(&device_id.to_le_bytes());
+    let mut dos = [0u8; 8];
+    let b = dos_name.as_bytes();
+    let len = b.len().min(8);
+    dos[..len].copy_from_slice(&b[..len]);
+    out.extend_from_slice(&dos);
+    out.extend_from_slice(&0u32.to_le_bytes()); // device_data_len = 0
+    out
+}
+
+#[tokio::test]
+async fn test_e2e_rdpdr_channel_negotiation_and_device_announce() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tls, pub_key) = create_tls_acceptor_and_pubkey();
+    let creds = Credentials {
+        username: "testuser".to_string(),
+        password: "testpassword".to_string(),
+        domain: None,
+    };
+    let validator = Arc::new(ExactMatchCredentialValidator::new(creds.clone()));
+
+    let (display, _display_tx) = ChannelDisplay::new(64, 64);
+    let ready_devices = Arc::new(Mutex::new(Vec::new()));
+    let drive_factory = RecordingDriveFactory {
+        ready_devices: Arc::clone(&ready_devices),
+    };
+
+    let server = RdpServer::builder()
+        .with_listener(listener)
+        .with_tls(tls)
+        .with_tls_public_key(pub_key)
+        .with_display_handler(display)
+        .with_input_handler(NoopInput)
+        .with_credential_validator(Some(validator))
+        .with_nla_credentials(Some(creds))
+        .with_drive_factory(Some(Box::new(drive_factory)))
+        .build();
+
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut client = MockRdpClient::connect(
+        addr,
+        64,
+        64,
+        "testuser",
+        "testpassword",
+        vec!["rdpdr".to_string()],
+    )
+    .await;
+
+    let rdpdr_channel_id = 1004;
+    let mut announced_devices = false;
+
+    let success = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = client.read_frame().await;
+            if frame.len() > 10
+                && frame[0] == 0x03
+                && let Ok(send_data) = SendData::decode_indication(&frame[7..])
+                && send_data.channel_id == rdpdr_channel_id
+                && let Ok((_, _, payload)) = svc::dechunkify(&send_data.data)
+            {
+                if payload.len() < 4 {
+                    continue;
+                }
+                let component = u16::from_le_bytes([payload[0], payload[1]]);
+                let packet_id = u16::from_le_bytes([payload[2], payload[3]]);
+
+                if component == rdpdr_pdu::RDPDR_CTYP_CORE {
+                    match packet_id {
+                        rdpdr_pdu::PAKID_CORE_SERVER_ANNOUNCE => {
+                            // Client Announce Reply + Client Name Request
+                            let client_id = if payload.len() >= 12 {
+                                u32::from_le_bytes([
+                                    payload[8],
+                                    payload[9],
+                                    payload[10],
+                                    payload[11],
+                                ])
+                            } else {
+                                1
+                            };
+                            let reply = encode_rdpdr_announce_reply(client_id);
+                            client.send_channel_data(rdpdr_channel_id, &reply).await;
+
+                            let name_req = encode_rdpdr_client_name("MockClient");
+                            client.send_channel_data(rdpdr_channel_id, &name_req).await;
+                        }
+                        rdpdr_pdu::PAKID_CORE_SERVER_CAPABILITY => {
+                            // Client Capability Response
+                            let cap_resp = encode_rdpdr_client_capability();
+                            client.send_channel_data(rdpdr_channel_id, &cap_resp).await;
+                        }
+                        rdpdr_pdu::PAKID_CORE_USER_LOGGEDON => {
+                            // Announce shared filesystem device
+                            if !announced_devices {
+                                announced_devices = true;
+                                let dev_ann = encode_rdpdr_device_list_announce(
+                                    1,
+                                    rdpdr_pdu::RDPDR_DTYP_FILESYSTEM,
+                                    "SHARED",
+                                );
+                                client.send_channel_data(rdpdr_channel_id, &dev_ann).await;
+                            }
+                        }
+                        rdpdr_pdu::PAKID_CORE_DEVICE_REPLY => {
+                            // Server confirmed device announcement
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    server_task.abort();
+    assert!(
+        success.unwrap_or(false),
+        "RDPDR device redirection handshake timed out"
+    );
+    let devs = ready_devices.lock().unwrap().clone();
+    assert_eq!(
+        devs.len(),
+        1,
+        "Server DriveConsumer must receive 1 ready device"
+    );
+    assert_eq!(devs[0].0, 1, "Device ID must be 1");
+    assert_eq!(
+        devs[0].1,
+        rdpdr_pdu::RDPDR_DTYP_FILESYSTEM,
+        "Device type must be FILESYSTEM"
+    );
+    assert_eq!(devs[0].2, "SHARED", "DosName must match SHARED");
 }
