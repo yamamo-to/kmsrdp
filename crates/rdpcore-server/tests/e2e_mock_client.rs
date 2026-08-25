@@ -26,9 +26,7 @@ use rdpcore_pdu::rdp6;
 use rdpcore_pdu::svc;
 use rdpcore_pdu::x224::{self, ConnectionConfirm, ConnectionRequest, SecurityProtocol};
 use rdpcore_rdpsnd::pdu as rdpsnd_pdu;
-use rdpcore_rdpsnd::{
-    RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory, WavePublisher,
-};
+use rdpcore_rdpsnd::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory, WavePublisher};
 use rdpcore_server::tokio_rustls::TlsAcceptor;
 use rdpcore_server::tokio_rustls::client::TlsStream as ClientTlsStream;
 use rdpcore_server::tokio_rustls::rustls::pki_types::{
@@ -205,6 +203,87 @@ impl RdpServerDisplay for SingleFrameDisplay {
     }
 }
 
+fn make_bitmap_update(width: u16, height: u16, data: Vec<u8>) -> BitmapUpdate {
+    let w = core::num::NonZeroU16::new(width).unwrap();
+    let h = core::num::NonZeroU16::new(height).unwrap();
+    let stride = core::num::NonZeroUsize::new(usize::from(width) * 4).unwrap();
+    BitmapUpdate {
+        x: 0,
+        y: 0,
+        width: w,
+        height: h,
+        format: PixelFormat::BgrX32,
+        data: Arc::from(data),
+        stride,
+        src_x: 0,
+        src_y: 0,
+    }
+}
+
+struct ChannelDisplayUpdates {
+    rx: tokio::sync::mpsc::UnboundedReceiver<BitmapUpdate>,
+    latest: Option<BitmapUpdate>,
+}
+
+#[async_trait::async_trait]
+impl RdpServerDisplayUpdates for ChannelDisplayUpdates {
+    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>, rdpcore_server::DisplayError> {
+        if let Some(update) = self.rx.recv().await {
+            self.latest = Some(update.clone());
+            Ok(Some(DisplayUpdate::Bitmap(update)))
+        } else {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok(None)
+        }
+    }
+
+    fn latest_full_frame(&self) -> Option<BitmapUpdate> {
+        self.latest.clone()
+    }
+}
+
+struct ChannelDisplay {
+    initial_width: u16,
+    initial_height: u16,
+    rx_slot: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<BitmapUpdate>>>>,
+}
+
+impl ChannelDisplay {
+    fn new(width: u16, height: u16) -> (Self, tokio::sync::mpsc::UnboundedSender<BitmapUpdate>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self {
+                initial_width: width,
+                initial_height: height,
+                rx_slot: Arc::new(Mutex::new(Some(rx))),
+            },
+            tx,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl RdpServerDisplay for ChannelDisplay {
+    async fn size(&self) -> DesktopSize {
+        DesktopSize {
+            width: self.initial_width,
+            height: self.initial_height,
+        }
+    }
+
+    async fn updates(
+        &self,
+    ) -> Result<Box<dyn RdpServerDisplayUpdates>, rdpcore_server::DisplayError> {
+        let rx = self
+            .rx_slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("updates called once");
+        Ok(Box::new(ChannelDisplayUpdates { rx, latest: None }))
+    }
+}
+
 #[derive(Default)]
 struct RecordingInputHandler {
     keyboard_events: Arc<Mutex<Vec<KeyboardEvent>>>,
@@ -274,24 +353,20 @@ struct MockCliprdrBackend {
 
 impl CliprdrBackend for MockCliprdrBackend {
     fn on_ready(&mut self) {
-        let _ = self
-            .sender
-            .send(ClipboardMessage::SendInitiateCopy(vec![
-                ClipboardFormat::unicode_text(),
-            ]));
+        let _ = self.sender.send(ClipboardMessage::SendInitiateCopy(vec![
+            ClipboardFormat::unicode_text(),
+        ]));
     }
     fn on_remote_copy(&mut self, _formats: &[ClipboardFormat]) {}
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
         if request.format == cliprdr_pdu::CF_UNICODETEXT {
-            let _ = self
-                .sender
-                .send(ClipboardMessage::SendFormatData(
-                    FormatDataResponse::new_unicode_string(&self.text),
-                ));
+            let _ = self.sender.send(ClipboardMessage::SendFormatData(
+                FormatDataResponse::new_unicode_string(&self.text),
+            ));
         } else {
-            let _ = self
-                .sender
-                .send(ClipboardMessage::SendFormatData(FormatDataResponse::new_error()));
+            let _ = self.sender.send(ClipboardMessage::SendFormatData(
+                FormatDataResponse::new_error(),
+            ));
         }
     }
     fn on_format_data_response(&mut self, _response: FormatDataResponse) {}
@@ -373,7 +448,9 @@ async fn read_tpkt_or_fastpath_frame<R: AsyncRead + Unpin>(
 async fn read_n_tpkts<R: AsyncRead + Unpin>(reader: &mut R, n: usize) -> Vec<Vec<u8>> {
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        let frame = read_tpkt_or_fastpath_frame(reader).await.expect("read frame");
+        let frame = read_tpkt_or_fastpath_frame(reader)
+            .await
+            .expect("read frame");
         out.push(frame);
     }
     out
@@ -717,15 +794,8 @@ async fn test_e2e_bitmap_rendering_pixel_match() {
         let _ = server.run().await;
     });
 
-    let mut client = MockRdpClient::connect(
-        addr,
-        width,
-        height,
-        "testuser",
-        "testpassword",
-        Vec::new(),
-    )
-    .await;
+    let mut client =
+        MockRdpClient::connect(addr, width, height, "testuser", "testpassword", Vec::new()).await;
 
     // Client canvas to reconstruct the received frame
     let mut reconstructed = vec![0u8; usize::from(width) * usize::from(height) * 4];
@@ -751,8 +821,7 @@ async fn test_e2e_bitmap_rendering_pixel_match() {
                     let rect_w = usize::from(rect.width);
                     let rect_h = usize::from(rect.height);
                     let bgrx_pixels = if rect.compressed_scan_width.is_some() {
-                        rdp6::decode(&rect.data, rect_w, rect_h)
-                            .expect("decode rdp6 planar tile")
+                        rdp6::decode(&rect.data, rect_w, rect_h).expect("decode rdp6 planar tile")
                     } else {
                         rect.data.clone()
                     };
@@ -815,15 +884,8 @@ async fn test_e2e_input_injection_keyboard_and_mouse() {
         let _ = server.run().await;
     });
 
-    let mut client = MockRdpClient::connect(
-        addr,
-        64,
-        64,
-        "testuser",
-        "testpassword",
-        Vec::new(),
-    )
-    .await;
+    let mut client =
+        MockRdpClient::connect(addr, 64, 64, "testuser", "testpassword", Vec::new()).await;
 
     // Send input events: Scancodes (A press & release), Mouse move, Left Click, Wheels
     client
@@ -992,12 +1054,9 @@ async fn test_e2e_cliprdr_text_exchange() {
                     client.send_channel_data(cliprdr_channel_id, &resp).await;
                     if !requested {
                         requested = true;
-                        let req = cliprdr_pdu::encode_format_data_request(
-                            cliprdr_pdu::CF_UNICODETEXT,
-                        );
-                        client
-                            .send_channel_data(cliprdr_channel_id, &req)
-                            .await;
+                        let req =
+                            cliprdr_pdu::encode_format_data_request(cliprdr_pdu::CF_UNICODETEXT);
+                        client.send_channel_data(cliprdr_channel_id, &req).await;
                     }
                 }
                 cliprdr_pdu::ClientMessage::FormatDataResponse(
@@ -1129,16 +1188,7 @@ async fn test_e2e_rdpsnd_audio_streaming_and_confirm() {
             if msg_type == rdpsnd_pdu::SNDC_TRAINING {
                 // Reply with training confirm
                 let mut confirm = Vec::new();
-                confirm.extend_from_slice(&[
-                    rdpsnd_pdu::SNDC_TRAINING,
-                    0,
-                    4,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ]);
+                confirm.extend_from_slice(&[rdpsnd_pdu::SNDC_TRAINING, 0, 4, 0, 0, 0, 0, 0]);
                 client.send_channel_data(rdpsnd_channel_id, &confirm).await;
 
                 // Yield to let server process TrainingConfirm and transition to Ready
@@ -1148,10 +1198,7 @@ async fn test_e2e_rdpsnd_audio_streaming_and_confirm() {
                     audio_published = true;
                     let pub_guard = publisher_slot.lock().unwrap();
                     if let Some(ref publisher) = *pub_guard {
-                        publisher.publish(RdpsndServerMessage::Wave(
-                            vec![0xAA; 1764],
-                            12345,
-                        ));
+                        publisher.publish(RdpsndServerMessage::Wave(vec![0xAA; 1764], 12345));
                     }
                 }
             } else if msg_type == rdpsnd_pdu::SNDC_WAVE2 {
@@ -1182,5 +1229,790 @@ async fn test_e2e_rdpsnd_audio_streaming_and_confirm() {
     assert!(
         got_wave.unwrap_or(false),
         "Client must successfully receive audio Wave packet on rdpsnd channel"
+    );
+}
+
+// =====================================================================
+// MS-RDPEGFX (H.264 AVC420) DVC E2E Tests
+// =====================================================================
+
+#[cfg(feature = "gfx")]
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+enum GfxServerPdu {
+    CapsConfirm(rdpcore_rdpegfx::pdu::RawCapabilitySet),
+    ResetGraphics {
+        width: u32,
+        height: u32,
+    },
+    CreateSurface {
+        surface_id: u16,
+        width: u16,
+        height: u16,
+    },
+    DeleteSurface {
+        surface_id: u16,
+    },
+    MapSurfaceToOutput {
+        surface_id: u16,
+    },
+    StartFrame {
+        timestamp: u32,
+        frame_id: u32,
+    },
+    EndFrame {
+        frame_id: u32,
+    },
+    WireToSurface1Avc420 {
+        surface_id: u16,
+        width: u16,
+        height: u16,
+        data: Vec<u8>,
+    },
+    Other(u16),
+}
+
+#[cfg(feature = "gfx")]
+fn parse_gfx_pdus(payload: &[u8]) -> Vec<GfxServerPdu> {
+    let mut out = Vec::new();
+    let mut data = payload;
+    if data.len() >= 2 && data[0] == 0xe0 && data[1] == 0x04 {
+        data = &data[2..];
+    }
+    let mut cursor = rdpcore_pdu::cursor::ReadCursor::new(data);
+    while cursor.remaining() >= 8 {
+        let Ok(cmd_id) = cursor.read_u16_le() else {
+            break;
+        };
+        let Ok(_flags) = cursor.read_u16_le() else {
+            break;
+        };
+        let Ok(pdu_length) = cursor.read_u32_le() else {
+            break;
+        };
+        if pdu_length < 8 {
+            break;
+        }
+        let body_len = (pdu_length - 8) as usize;
+        let Ok(body) = cursor.read_slice(body_len) else {
+            break;
+        };
+        let mut body_cursor = rdpcore_pdu::cursor::ReadCursor::new(body);
+
+        match cmd_id {
+            0x0013 => {
+                if let (Ok(version), Ok(len)) =
+                    (body_cursor.read_u32_le(), body_cursor.read_u32_le())
+                    && let Ok(cap_data) = body_cursor.read_slice(len as usize)
+                {
+                    out.push(GfxServerPdu::CapsConfirm(
+                        rdpcore_rdpegfx::pdu::RawCapabilitySet {
+                            version,
+                            data: cap_data.to_vec(),
+                        },
+                    ));
+                }
+            }
+            0x000e => {
+                if let (Ok(w), Ok(h)) = (body_cursor.read_u32_le(), body_cursor.read_u32_le()) {
+                    out.push(GfxServerPdu::ResetGraphics {
+                        width: w,
+                        height: h,
+                    });
+                }
+            }
+            0x0009 => {
+                if let (Ok(surface_id), Ok(width), Ok(height)) = (
+                    body_cursor.read_u16_le(),
+                    body_cursor.read_u16_le(),
+                    body_cursor.read_u16_le(),
+                ) {
+                    out.push(GfxServerPdu::CreateSurface {
+                        surface_id,
+                        width,
+                        height,
+                    });
+                }
+            }
+            0x000a => {
+                if let Ok(surface_id) = body_cursor.read_u16_le() {
+                    out.push(GfxServerPdu::DeleteSurface { surface_id });
+                }
+            }
+            0x000f => {
+                if let Ok(surface_id) = body_cursor.read_u16_le() {
+                    out.push(GfxServerPdu::MapSurfaceToOutput { surface_id });
+                }
+            }
+            0x000b => {
+                if let (Ok(timestamp), Ok(frame_id)) =
+                    (body_cursor.read_u32_le(), body_cursor.read_u32_le())
+                {
+                    out.push(GfxServerPdu::StartFrame {
+                        timestamp,
+                        frame_id,
+                    });
+                }
+            }
+            0x000c => {
+                if let Ok(frame_id) = body_cursor.read_u32_le() {
+                    out.push(GfxServerPdu::EndFrame { frame_id });
+                }
+            }
+            0x0001 => {
+                if let (
+                    Ok(surface_id),
+                    Ok(codec_id),
+                    Ok(_pix),
+                    Ok(left),
+                    Ok(top),
+                    Ok(right),
+                    Ok(bottom),
+                    Ok(len),
+                ) = (
+                    body_cursor.read_u16_le(),
+                    body_cursor.read_u16_le(),
+                    body_cursor.read_u8(),
+                    body_cursor.read_u16_le(),
+                    body_cursor.read_u16_le(),
+                    body_cursor.read_u16_le(),
+                    body_cursor.read_u16_le(),
+                    body_cursor.read_u32_le(),
+                ) && let Ok(data) = body_cursor.read_slice(len as usize)
+                    && codec_id == 0x000b
+                {
+                    out.push(GfxServerPdu::WireToSurface1Avc420 {
+                        surface_id,
+                        width: right.saturating_sub(left),
+                        height: bottom.saturating_sub(top),
+                        data: data.to_vec(),
+                    });
+                }
+            }
+            other => {
+                out.push(GfxServerPdu::Other(other));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(feature = "gfx")]
+fn extract_h264_bitstream(avc420_data: &[u8]) -> &[u8] {
+    if avc420_data.len() < 14 {
+        return &[];
+    }
+    let mut cursor = rdpcore_pdu::cursor::ReadCursor::new(avc420_data);
+    let Ok(rects) = cursor.read_u32_le() else {
+        return &[];
+    };
+    let rect_bytes = (rects as usize) * 8;
+    if cursor.remaining() < rect_bytes + 2 {
+        return &[];
+    }
+    let _ = cursor.read_slice(rect_bytes);
+    let _ = cursor.read_u8(); // quantQualityVal
+    let _ = cursor.read_u8(); // quality
+    cursor.read_rest()
+}
+
+#[cfg(feature = "gfx")]
+fn find_nal_unit_types(bitstream: &[u8]) -> Vec<u8> {
+    let mut types = Vec::new();
+    let mut i = 0;
+    while i + 3 < bitstream.len() {
+        if bitstream[i] == 0 && bitstream[i + 1] == 0 && bitstream[i + 2] == 1 {
+            let nal_header = bitstream[i + 3];
+            types.push(nal_header & 0x1F);
+            i += 4;
+        } else if i + 4 < bitstream.len()
+            && bitstream[i] == 0
+            && bitstream[i + 1] == 0
+            && bitstream[i + 2] == 0
+            && bitstream[i + 3] == 1
+        {
+            let nal_header = bitstream[i + 4];
+            types.push(nal_header & 0x1F);
+            i += 5;
+        } else {
+            i += 1;
+        }
+    }
+    types
+}
+
+#[cfg(feature = "gfx")]
+fn encode_gfx_caps_advertise(sets: &[rdpcore_rdpegfx::pdu::RawCapabilitySet]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(sets.len() as u16).to_le_bytes());
+    for s in sets {
+        body.extend_from_slice(&s.version.to_le_bytes());
+        body.extend_from_slice(&(s.data.len() as u32).to_le_bytes());
+        body.extend_from_slice(&s.data);
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x0012u16.to_le_bytes()); // CMD_CAPS_ADVERTISE
+    out.extend_from_slice(&0u16.to_le_bytes()); // flags
+    out.extend_from_slice(&(8u32 + body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+#[cfg(feature = "gfx")]
+fn encode_gfx_frame_acknowledge(queue_depth: u32, frame_id: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&queue_depth.to_le_bytes());
+    body.extend_from_slice(&frame_id.to_le_bytes());
+    body.extend_from_slice(&frame_id.to_le_bytes()); // total_frames_decoded
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x000Du16.to_le_bytes()); // CMD_FRAME_ACKNOWLEDGE
+    out.extend_from_slice(&0u16.to_le_bytes()); // flags
+    out.extend_from_slice(&(8u32 + body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+#[cfg(feature = "gfx")]
+fn encode_dvc_data_pdu(channel_id: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + payload.len());
+    out.push(0x30); // CMD_DATA << 4 | 0
+    out.push(channel_id as u8);
+    out.extend_from_slice(payload);
+    out
+}
+
+#[cfg(feature = "gfx")]
+fn read_dvc_var(
+    cursor: &mut rdpcore_pdu::cursor::ReadCursor<'_>,
+    sel: u8,
+) -> Result<u32, rdpcore_pdu::DecodeError> {
+    match sel {
+        0 => Ok(u32::from(cursor.read_u8()?)),
+        1 => Ok(u32::from(cursor.read_u16_le()?)),
+        2 => Ok(cursor.read_u32_le()?),
+        _ => Err(rdpcore_pdu::DecodeError::InvalidValue {
+            field: "dvc.var",
+            reason: "invalid sel",
+        }),
+    }
+}
+
+#[cfg(feature = "gfx")]
+struct MockDvcClient {
+    gfx_channel_id: Option<u32>,
+    reassembly: Option<(u32, Vec<u8>)>,
+}
+
+#[cfg(feature = "gfx")]
+impl MockDvcClient {
+    fn new() -> Self {
+        Self {
+            gfx_channel_id: None,
+            reassembly: None,
+        }
+    }
+
+    fn handle_drdynvc_frame(&mut self, payload: &[u8]) -> (Option<Vec<u8>>, Vec<GfxServerPdu>) {
+        let mut responses = Vec::new();
+        let mut gfx_pdus = Vec::new();
+
+        let mut cursor = rdpcore_pdu::cursor::ReadCursor::new(payload);
+        let Ok(header) = cursor.read_u8() else {
+            return (None, gfx_pdus);
+        };
+        let cmd = header >> 4;
+        let sp = (header >> 2) & 0x03;
+        let cb_id = header & 0x03;
+
+        match cmd {
+            0x05 => {
+                // CMD_CAPABILITY
+                responses.extend_from_slice(&[0x50, 0x00, 0x02, 0x00]);
+            }
+            0x01 => {
+                // CMD_CREATE
+                if let Ok(channel_id) = read_dvc_var(&mut cursor, cb_id) {
+                    let rest = cursor.read_rest();
+                    let name = String::from_utf8_lossy(rest);
+                    if name.starts_with("Microsoft::Windows::RDS::Graphics") {
+                        self.gfx_channel_id = Some(channel_id);
+                        let mut resp = Vec::new();
+                        resp.push(0x10); // CMD_CREATE << 4 | 0
+                        resp.push(channel_id as u8);
+                        resp.extend_from_slice(&0u32.to_le_bytes());
+                        responses.extend_from_slice(&resp);
+                    }
+                }
+            }
+            0x03 => {
+                // CMD_DATA
+                if let Ok(channel_id) = read_dvc_var(&mut cursor, cb_id) {
+                    let chunk = cursor.read_rest();
+                    if let Some((total_len, ref mut buf)) = self.reassembly {
+                        buf.extend_from_slice(chunk);
+                        if buf.len() >= total_len as usize {
+                            let completed = self.reassembly.take().unwrap().1;
+                            gfx_pdus.extend(parse_gfx_pdus(&completed));
+                        }
+                    } else if Some(channel_id) == self.gfx_channel_id {
+                        gfx_pdus.extend(parse_gfx_pdus(chunk));
+                    }
+                }
+            }
+            0x02 => {
+                // CMD_DATA_FIRST
+                if let (Ok(channel_id), Ok(total_len)) = (
+                    read_dvc_var(&mut cursor, cb_id),
+                    read_dvc_var(&mut cursor, sp),
+                ) {
+                    let chunk = cursor.read_rest();
+                    if Some(channel_id) == self.gfx_channel_id {
+                        let mut buf = Vec::with_capacity(total_len as usize);
+                        buf.extend_from_slice(chunk);
+                        if buf.len() >= total_len as usize {
+                            gfx_pdus.extend(parse_gfx_pdus(&buf));
+                        } else {
+                            self.reassembly = Some((total_len, buf));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let resp = if responses.is_empty() {
+            None
+        } else {
+            Some(responses)
+        };
+        (resp, gfx_pdus)
+    }
+}
+
+#[cfg(feature = "gfx")]
+#[tokio::test]
+async fn test_e2e_gfx_avc420_streaming_and_ack() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tls, pub_key) = create_tls_acceptor_and_pubkey();
+    let creds = Credentials {
+        username: "testuser".to_string(),
+        password: "testpassword".to_string(),
+        domain: None,
+    };
+    let validator = Arc::new(ExactMatchCredentialValidator::new(creds.clone()));
+
+    let (display, display_tx) = ChannelDisplay::new(64, 64);
+    let server = RdpServer::builder()
+        .with_listener(listener)
+        .with_tls(tls)
+        .with_tls_public_key(pub_key)
+        .with_display_handler(display)
+        .with_input_handler(NoopInput)
+        .with_credential_validator(Some(validator))
+        .with_nla_credentials(Some(creds))
+        .with_gfx(true)
+        .build();
+
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut client = MockRdpClient::connect(
+        addr,
+        64,
+        64,
+        "testuser",
+        "testpassword",
+        vec!["drdynvc".to_string()],
+    )
+    .await;
+
+    let drdynvc_channel_id = 1004;
+    let mut dvc_client = MockDvcClient::new();
+    let mut caps_advertised = false;
+    let mut got_surface_configured = false;
+    let mut got_h264_frame = false;
+    let mut acknowledged_frame = false;
+
+    let success = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = client.read_frame().await;
+            if frame.len() > 10
+                && frame[0] == 0x03
+                && let Ok(send_data) = SendData::decode_indication(&frame[7..])
+                && send_data.channel_id == drdynvc_channel_id
+                && let Ok((_, _, payload)) = svc::dechunkify(&send_data.data)
+            {
+                let (dvc_resp, gfx_pdus) = dvc_client.handle_drdynvc_frame(payload);
+                if let Some(resp) = dvc_resp {
+                    client.send_channel_data(drdynvc_channel_id, &resp).await;
+
+                    if let Some(gfx_chan) = dvc_client.gfx_channel_id
+                        && !caps_advertised
+                    {
+                        caps_advertised = true;
+                        let caps = encode_gfx_caps_advertise(&[
+                            rdpcore_rdpegfx::pdu::RawCapabilitySet::flags_only(
+                                rdpcore_rdpegfx::pdu::CAP_VERSION_81,
+                                rdpcore_rdpegfx::pdu::CAPS_FLAG_AVC420_ENABLED,
+                            ),
+                        ]);
+                        let dvc_caps = encode_dvc_data_pdu(gfx_chan, &caps);
+                        client
+                            .send_channel_data(drdynvc_channel_id, &dvc_caps)
+                            .await;
+                    }
+                }
+
+                for pdu in gfx_pdus {
+                    match pdu {
+                        GfxServerPdu::CreateSurface {
+                            surface_id: 1,
+                            width: 64,
+                            height: 64,
+                        } => {
+                            got_surface_configured = true;
+                            // Send first frame update to server
+                            let pixels = vec![0x80u8; 64 * 64 * 4];
+                            let _ = display_tx.send(make_bitmap_update(64, 64, pixels));
+                        }
+                        GfxServerPdu::WireToSurface1Avc420 {
+                            surface_id: 1,
+                            data,
+                            ..
+                        } => {
+                            let bitstream = extract_h264_bitstream(&data);
+                            let nal_types = find_nal_unit_types(bitstream);
+                            // Must contain SPS (7), PPS (8), and IDR (5)
+                            if nal_types.contains(&7)
+                                && nal_types.contains(&8)
+                                && nal_types.contains(&5)
+                            {
+                                got_h264_frame = true;
+                                if let Some(gfx_chan) = dvc_client.gfx_channel_id
+                                    && !acknowledged_frame
+                                {
+                                    acknowledged_frame = true;
+                                    let ack = encode_gfx_frame_acknowledge(0, 1);
+                                    let dvc_ack = encode_dvc_data_pdu(gfx_chan, &ack);
+                                    client.send_channel_data(drdynvc_channel_id, &dvc_ack).await;
+                                    return true;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    server_task.abort();
+    assert!(got_surface_configured, "GFX surface must be configured");
+    assert!(
+        got_h264_frame,
+        "Must receive valid H.264 AVC420 frame with SPS/PPS/IDR"
+    );
+    assert!(
+        success.unwrap_or(false),
+        "GFX AVC420 streaming test timed out"
+    );
+}
+
+#[cfg(feature = "gfx")]
+#[tokio::test]
+async fn test_e2e_gfx_dynamic_resize() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tls, pub_key) = create_tls_acceptor_and_pubkey();
+    let creds = Credentials {
+        username: "testuser".to_string(),
+        password: "testpassword".to_string(),
+        domain: None,
+    };
+    let validator = Arc::new(ExactMatchCredentialValidator::new(creds.clone()));
+
+    let (display, display_tx) = ChannelDisplay::new(64, 64);
+    let server = RdpServer::builder()
+        .with_listener(listener)
+        .with_tls(tls)
+        .with_tls_public_key(pub_key)
+        .with_display_handler(display)
+        .with_input_handler(NoopInput)
+        .with_credential_validator(Some(validator))
+        .with_nla_credentials(Some(creds))
+        .with_gfx(true)
+        .build();
+
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut client = MockRdpClient::connect(
+        addr,
+        64,
+        64,
+        "testuser",
+        "testpassword",
+        vec!["drdynvc".to_string()],
+    )
+    .await;
+
+    let drdynvc_channel_id = 1004;
+    let mut dvc_client = MockDvcClient::new();
+    let mut caps_advertised = false;
+    let mut got_surface_1 = false;
+    let mut got_surface_2 = false;
+    let mut deleted_surface_1 = false;
+
+    let success = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = client.read_frame().await;
+            if frame.len() > 10
+                && frame[0] == 0x03
+                && let Ok(send_data) = SendData::decode_indication(&frame[7..])
+                && send_data.channel_id == drdynvc_channel_id
+                && let Ok((_, _, payload)) = svc::dechunkify(&send_data.data)
+            {
+                let (dvc_resp, gfx_pdus) = dvc_client.handle_drdynvc_frame(payload);
+                if let Some(resp) = dvc_resp {
+                    client.send_channel_data(drdynvc_channel_id, &resp).await;
+
+                    if let Some(gfx_chan) = dvc_client.gfx_channel_id
+                        && !caps_advertised
+                    {
+                        caps_advertised = true;
+                        let caps = encode_gfx_caps_advertise(&[
+                            rdpcore_rdpegfx::pdu::RawCapabilitySet::flags_only(
+                                rdpcore_rdpegfx::pdu::CAP_VERSION_81,
+                                rdpcore_rdpegfx::pdu::CAPS_FLAG_AVC420_ENABLED,
+                            ),
+                        ]);
+                        let dvc_caps = encode_dvc_data_pdu(gfx_chan, &caps);
+                        client
+                            .send_channel_data(drdynvc_channel_id, &dvc_caps)
+                            .await;
+                    }
+                }
+
+                for pdu in gfx_pdus {
+                    match pdu {
+                        GfxServerPdu::CreateSurface {
+                            surface_id: 1,
+                            width: 64,
+                            height: 64,
+                        } => {
+                            got_surface_1 = true;
+                            // Send initial 64x64 frame
+                            let pixels = vec![0x55u8; 64 * 64 * 4];
+                            let _ = display_tx.send(make_bitmap_update(64, 64, pixels));
+                        }
+                        GfxServerPdu::WireToSurface1Avc420 { surface_id: 1, .. } => {
+                            // Once first frame arrived, trigger resize to 80x48
+                            let pixels2 = vec![0xAAu8; 80 * 48 * 4];
+                            let _ = display_tx.send(make_bitmap_update(80, 48, pixels2));
+                        }
+                        GfxServerPdu::DeleteSurface { surface_id: 1 } => {
+                            deleted_surface_1 = true;
+                        }
+                        GfxServerPdu::CreateSurface {
+                            surface_id: 2,
+                            width: 80,
+                            height: 48,
+                        } => {
+                            got_surface_2 = true;
+                        }
+                        GfxServerPdu::WireToSurface1Avc420 {
+                            surface_id: 2,
+                            width: 80,
+                            height: 48,
+                            data,
+                        } => {
+                            let bitstream = extract_h264_bitstream(&data);
+                            let nal_types = find_nal_unit_types(bitstream);
+                            if nal_types.contains(&7)
+                                && nal_types.contains(&8)
+                                && nal_types.contains(&5)
+                            {
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    server_task.abort();
+    assert!(got_surface_1, "Surface 1 must be created");
+    assert!(deleted_surface_1, "Surface 1 must be deleted on resize");
+    assert!(
+        got_surface_2,
+        "Surface 2 must be created with new dimensions 80x48"
+    );
+    assert!(
+        success.unwrap_or(false),
+        "GFX dynamic resize test timed out"
+    );
+}
+
+#[cfg(feature = "gfx")]
+#[tokio::test]
+async fn test_e2e_gfx_fallback_to_planar_on_unsupported_caps() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tls, pub_key) = create_tls_acceptor_and_pubkey();
+    let creds = Credentials {
+        username: "testuser".to_string(),
+        password: "testpassword".to_string(),
+        domain: None,
+    };
+    let validator = Arc::new(ExactMatchCredentialValidator::new(creds.clone()));
+
+    let width = 64u16;
+    let height = 64u16;
+    let mut expected_image = vec![0u8; usize::from(width) * usize::from(height) * 4];
+    for y in 0..usize::from(height) {
+        for x in 0..usize::from(width) {
+            let idx = (y * usize::from(width) + x) * 4;
+            expected_image[idx] = 0x12; // B
+            expected_image[idx + 1] = 0x34; // G
+            expected_image[idx + 2] = 0x56; // R
+            expected_image[idx + 3] = 0; // X
+        }
+    }
+
+    let (display, display_tx) = ChannelDisplay::new(width, height);
+    let server = RdpServer::builder()
+        .with_listener(listener)
+        .with_tls(tls)
+        .with_tls_public_key(pub_key)
+        .with_display_handler(display)
+        .with_input_handler(NoopInput)
+        .with_credential_validator(Some(validator))
+        .with_nla_credentials(Some(creds))
+        .with_gfx(true)
+        .build();
+
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut client = MockRdpClient::connect(
+        addr,
+        width,
+        height,
+        "testuser",
+        "testpassword",
+        vec!["drdynvc".to_string()],
+    )
+    .await;
+
+    let drdynvc_channel_id = 1004;
+    let mut dvc_client = MockDvcClient::new();
+    let mut caps_advertised = false;
+    let mut reconstructed = vec![0u8; usize::from(width) * usize::from(height) * 4];
+    let mut total_tiles_decoded = 0;
+
+    let success = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = client.read_frame().await;
+            if frame.is_empty() {
+                continue;
+            }
+
+            // Check if it's a FastPath output packet (Planar fallback)
+            if frame[0] & 0x03 == 0 {
+                if let Ok(fastpath) = FastPathOutput::decode(&frame) {
+                    for update in fastpath.updates {
+                        if update.update_code != UPDATE_CODE_BITMAP {
+                            continue;
+                        }
+                        if let Ok(bitmap_data) = fastpath::BitmapUpdateData::decode(&update.data) {
+                            for rect in bitmap_data.rectangles {
+                                let rect_w = usize::from(rect.width);
+                                let rect_h = usize::from(rect.height);
+                                let bgrx_pixels = if rect.compressed_scan_width.is_some() {
+                                    rdp6::decode(&rect.data, rect_w, rect_h)
+                                        .expect("decode rdp6 planar tile")
+                                } else {
+                                    rect.data.clone()
+                                };
+
+                                for ry in 0..rect_h {
+                                    let cy = usize::from(rect.dest_top) + (rect_h - 1 - ry);
+                                    let cx = usize::from(rect.dest_left);
+                                    let dst_start = (cy * usize::from(width) + cx) * 4;
+                                    let src_start = (ry * rect_w) * 4;
+                                    reconstructed[dst_start..dst_start + rect_w * 4]
+                                        .copy_from_slice(
+                                            &bgrx_pixels[src_start..src_start + rect_w * 4],
+                                        );
+                                }
+                                total_tiles_decoded += 1;
+                                if total_tiles_decoded >= 1 {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if frame.len() > 10
+                && frame[0] == 0x03
+                && let Ok(send_data) = SendData::decode_indication(&frame[7..])
+                && send_data.channel_id == drdynvc_channel_id
+                && let Ok((_, _, payload)) = svc::dechunkify(&send_data.data)
+            {
+                let (dvc_resp, _) = dvc_client.handle_drdynvc_frame(payload);
+                if let Some(resp) = dvc_resp {
+                    client.send_channel_data(drdynvc_channel_id, &resp).await;
+
+                    if let Some(gfx_chan) = dvc_client.gfx_channel_id
+                        && !caps_advertised
+                    {
+                        caps_advertised = true;
+                        // Send CapsAdvertise with NO AVC420 support (flags = 0)
+                        let caps = encode_gfx_caps_advertise(&[
+                            rdpcore_rdpegfx::pdu::RawCapabilitySet::flags_only(
+                                rdpcore_rdpegfx::pdu::CAP_VERSION_81,
+                                0,
+                            ),
+                        ]);
+                        let dvc_caps = encode_dvc_data_pdu(gfx_chan, &caps);
+                        client
+                            .send_channel_data(drdynvc_channel_id, &dvc_caps)
+                            .await;
+
+                        // Yield to let server process unsupported Caps and abandon GFX
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+
+                        // Now push a bitmap frame to trigger fallback Planar encoding
+                        let _ = display_tx.send(make_bitmap_update(
+                            width,
+                            height,
+                            expected_image.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    server_task.abort();
+    assert!(
+        success.unwrap_or(false),
+        "Must fall back to Planar tiles when AVC420 is unsupported"
+    );
+    assert_eq!(
+        reconstructed, expected_image,
+        "Reconstructed planar tiles must match"
     );
 }
