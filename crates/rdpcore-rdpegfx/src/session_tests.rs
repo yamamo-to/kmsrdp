@@ -11,6 +11,23 @@ fn expect_frames(result: GfxFrameResult) -> Vec<Vec<u8>> {
     }
 }
 
+fn encode_frame_ack_for_test(queue_depth: u32, frame_id: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.write_u16_le(0x000d);
+    out.write_u16_le(0);
+    out.write_u32_le(20);
+    out.write_u32_le(queue_depth);
+    out.write_u32_le(frame_id);
+    out.write_u32_le(0);
+    out
+}
+
+fn is_idr_frame(frames: &[Vec<u8>]) -> bool {
+    frames
+        .iter()
+        .any(|f| f.windows(5).any(|w| w == [0, 0, 0, 1, 0x65]))
+}
+
 fn encode_caps_advertise_for_test(sets: &[RawCapabilitySet]) -> Vec<u8> {
     let mut body = Vec::new();
     body.write_u16_le(sets.len() as u16);
@@ -181,6 +198,57 @@ fn frame_ack_unavailable_clears_in_flight_pressure() {
         session.encode_frame(16, 16, 16 * 4, &pixels),
         GfxFrameResult::Frames(_)
     ));
+}
+
+#[test]
+fn encode_frame_skips_once_client_reports_a_full_queue() {
+    let session = GfxSession::mock(16, 16);
+    let mut handler = session.dvc_handler();
+    let advertise = encode_caps_advertise_for_test(&[RawCapabilitySet::flags_only(
+        CAP_VERSION_81,
+        CAPS_FLAG_AVC420_ENABLED,
+    )]);
+    let _ = handler.on_data(&advertise);
+    let pixels = vec![0u8; 16 * 16 * 4];
+    let _ = expect_frames(session.encode_frame(16, 16, 16 * 4, &pixels));
+
+    let ack = encode_frame_ack_for_test(MAX_FRAMES_IN_FLIGHT, 1);
+    assert!(handler.on_data(&ack).is_empty());
+
+    // Client says its queue is already at the cap - back off instead of
+    // encoding (and definitely instead of forcing a bigger IDR into it).
+    assert_eq!(
+        session.encode_frame(16, 16, 16 * 4, &pixels),
+        GfxFrameResult::Skip
+    );
+}
+
+#[test]
+fn encode_frame_resumes_without_a_forced_idr_once_the_client_queue_drains() {
+    let session = GfxSession::mock(16, 16);
+    let mut handler = session.dvc_handler();
+    let advertise = encode_caps_advertise_for_test(&[RawCapabilitySet::flags_only(
+        CAP_VERSION_81,
+        CAPS_FLAG_AVC420_ENABLED,
+    )]);
+    let _ = handler.on_data(&advertise);
+    let pixels = vec![0u8; 16 * 16 * 4];
+    // First frame is always an IDR; get it out of the way.
+    let _ = expect_frames(session.encode_frame(16, 16, 16 * 4, &pixels));
+
+    let _ = handler.on_data(&encode_frame_ack_for_test(MAX_FRAMES_IN_FLIGHT, 1));
+    assert_eq!(
+        session.encode_frame(16, 16, 16 * 4, &pixels),
+        GfxFrameResult::Skip
+    );
+
+    // Client catches up and reports a small queue again.
+    let _ = handler.on_data(&encode_frame_ack_for_test(5, 2));
+    let frames = expect_frames(session.encode_frame(16, 16, 16 * 4, &pixels));
+    assert!(
+        !is_idr_frame(&frames),
+        "resuming from a clean skip must not need a forced IDR"
+    );
 }
 
 #[test]

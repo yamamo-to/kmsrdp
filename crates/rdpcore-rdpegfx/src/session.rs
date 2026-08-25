@@ -19,7 +19,10 @@ fn recover_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 const DEFAULT_SURFACE_ID: u16 = 1;
-/// Soft cap — mstsc often delays FrameAcknowledge.
+/// Backpressure cap: encoding stops once the client (via FrameAcknowledge)
+/// reports this many frames still outstanding, and only resumes once a
+/// later ack reports the queue has drained below it. Generous because
+/// mstsc often delays FrameAcknowledge under normal conditions.
 const MAX_FRAMES_IN_FLIGHT: u32 = 32;
 const QUEUE_DEPTH_UNAVAILABLE: u32 = 0xffff_ffff;
 /// Force an IDR at least this often so a lost/corrupt frame cannot leave
@@ -281,8 +284,17 @@ impl Inner {
         }
 
         if self.frames_in_flight >= MAX_FRAMES_IN_FLIGHT {
-            self.frames_in_flight = MAX_FRAMES_IN_FLIGHT / 2;
-            self.force_next_idr = true;
+            // The client's own FrameAcknowledge says it hasn't kept up -
+            // skip this frame outright instead of forcing a bigger IDR
+            // frame into an already-backed-up decode queue. That used to
+            // make an overloaded client's queue balloon further (observed:
+            // queue_depth spiking into the tens of thousands right before
+            // the client gave up and closed the connection). No IDR is
+            // needed to resume: we never called the encoder for the
+            // skipped frames, so its reference frame is still the last one
+            // actually sent, and normal delta-frame encoding against it is
+            // correct once FrameAcknowledge reports the queue has drained.
+            return Err(GfxFrameResult::Skip);
         }
 
         let force_idr = self.force_next_idr
