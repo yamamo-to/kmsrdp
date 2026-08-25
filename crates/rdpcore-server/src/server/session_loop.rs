@@ -22,8 +22,7 @@ use tracing::{debug, warn};
 
 use crate::display::{BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay};
 use crate::encode::{
-    BitmapEncodePolicy, bitmap_encode_policy, bump_color_loss_on_backlog,
-    client_needs_compat_workarounds, covers_desktop, decay_color_loss_after_catchup, resync_bitmap,
+    bitmap_encode_policy, client_needs_compat_workarounds, covers_desktop, resync_bitmap,
     retain_bitmap_during_resize,
 };
 use crate::error::{SessionError, finish_session};
@@ -311,44 +310,8 @@ where
         .unwrap_or(server_mfu)
         .min(server_mfu)
         .max(fastpath::MAX_FASTPATH_CHUNK_SIZE as u32);
-    let mut bitmap_policy =
+    let bitmap_policy =
         bitmap_encode_policy(client_label, accepted.nscodec, max_request_size as usize);
-    // The color_loss_level the client actually negotiated - the floor
-    // `decay_color_loss_after_catchup` claws back down to, never below it.
-    let negotiated_color_loss = bitmap_policy.nscodec.map(|(_, cll)| cll);
-    let mut current_color_loss = negotiated_color_loss.unwrap_or(0);
-    if let Some(cll) = negotiated_color_loss {
-        debug!(color_loss_level = cll, "NSCodec negotiated");
-    }
-    // Consecutive clean (non-deferred) pumps since the last backlog-driven
-    // quality bump - `DECAY_AFTER_CLEAN_SENDS` of these earns one step back
-    // toward `negotiated_color_loss`.
-    let mut clean_sends_since_backlog: u32 = 0;
-    const DECAY_AFTER_CLEAN_SENDS: u32 = 60;
-    // The very first full-desktop send is inherently large (a whole 4K
-    // frame, not an incremental diff) and takes noticeably longer than any
-    // later pump - that's expected, not the link falling behind, so don't
-    // let it trip the same miss counter that drives color_loss escalation
-    // (it otherwise reliably hits MISSED_BEFORE_RESYNC before the first
-    // frame is even off the wire, maxing out color_loss on every connect
-    // before the client has painted anything). Catch-up bookkeeping
-    // (merge/resync) still applies as normal during this window - only the
-    // quality escalation is held off.
-    let mut sent_first_frame = false;
-    // `MISSED_BEFORE_RESYNC` is a cheap, frequently-true threshold by
-    // design (3 dirty-rect messages arriving while one send is still in
-    // flight is routine - a single capture tick commonly emits several
-    // separate `DisplayUpdate::Bitmap` messages for different changed
-    // regions, all faster than one encode+send cycle). That's fine for
-    // choosing union-vs-resync, but degrading visual quality every time it
-    // fires is not: observed live, ~8000 bumps in 3 minutes of ordinary
-    // use, permanently pinning color_loss at max from routine bursts that
-    // never reflected sustained trouble. Rate-limit the *quality* side
-    // effect to real elapsed time instead - a burst within one capture
-    // tick can cost at most one step; only backlog that's still there
-    // `MIN_COLOR_LOSS_BUMP_INTERVAL` later earns another.
-    let mut last_color_loss_bump: Option<std::time::Instant> = None;
-    const MIN_COLOR_LOSS_BUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(750);
     // Above this many bytes still unacknowledged in the kernel's TCP send
     // buffer, treat the connection as busy regardless of what our own
     // `bulk_send` bookkeeping thinks - see `socket_backlog`'s doc comment.
@@ -696,25 +659,11 @@ where
                             if missed_since_last_send >= MISSED_BEFORE_RESYNC {
                                 pending_resync = true;
                                 deferred_bitmap = None;
-                                // Reset so the *next* bump needs another
+                                // Reset so the next resync needs another
                                 // full run of misses, not the very next
-                                // dirty-rect - without this, every miss
-                                // while still backed up re-triggers this
-                                // branch (the counter only ever grows),
-                                // cascading color_loss to max in one burst
-                                // instead of one step per real escalation.
+                                // dirty-rect (the counter only ever grows
+                                // otherwise).
                                 missed_since_last_send = 0;
-                                if sent_first_frame
-                                    && last_color_loss_bump
-                                        .is_none_or(|t| t.elapsed() >= MIN_COLOR_LOSS_BUMP_INTERVAL)
-                                {
-                                    current_color_loss =
-                                        bump_color_loss_on_backlog(current_color_loss);
-                                    set_color_loss_level(&mut bitmap_policy, current_color_loss);
-                                    clean_sends_since_backlog = 0;
-                                    last_color_loss_bump = Some(std::time::Instant::now());
-                                    debug!(color_loss_level = current_color_loss, "NSCodec backlog: raised color_loss_level");
-                                }
                             } else {
                                 deferred_bitmap = Some(match deferred_bitmap.take() {
                                     Some(prev) => prev.union(bitmap),
@@ -755,11 +704,6 @@ where
                                 pending_resync = false;
                                 last_synced_full = None;
                                 resync_target = None;
-                                current_color_loss = negotiated_color_loss.unwrap_or(0);
-                                clean_sends_since_backlog = 0;
-                                sent_first_frame = false;
-                                last_color_loss_bump = None;
-                                set_color_loss_level(&mut bitmap_policy, current_color_loss);
                                 if frame_sender.send(Frame { channel: ChannelKey::Io, priority: Priority::Latency, bytes: response }).is_err() {
                                     return finish_session(Err(SessionError::WriterClosed));
                                 }
@@ -837,19 +781,6 @@ where
                         // re-triggers this branch instead of needing a
                         // fresh run of misses.
                         missed_since_last_send = 0;
-                        if sent_first_frame
-                            && last_color_loss_bump
-                                .is_none_or(|t| t.elapsed() >= MIN_COLOR_LOSS_BUMP_INTERVAL)
-                        {
-                            current_color_loss = bump_color_loss_on_backlog(current_color_loss);
-                            set_color_loss_level(&mut bitmap_policy, current_color_loss);
-                            clean_sends_since_backlog = 0;
-                            last_color_loss_bump = Some(std::time::Instant::now());
-                            debug!(
-                                color_loss_level = current_color_loss,
-                                "NSCodec backlog: raised color_loss_level"
-                            );
-                        }
                     } else {
                         deferred_bitmap = Some(match deferred_bitmap.take() {
                             Some(prev) => prev.union(bitmap),
@@ -860,22 +791,6 @@ where
                 continue;
             }
             missed_since_last_send = 0;
-            sent_first_frame = true;
-            if let Some(floor) = negotiated_color_loss {
-                clean_sends_since_backlog += 1;
-                if clean_sends_since_backlog >= DECAY_AFTER_CLEAN_SENDS {
-                    clean_sends_since_backlog = 0;
-                    let decayed = decay_color_loss_after_catchup(current_color_loss, floor);
-                    if decayed != current_color_loss {
-                        current_color_loss = decayed;
-                        set_color_loss_level(&mut bitmap_policy, current_color_loss);
-                        debug!(
-                            color_loss_level = current_color_loss,
-                            "NSCodec caught up: lowered color_loss_level"
-                        );
-                    }
-                }
-            }
             if use_resync_catchup {
                 if let Some(synced) = resync_target.take() {
                     last_synced_full = Some(synced);
@@ -929,14 +844,6 @@ where
 
 fn trim_client_name(name: &str) -> &str {
     name.trim_end_matches('\0').trim()
-}
-
-/// Applies a new NSCodec color_loss_level to `policy` in place. No-op for
-/// non-NSCodec clients (`policy.nscodec` is `None`).
-fn set_color_loss_level(policy: &mut BitmapEncodePolicy, level: u8) {
-    if let Some((codec_id, _)) = policy.nscodec {
-        policy.nscodec = Some((codec_id, level));
-    }
 }
 
 /// Consumes a pending catch-up flag and turns it into a bitmap to send (via
