@@ -61,6 +61,7 @@ fn advertise_unicode_formats(sender: &UnboundedSender<ClipboardMessage>) -> bool
 /// Wayland-only sessions still work.
 fn spawn_shared_clipboard_watcher(
     subscribers: Arc<Mutex<Vec<UnboundedSender<ClipboardMessage>>>>,
+    last_written: Arc<Mutex<Option<String>>>,
     mut session_rx: watch::Receiver<Option<Session>>,
 ) {
     tokio::spawn(async move {
@@ -69,7 +70,7 @@ fn spawn_shared_clipboard_watcher(
             .unwrap_or(None);
         let mut xfixes_stop = Arc::new(AtomicBool::new(false));
         let mut xfixes_active =
-            start_xfixes_watch(Arc::clone(&subscribers), Arc::clone(&xfixes_stop));
+            start_xfixes_watch(Arc::clone(&subscribers), Arc::clone(&last_written), Arc::clone(&xfixes_stop));
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {
@@ -83,8 +84,11 @@ fn spawn_shared_clipboard_watcher(
                     }
                     let current = tokio::task::spawn_blocking(local_text).await.unwrap_or(None);
                     if current != last && matches!(&current, Some(t) if !t.is_empty()) {
-                        let mut subs = subscribers.lock().unwrap_or_else(|e| e.into_inner());
-                        subs.retain(advertise_unicode_formats);
+                        let written = last_written.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        if !matches!((&current, &written), (Some(c), Some(w)) if c == w) {
+                            let mut subs = subscribers.lock().unwrap_or_else(|e| e.into_inner());
+                            subs.retain(advertise_unicode_formats);
+                        }
                     }
                     last = current;
                 }
@@ -97,7 +101,7 @@ fn spawn_shared_clipboard_watcher(
                     xfixes_stop.store(true, Ordering::SeqCst);
                     xfixes_stop = Arc::new(AtomicBool::new(false));
                     xfixes_active =
-                        start_xfixes_watch(Arc::clone(&subscribers), Arc::clone(&xfixes_stop));
+                        start_xfixes_watch(Arc::clone(&subscribers), Arc::clone(&last_written), Arc::clone(&xfixes_stop));
                 }
             }
         }
@@ -106,6 +110,7 @@ fn spawn_shared_clipboard_watcher(
 
 fn start_xfixes_watch(
     subscribers: Arc<Mutex<Vec<UnboundedSender<ClipboardMessage>>>>,
+    last_written: Arc<Mutex<Option<String>>>,
     stop: Arc<AtomicBool>,
 ) -> Arc<AtomicBool> {
     let active = Arc::new(AtomicBool::new(false));
@@ -113,7 +118,7 @@ fn start_xfixes_watch(
     let _ = std::thread::Builder::new()
         .name("kmsrdp-clip-xfixes".into())
         .spawn(
-            move || match xfixes_selection_loop(&subscribers, &stop, &active_for_thread) {
+            move || match xfixes_selection_loop(&subscribers, &last_written, &stop, &active_for_thread) {
                 Ok(()) => {}
                 Err(e) => {
                     active_for_thread.store(false, Ordering::SeqCst);
@@ -126,6 +131,7 @@ fn start_xfixes_watch(
 
 fn xfixes_selection_loop(
     subscribers: &Mutex<Vec<UnboundedSender<ClipboardMessage>>>,
+    last_written: &Mutex<Option<String>>,
     stop: &AtomicBool,
     active: &AtomicBool,
 ) -> std::io::Result<()> {
@@ -175,6 +181,7 @@ fn xfixes_selection_loop(
     active.store(true, Ordering::SeqCst);
 
     use std::os::unix::io::AsRawFd as _;
+    let mut last_advertised: Option<String> = None;
 
     while !stop.load(Ordering::Relaxed) {
         match conn.poll_for_event() {
@@ -184,7 +191,15 @@ fn xfixes_selection_loop(
                 if !subs.is_empty() {
                     let current = local_text();
                     if matches!(&current, Some(t) if !t.is_empty()) {
-                        subs.retain(advertise_unicode_formats);
+                        let written = last_written.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        if matches!((&current, &written), (Some(c), Some(w)) if c == w) {
+                            last_advertised = current;
+                            continue;
+                        }
+                        if current != last_advertised {
+                            last_advertised = current.clone();
+                            subs.retain(advertise_unicode_formats);
+                        }
                     }
                 }
             }
@@ -244,15 +259,17 @@ impl ClipboardMode {
 pub struct LocalClipboardFactory {
     subscribers: Arc<Mutex<Vec<UnboundedSender<ClipboardMessage>>>>,
     mode: ClipboardMode,
+    last_written: Arc<Mutex<Option<String>>>,
 }
 
 impl LocalClipboardFactory {
     pub fn new(session_rx: watch::Receiver<Option<Session>>, mode: ClipboardMode) -> Self {
         let subscribers = Arc::new(Mutex::new(Vec::new()));
+        let last_written = Arc::new(Mutex::new(None));
         if mode.allows_host_to_client() {
-            spawn_shared_clipboard_watcher(subscribers.clone(), session_rx);
+            spawn_shared_clipboard_watcher(subscribers.clone(), last_written.clone(), session_rx);
         }
-        Self { subscribers, mode }
+        Self { subscribers, mode, last_written }
     }
 }
 
@@ -272,6 +289,7 @@ impl CliprdrBackendFactory for LocalClipboardFactory {
             mode: self.mode,
             remote_has_text: false,
             delay_first_paste: true,
+            last_written: self.last_written.clone(),
         })
     }
 }
@@ -282,6 +300,7 @@ struct LocalClipboardBackend {
     remote_has_text: bool,
     /// First paste is delayed; later ones go out immediately.
     delay_first_paste: bool,
+    last_written: Arc<Mutex<Option<String>>>,
 }
 
 impl LocalClipboardBackend {
@@ -370,7 +389,11 @@ impl CliprdrBackend for LocalClipboardBackend {
             return;
         }
         if let Some(text) = response.to_unicode_string() {
+            let last_written = self.last_written.clone();
             let execute = move || {
+                if let Ok(mut guard) = last_written.lock() {
+                    *guard = Some(text.clone());
+                }
                 set_local_text(text);
             };
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -484,6 +507,7 @@ mod tests {
                 mode,
                 remote_has_text: false,
                 delay_first_paste: true,
+                last_written: Arc::new(Mutex::new(None)),
             },
             rx,
         )
@@ -507,7 +531,8 @@ mod tests {
     async fn session_change_resets_watcher_state() {
         let (session_tx, session_rx) = watch::channel(None);
         let subscribers = Arc::new(Mutex::new(Vec::<UnboundedSender<ClipboardMessage>>::new()));
-        spawn_shared_clipboard_watcher(Arc::clone(&subscribers), session_rx);
+        let last_written = Arc::new(Mutex::new(None));
+        spawn_shared_clipboard_watcher(Arc::clone(&subscribers), last_written, session_rx);
         session_tx
             .send(Some(test_session(Some(":254"))))
             .expect("send session");
