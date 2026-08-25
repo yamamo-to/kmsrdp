@@ -287,17 +287,36 @@ impl CliprdrBackendFactory for LocalClipboardFactory {
         Box::new(LocalClipboardBackend {
             sender,
             mode: self.mode,
-            remote_has_text: false,
+            remote_text_format: None,
             delay_first_paste: true,
             last_written: self.last_written.clone(),
         })
     }
 }
 
+pub const CF_TEXT: u32 = 1;
+pub const CF_OEMTEXT: u32 = 7;
+
+pub fn is_text_format(id: u32) -> bool {
+    matches!(id, CF_TEXT | CF_OEMTEXT | CF_UNICODETEXT)
+}
+
+fn select_text_format(formats: &[ClipboardFormat]) -> Option<u32> {
+    if formats.iter().any(|f| f.id == CF_UNICODETEXT) {
+        Some(CF_UNICODETEXT)
+    } else if formats.iter().any(|f| f.id == CF_TEXT) {
+        Some(CF_TEXT)
+    } else if formats.iter().any(|f| f.id == CF_OEMTEXT) {
+        Some(CF_OEMTEXT)
+    } else {
+        None
+    }
+}
+
 struct LocalClipboardBackend {
     sender: UnboundedSender<ClipboardMessage>,
     mode: ClipboardMode,
-    remote_has_text: bool,
+    remote_text_format: Option<u32>,
     /// First paste is delayed; later ones go out immediately.
     delay_first_paste: bool,
     last_written: Arc<Mutex<Option<String>>>,
@@ -307,9 +326,7 @@ impl LocalClipboardBackend {
     /// `Some(delay)` when a Format Data Request should be sent; `None` when
     /// this advertisement is inside the debounce window or has no unicode.
     fn paste_delay(&mut self) -> Option<Duration> {
-        if !self.remote_has_text {
-            return None;
-        }
+        self.remote_text_format?;
         if self.delay_first_paste {
             self.delay_first_paste = false;
             Some(Duration::from_millis(500))
@@ -323,7 +340,7 @@ impl core::fmt::Debug for LocalClipboardBackend {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LocalClipboardBackend")
             .field("mode", &self.mode)
-            .field("remote_has_text", &self.remote_has_text)
+            .field("remote_text_format", &self.remote_text_format)
             .finish()
     }
 }
@@ -344,26 +361,29 @@ impl CliprdrBackend for LocalClipboardBackend {
         if !self.mode.allows_client_to_host() {
             return;
         }
-        self.remote_has_text = available_formats.iter().any(|f| f.id == CF_UNICODETEXT);
+        self.remote_text_format = select_text_format(available_formats);
+        let Some(format_id) = self.remote_text_format else {
+            return;
+        };
         let Some(delay) = self.paste_delay() else {
             return;
         };
         let sender = self.sender.clone();
         if delay.is_zero() {
-            let _ = sender.send(ClipboardMessage::SendInitiatePaste(CF_UNICODETEXT));
+            let _ = sender.send(ClipboardMessage::SendInitiatePaste(format_id));
         } else {
             // Pulling the remote clipboard immediately during CLIPRDR startup
             // overlaps channel setup on macOS Windows App and has been observed
             // to coincide with abrupt disconnects. Delay the first paste request.
             tokio::spawn(async move {
                 tokio::time::sleep(delay).await;
-                let _ = sender.send(ClipboardMessage::SendInitiatePaste(CF_UNICODETEXT));
+                let _ = sender.send(ClipboardMessage::SendInitiatePaste(format_id));
             });
         }
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
-        if !self.mode.allows_host_to_client() || request.format != CF_UNICODETEXT {
+        if !self.mode.allows_host_to_client() || !is_text_format(request.format) {
             let _ = self.sender.send(ClipboardMessage::SendFormatData(
                 FormatDataResponse::new_error(),
             ));
@@ -461,13 +481,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_copy_without_unicode_skips_paste() {
+    async fn remote_copy_without_text_skips_paste() {
         let factory = LocalClipboardFactory::new(session_rx(), ClipboardMode::default());
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut backend = factory.build_cliprdr_backend(tx);
-        backend.on_remote_copy(&[ClipboardFormat { id: 1 }]);
+        backend.on_remote_copy(&[ClipboardFormat { id: 999 }]);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_copy_with_cf_text_triggers_paste() {
+        let factory = LocalClipboardFactory::new(session_rx(), ClipboardMode::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut backend = factory.build_cliprdr_backend(tx);
+        backend.on_remote_copy(&[ClipboardFormat { id: CF_TEXT }]);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        match rx.try_recv().expect("expected initiate paste") {
+            ClipboardMessage::SendInitiatePaste(format) => assert_eq!(format, CF_TEXT),
+            _ => panic!("expected SendInitiatePaste"),
+        }
     }
 
     #[tokio::test]
@@ -505,7 +538,7 @@ mod tests {
             LocalClipboardBackend {
                 sender: tx,
                 mode,
-                remote_has_text: false,
+                remote_text_format: None,
                 delay_first_paste: true,
                 last_written: Arc::new(Mutex::new(None)),
             },
@@ -516,13 +549,13 @@ mod tests {
     #[test]
     fn paste_delay_delays_first_then_allows_immediate_later_copies() {
         let (mut backend, _rx) = backend(ClipboardMode::Bidirectional);
-        backend.remote_has_text = true;
+        backend.remote_text_format = Some(CF_UNICODETEXT);
         assert_eq!(backend.paste_delay(), Some(Duration::from_millis(500)));
         assert_eq!(backend.paste_delay(), Some(Duration::ZERO));
     }
 
     #[test]
-    fn paste_delay_skips_when_no_unicode() {
+    fn paste_delay_skips_when_no_text() {
         let (mut backend, _rx) = backend(ClipboardMode::Bidirectional);
         assert_eq!(backend.paste_delay(), None);
     }

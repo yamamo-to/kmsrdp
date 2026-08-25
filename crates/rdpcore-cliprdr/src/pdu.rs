@@ -148,6 +148,21 @@ pub enum FormatDataStatus {
     Failed,
 }
 
+fn decode_text_body(body: &[u8]) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+    if body.len() >= 2
+        && (body.len() & 1) == 0
+        && (body[1] == 0 || body.iter().step_by(2).skip(1).any(|&b| b == 0))
+    {
+        utf16::read_fixed(body)
+    } else {
+        let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+        String::from_utf8_lossy(&body[..end]).into_owned()
+    }
+}
+
 pub fn decode_client_message(input: &[u8]) -> Result<ClientMessage, DecodeError> {
     let mut cursor = ReadCursor::new(input);
     let msg_type = cursor.read_u16_le()?;
@@ -167,7 +182,7 @@ pub fn decode_client_message(input: &[u8]) -> Result<ClientMessage, DecodeError>
                 Ok(ClientMessage::FormatDataResponse(FormatDataStatus::Failed))
             } else {
                 Ok(ClientMessage::FormatDataResponse(FormatDataStatus::Ok(
-                    utf16::read_fixed(body),
+                    decode_text_body(body),
                 )))
             }
         }
