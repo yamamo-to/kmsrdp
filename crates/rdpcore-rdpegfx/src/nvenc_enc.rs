@@ -66,15 +66,15 @@ impl CudaCtx {
             > = lib
                 .get(b"cuCtxCreate_v2")
                 .or_else(|_| lib.get(b"cuCtxCreate"))
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| EncoderError::InitFailed(e.to_string()))?;
             let mut ctx = ptr::null_mut();
             if cu_ctx_create(&mut ctx, 0, device) != 0 {
-                return Err("cuCtxCreate failed".into());
+                return Err(EncoderError::InitFailed("cuCtxCreate failed".into()));
             }
             let destroy: libloading::Symbol<unsafe extern "C" fn(*mut c_void) -> u32> = lib
                 .get(b"cuCtxDestroy_v2")
                 .or_else(|_| lib.get(b"cuCtxDestroy"))
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| EncoderError::InitFailed(e.to_string()))?;
             Ok(Self {
                 destroy: *destroy,
                 _lib: lib,
