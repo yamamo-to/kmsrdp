@@ -1,3 +1,15 @@
+kmsrdp (0.1.61) unstable; urgency=medium
+
+  * Fix NSCodec catch-up backlog growing unboundedly under sustained
+    display churn (e.g. video), causing multi-minute latency.
+  * Gate NSCodec catch-up on real kernel TCP send backlog, not just our
+    own send-queue bookkeeping.
+  * Fix GFX backpressure forcing a bigger IDR frame into an already
+    backed-up client.
+  * Fix nvenc feature failing to compile (EncoderError type mismatch).
+
+ -- kmsrdp contributors <noreply@example.com>  Tue, 25 Aug 2026 22:50:00 +0900
+
 kmsrdp (0.1.60) unstable; urgency=medium
 
   * Fix Guacamole clipboard synchronization and echo loop suppression.

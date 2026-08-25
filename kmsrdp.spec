@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.60
+Version:        0.1.61
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,12 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Tue Aug 25 2026 kmsrdp contributors <noreply@example.com> - 0.1.61-1
+- Fix NSCodec catch-up backlog growing unboundedly under sustained display churn (e.g. video), causing multi-minute latency
+- Gate NSCodec catch-up on real kernel TCP send backlog, not just our own send-queue bookkeeping
+- Fix GFX backpressure forcing a bigger IDR frame into an already backed-up client
+- Fix nvenc feature failing to compile (EncoderError type mismatch)
+
 * Tue Aug 25 2026 kmsrdp contributors <noreply@example.com> - 0.1.60-1
 - Fix Guacamole clipboard synchronization and echo loop suppression
 - Support CF_TEXT and CF_OEMTEXT formats alongside CF_UNICODETEXT
