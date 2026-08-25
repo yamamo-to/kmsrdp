@@ -682,6 +682,14 @@ where
                             if missed_since_last_send >= MISSED_BEFORE_RESYNC {
                                 pending_resync = true;
                                 deferred_bitmap = None;
+                                // Reset so the *next* bump needs another
+                                // full run of misses, not the very next
+                                // dirty-rect - without this, every miss
+                                // while still backed up re-triggers this
+                                // branch (the counter only ever grows),
+                                // cascading color_loss to max in one burst
+                                // instead of one step per real escalation.
+                                missed_since_last_send = 0;
                                 if sent_first_frame {
                                     current_color_loss =
                                         bump_color_loss_on_backlog(current_color_loss);
@@ -805,6 +813,11 @@ where
                     if missed_since_last_send >= MISSED_BEFORE_RESYNC {
                         pending_resync = true;
                         deferred_bitmap = None;
+                        // See the matching comment at the other call site -
+                        // without this, every miss while already flagged
+                        // re-triggers this branch instead of needing a
+                        // fresh run of misses.
+                        missed_since_last_send = 0;
                         if sent_first_frame {
                             current_color_loss = bump_color_loss_on_backlog(current_color_loss);
                             set_color_loss_level(&mut bitmap_policy, current_color_loss);
