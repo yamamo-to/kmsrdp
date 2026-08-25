@@ -21,7 +21,8 @@ use tracing::{debug, warn};
 
 use crate::display::{BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay};
 use crate::encode::{
-    bitmap_encode_policy, client_needs_compat_workarounds, retain_bitmap_during_resize,
+    bitmap_encode_policy, client_needs_compat_workarounds, covers_desktop, resync_bitmap,
+    retain_bitmap_during_resize,
 };
 use crate::error::{SessionError, finish_session};
 use crate::input::{ConnectionScopedInput, RdpServerInputHandler};
@@ -306,13 +307,54 @@ where
         .max(fastpath::MAX_FASTPATH_CHUNK_SIZE as u32);
     let bitmap_policy =
         bitmap_encode_policy(client_label, accepted.nscodec, max_request_size as usize);
+    // Scopes every catch-up-path behavior change below to NSCodec clients
+    // (macOS "Windows App") - the ones actually affected by the residual-
+    // pixel/growing-latency issues this exists to fix, since NSCodec's
+    // slow, untiled encode is what makes this session fall behind often
+    // enough to matter. Planar clients (mstsc, xfreerdp, ...) keep the
+    // exact prior "latest wins" catch-up behavior, unchanged, so this work
+    // can't regress them.
+    let use_resync_catchup = bitmap_policy.nscodec.is_some();
     let defer_ms = initial_bitmap_defer_ms(client_label, bitmap_policy.nscodec.is_some());
     let mut metrics = SessionBitmapMetrics::default();
     let mut bitmap_gate_open = defer_ms == 0;
     let mut bitmap_gate = Box::pin(tokio::time::sleep(std::time::Duration::from_millis(
         defer_ms,
     )));
+    // Cheap catch-up path for the common case: a rect that arrives while
+    // this session can't act on it yet (startup gate still closed, or a
+    // bulk send already in flight) is merged here via `BitmapUpdate::union`
+    // - no frame-wide diff, same cost as before this catch-up logic
+    // existed at all. Escalates to `pending_resync` only after
+    // `MISSED_BEFORE_RESYNC` consecutive misses (see there for why:
+    // occasional single misses are normal encode/send latency and not
+    // worth a full-frame diff for; a real backlog is).
     let mut deferred_bitmap: Option<BitmapUpdate> = None;
+    let mut missed_since_last_send: u32 = 0;
+    /// After this many consecutive misses, switch from unioning
+    /// (`deferred_bitmap`) to a real diff-based resync. A running union's
+    /// bounding box only grows across cycles - fine for a couple of
+    /// misses, but under sustained load (e.g. video) it keeps re-encoding
+    /// a bigger area every cycle, falling further behind each time.
+    /// Resyncing pays a full-frame diff once instead of letting that
+    /// compound; low-value for the 1-2-miss case this exists to keep
+    /// cheap, so the threshold stays above that.
+    const MISSED_BEFORE_RESYNC: u32 = 3;
+    // Set once `missed_since_last_send` crosses the threshold above. When
+    // it's finally ready to pump again, `resync_bitmap` recomputes
+    // exactly what's different from `last_synced_full` rather than
+    // resending whatever rect happened to arrive most recently - see its
+    // doc comment for why that matters under sustained load.
+    let mut pending_resync = false;
+    // The last full-desktop frame this session is confirmed to have sent
+    // in its entirety (either directly, or as the baseline a resync
+    // diffed against and then fully covered).
+    let mut last_synced_full: Option<BitmapUpdate> = None;
+    // Set alongside `bitmap_to_pump` when it came from a resync, so once
+    // that pump actually gets queued for sending, `last_synced_full` only
+    // advances to it then - not before, since a resync only reflects
+    // reality once it's actually been handed off to be sent.
+    let mut resync_target: Option<BitmapUpdate> = None;
     let mut display_updates_allowed = true;
     let mut frame_id = 1u32;
     let io_channel_id = accepted.io_channel_id;
@@ -539,13 +581,43 @@ where
                     Err(_) => return finish_session(Err(SessionError::EncodeJoin)),
                 }
                 if display_updates_allowed && bitmap_gate_open {
-                    bitmap_to_pump = deferred_bitmap.take();
+                    if pending_resync {
+                        let (pump, target) = match take_pending_resync(
+                            &mut pending_resync,
+                            last_synced_full.clone(),
+                            updates.latest_full_frame(),
+                        )
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => return finish_session(Err(e)),
+                        };
+                        bitmap_to_pump = pump;
+                        resync_target = target;
+                    } else {
+                        bitmap_to_pump = deferred_bitmap.take();
+                    }
                 }
             }
             _ = &mut bitmap_gate, if !bitmap_gate_open => {
                 bitmap_gate_open = true;
                 if display_updates_allowed {
-                    bitmap_to_pump = deferred_bitmap.take();
+                    if pending_resync {
+                        let (pump, target) = match take_pending_resync(
+                            &mut pending_resync,
+                            last_synced_full.clone(),
+                            updates.latest_full_frame(),
+                        )
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => return finish_session(Err(e)),
+                        };
+                        bitmap_to_pump = pump;
+                        resync_target = target;
+                    } else {
+                        bitmap_to_pump = deferred_bitmap.take();
+                    }
                 }
             }
             update = updates.next_update() => {
@@ -557,10 +629,24 @@ where
                             bitmap,
                             resize_desktop.width,
                             resize_desktop.height,
+                            use_resync_catchup,
                         );
                     }
                     Ok(Some(DisplayUpdate::Bitmap(bitmap))) if !bitmap_gate_open => {
-                        deferred_bitmap = Some(bitmap);
+                        if !use_resync_catchup {
+                            deferred_bitmap = Some(bitmap);
+                        } else {
+                            missed_since_last_send += 1;
+                            if missed_since_last_send >= MISSED_BEFORE_RESYNC {
+                                pending_resync = true;
+                                deferred_bitmap = None;
+                            } else {
+                                deferred_bitmap = Some(match deferred_bitmap.take() {
+                                    Some(prev) => prev.union(bitmap),
+                                    None => bitmap,
+                                });
+                            }
+                        }
                     }
                     Ok(Some(DisplayUpdate::Bitmap(_))) if !display_updates_allowed => {}
                     Ok(Some(DisplayUpdate::Bitmap(bitmap))) => {
@@ -590,6 +676,10 @@ where
                                 resize_desktop = size;
                                 pending_after_resize = None;
                                 deferred_bitmap = None;
+                                missed_since_last_send = 0;
+                                pending_resync = false;
+                                last_synced_full = None;
+                                resync_target = None;
                                 if frame_sender.send(Frame { channel: ChannelKey::Io, priority: Priority::Latency, bytes: response }).is_err() {
                                     return finish_session(Err(SessionError::WriterClosed));
                                 }
@@ -642,8 +732,29 @@ where
 
         if let Some(bitmap) = bitmap_to_pump {
             if bulk_send.0.is_some() {
-                deferred_bitmap = Some(bitmap);
+                if !use_resync_catchup {
+                    deferred_bitmap = Some(bitmap);
+                } else {
+                    missed_since_last_send += 1;
+                    if missed_since_last_send >= MISSED_BEFORE_RESYNC {
+                        pending_resync = true;
+                        deferred_bitmap = None;
+                    } else {
+                        deferred_bitmap = Some(match deferred_bitmap.take() {
+                            Some(prev) => prev.union(bitmap),
+                            None => bitmap,
+                        });
+                    }
+                }
                 continue;
+            }
+            missed_since_last_send = 0;
+            if use_resync_catchup {
+                if let Some(synced) = resync_target.take() {
+                    last_synced_full = Some(synced);
+                } else if covers_desktop(&bitmap, resize_desktop.width, resize_desktop.height) {
+                    last_synced_full = Some(bitmap.clone());
+                }
             }
             let full = updates.latest_full_frame();
             #[cfg(feature = "gfx")]
@@ -673,7 +784,11 @@ where
                 &mut frame_id,
                 &mut metrics,
                 &mut bulk_send.0,
-                &mut deferred_bitmap,
+                // `bulk_send.0` is always `None` here (checked just above),
+                // so `encode_and_queue_bitmap`'s own defer branch never
+                // fires - this session tracks catch-up itself via
+                // `pending_resync`/`resync_bitmap` instead.
+                &mut None,
                 gfx_frames,
                 gfx_handled,
             )
@@ -687,6 +802,41 @@ where
 
 fn trim_client_name(name: &str) -> &str {
     name.trim_end_matches('\0').trim()
+}
+
+/// Consumes a pending catch-up flag and turns it into a bitmap to send (via
+/// [`resync_bitmap`]), plus the full-frame baseline `last_synced_full`
+/// should advance to once that bitmap is actually queued for sending.
+/// Returns `(None, None)` if there was nothing pending, the display has no
+/// full frame yet, or the resync found nothing actually different.
+///
+/// `resync_bitmap` walks the whole frame (a tile-diff, same cost class as
+/// the capture-side dirty-diff it mirrors) - run on the blocking pool, not
+/// inline on this connection's select! task, for the same reason
+/// `encode_outbound_bitmap` does: a synchronous full-frame scan here would
+/// otherwise stall Fast-Path input dispatch (and every other connection
+/// sharing this runtime) for its duration on every catch-up cycle.
+async fn take_pending_resync(
+    pending_resync: &mut bool,
+    last_synced_full: Option<BitmapUpdate>,
+    latest_full: Option<BitmapUpdate>,
+) -> Result<(Option<BitmapUpdate>, Option<BitmapUpdate>), SessionError> {
+    if !std::mem::take(pending_resync) {
+        return Ok((None, None));
+    }
+    let Some(full) = latest_full else {
+        return Ok((None, None));
+    };
+    let full_for_diff = full.clone();
+    let merged = tokio::task::spawn_blocking(move || {
+        resync_bitmap(last_synced_full.as_ref(), &full_for_diff)
+    })
+    .await
+    .map_err(|_| SessionError::EncodeJoin)?;
+    Ok(match merged {
+        Some(merged) => (Some(merged), Some(full)),
+        None => (None, None),
+    })
 }
 
 fn initial_bitmap_defer_ms(client_name: &str, using_nscodec: bool) -> u64 {

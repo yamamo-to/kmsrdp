@@ -105,6 +105,63 @@ impl BitmapUpdate {
             src_y,
         })
     }
+
+    /// Bounding-box union of two dirty-rect updates from the same frame
+    /// geometry, backed by `newer`'s (more current) pixel data.
+    ///
+    /// A pending update that gets superseded before it's ever sent must not
+    /// simply be replaced: the capture-side dirty-diff baseline has already
+    /// moved past that rect the moment it was captured, so once dropped
+    /// here it will never be re-flagged as dirty and that region of the
+    /// client's screen goes stale permanently. Unioning instead guarantees
+    /// every dirty rect that was ever produced ends up covered by some sent
+    /// update.
+    pub fn union(self, newer: BitmapUpdate) -> BitmapUpdate {
+        if self.stride != newer.stride || self.format != newer.format {
+            // Different frame geometry (e.g. mid-resize) - can't safely
+            // address `self`'s rect through `newer`'s buffer, so fall back
+            // to `newer` alone rather than risk an out-of-bounds read.
+            return newer;
+        }
+        let x = self.x.min(newer.x);
+        let y = self.y.min(newer.y);
+        let right = (u32::from(self.x) + u32::from(self.width.get()))
+            .max(u32::from(newer.x) + u32::from(newer.width.get()));
+        let bottom = (u32::from(self.y) + u32::from(self.height.get()))
+            .max(u32::from(newer.y) + u32::from(newer.height.get()));
+        let dims = (
+            NonZeroU16::new((right - u32::from(x)) as u16),
+            NonZeroU16::new((bottom - u32::from(y)) as u16),
+        );
+        let (Some(width), Some(height)) = dims else {
+            return newer;
+        };
+        // Defensive, same check `sub()` makes: both inputs are expected to
+        // be views into a full-desktop-sized buffer (every production
+        // `BitmapUpdate` is), so this never trips - but if that invariant
+        // is ever violated, fall back to `newer` alone rather than read
+        // past the end of its backing buffer.
+        const BYTES_PER_PIXEL: usize = 4;
+        let last = (usize::from(y) + usize::from(height.get()).saturating_sub(1))
+            .saturating_mul(newer.stride.get())
+            .saturating_add(
+                (usize::from(x) + usize::from(width.get())).saturating_mul(BYTES_PER_PIXEL),
+            );
+        if last > newer.data.len() {
+            return newer;
+        }
+        BitmapUpdate {
+            x,
+            y,
+            width,
+            height,
+            format: newer.format,
+            data: newer.data,
+            stride: newer.stride,
+            src_x: x,
+            src_y: y,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,5 +273,67 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn union_covers_both_disjoint_rects() {
+        let full = full_frame(128, 128, 0);
+        let earlier = full
+            .sub(
+                0,
+                0,
+                NonZeroU16::new(16).unwrap(),
+                NonZeroU16::new(16).unwrap(),
+            )
+            .unwrap();
+        let later = full
+            .sub(
+                100,
+                100,
+                NonZeroU16::new(8).unwrap(),
+                NonZeroU16::new(8).unwrap(),
+            )
+            .unwrap();
+        let merged = earlier.union(later);
+        assert_eq!((merged.x, merged.y), (0, 0));
+        assert_eq!(merged.width.get(), 108);
+        assert_eq!(merged.height.get(), 108);
+        assert_eq!((merged.src_x, merged.src_y), (0, 0));
+    }
+
+    #[test]
+    fn union_of_overlapping_rects_is_bounding_box() {
+        let full = full_frame(64, 64, 0);
+        let a = full
+            .sub(
+                10,
+                10,
+                NonZeroU16::new(20).unwrap(),
+                NonZeroU16::new(20).unwrap(),
+            )
+            .unwrap();
+        let b = full
+            .sub(
+                20,
+                5,
+                NonZeroU16::new(20).unwrap(),
+                NonZeroU16::new(10).unwrap(),
+            )
+            .unwrap();
+        let merged = a.union(b);
+        assert_eq!((merged.x, merged.y), (10, 5));
+        // right edge: max(10+20, 20+20) = 40; bottom edge: max(10+20, 5+10) = 30
+        assert_eq!(merged.width.get(), 30);
+        assert_eq!(merged.height.get(), 25);
+    }
+
+    #[test]
+    fn union_falls_back_to_newer_on_stride_mismatch() {
+        let a = full_frame(64, 64, 1);
+        let b = full_frame(32, 32, 2);
+        let merged = a.union(b.clone());
+        assert_eq!(merged.width, b.width);
+        assert_eq!(merged.height, b.height);
+        assert!(Arc::ptr_eq(&merged.data, &b.data));
     }
 }

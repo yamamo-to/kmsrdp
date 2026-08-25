@@ -2,9 +2,12 @@
 //! Extracted from the accept/session loop so tiling, compression, and
 //! resize-pending frame choice can be tested without a live socket.
 
+use core::num::NonZeroU16;
+
 use rdpcore_pdu::capability_sets::NsCodecNegotiated;
 use rdpcore_pdu::fastpath::{self, UPDATE_CODE_BITMAP, UPDATE_CODE_SURFACE_COMMANDS};
 
+use crate::diff::find_dirty_rects;
 use crate::display::BitmapUpdate;
 
 pub(crate) fn client_needs_compat_workarounds(client_name: &str) -> bool {
@@ -323,31 +326,106 @@ fn encode_rectangles_to_wire_frames(
     encode_update_to_wire_frames(UPDATE_CODE_BITMAP, &bitmap_bytes, max_request_size)
 }
 
-fn covers_desktop(bitmap: &BitmapUpdate, width: u16, height: u16) -> bool {
+pub(crate) fn covers_desktop(bitmap: &BitmapUpdate, width: u16, height: u16) -> bool {
     bitmap.x == 0 && bitmap.y == 0 && bitmap.width.get() == width && bitmap.height.get() == height
 }
 
 /// Keep the best frame seen while a resize handshake is in flight.
-/// Prefer a full-desktop bitmap (mstsc's canvas is blank after Deactivate-All);
-/// only replace an existing full frame with a newer full frame.
+/// Prefer a full-desktop bitmap (mstsc's canvas is blank after Deactivate-All).
+///
+/// When `merge_partials` is true (NSCodec/mac clients only - see
+/// `use_resync_catchup` at the call site), two partial tiles are merged
+/// (via [`BitmapUpdate::union`]) rather than the second replacing the
+/// first outright. When false, behavior is exactly the original
+/// "incoming full, or nothing full yet, wins" rule, unchanged for every
+/// other client.
 pub(crate) fn retain_bitmap_during_resize(
     pending: &mut Option<BitmapUpdate>,
     bitmap: BitmapUpdate,
     desktop_width: u16,
     desktop_height: u16,
+    merge_partials: bool,
 ) {
-    let incoming_full = covers_desktop(&bitmap, desktop_width, desktop_height);
     let have_full = pending
         .as_ref()
         .is_some_and(|p| covers_desktop(p, desktop_width, desktop_height));
-    if incoming_full || !have_full {
-        *pending = Some(bitmap);
+    let incoming_full = covers_desktop(&bitmap, desktop_width, desktop_height);
+    if !merge_partials {
+        if incoming_full || !have_full {
+            *pending = Some(bitmap);
+        }
+        return;
     }
+    *pending = Some(match (pending.take(), have_full, incoming_full) {
+        // A full frame already covers anything a later partial tile could add.
+        (Some(prev), true, false) => prev,
+        (Some(prev), _, _) => prev.union(bitmap),
+        (None, _, _) => bitmap,
+    });
+}
+
+/// Recomputes what actually changed since `last_synced_full` instead of
+/// resending whatever individual dirty rect happened to arrive most
+/// recently while this session was busy encoding/sending (gated at
+/// connect, or a bulk send still in flight).
+///
+/// That "latest wins" (or even a running bounding-box union of every rect
+/// that trickled in) has two failure modes under sustained load - e.g. a
+/// video playing in the captured desktop: it can drop a real change that
+/// never gets superseded by anything overlapping it, and a running union's
+/// bounding box only ever grows across cycles, so a session that falls
+/// behind re-encodes a bigger area every single catch-up cycle, which
+/// makes it fall further behind (the "latency stacks up over minutes"
+/// symptom). Diffing directly against the last confirmed-synced frame
+/// anchors every catch-up to what's actually different *right now* -
+/// a pixel that changed and changed back in between drops out for free,
+/// and the next catch-up starts fresh from this one's result instead of
+/// compounding on top of it.
+pub(crate) fn resync_bitmap(
+    last_synced_full: Option<&BitmapUpdate>,
+    current_full: &BitmapUpdate,
+) -> Option<BitmapUpdate> {
+    let prev = match last_synced_full {
+        Some(prev)
+            if prev.stride == current_full.stride
+                && prev.width == current_full.width
+                && prev.height == current_full.height =>
+        {
+            prev
+        }
+        // No confirmed baseline yet, or the geometry moved on (resize) -
+        // the safe answer is "everything", same as a fresh connection.
+        _ => return Some(current_full.clone()),
+    };
+    let rects = find_dirty_rects(
+        &prev.data,
+        prev.stride.get(),
+        &current_full.data,
+        current_full.stride.get(),
+        usize::from(current_full.width.get()),
+        usize::from(current_full.height.get()),
+        4,
+    );
+    rects.into_iter().fold(None, |merged, rect| {
+        let (Some(w), Some(h)) = (
+            NonZeroU16::new(rect.width as u16),
+            NonZeroU16::new(rect.height as u16),
+        ) else {
+            return merged;
+        };
+        let Some(sub) = current_full.sub(rect.x as u16, rect.y as u16, w, h) else {
+            return merged;
+        };
+        Some(match merged {
+            Some(m) => BitmapUpdate::union(m, sub),
+            None => sub,
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{covers_desktop, retain_bitmap_during_resize};
+    use super::{covers_desktop, resync_bitmap, retain_bitmap_during_resize};
     use crate::display::{BitmapUpdate, PixelFormat};
     use core::num::{NonZeroU16, NonZeroUsize};
 
@@ -380,8 +458,8 @@ mod tests {
     #[test]
     fn resize_pending_prefers_full_frame_over_later_tile() {
         let mut pending = None;
-        retain_bitmap_during_resize(&mut pending, bitmap(0, 0, 100, 50, 1), 100, 50);
-        retain_bitmap_during_resize(&mut pending, bitmap(0, 0, 64, 64, 2), 100, 50);
+        retain_bitmap_during_resize(&mut pending, bitmap(0, 0, 100, 50, 1), 100, 50, false);
+        retain_bitmap_during_resize(&mut pending, bitmap(0, 0, 64, 64, 2), 100, 50, false);
         let kept = pending.unwrap();
         assert!(covers_desktop(&kept, 100, 50));
         assert_eq!(kept.data[0], 1);
@@ -390,11 +468,110 @@ mod tests {
     #[test]
     fn resize_pending_upgrades_tile_to_full_frame() {
         let mut pending = None;
-        retain_bitmap_during_resize(&mut pending, bitmap(0, 0, 64, 64, 2), 100, 50);
-        retain_bitmap_during_resize(&mut pending, bitmap(0, 0, 100, 50, 3), 100, 50);
+        retain_bitmap_during_resize(&mut pending, bitmap(0, 0, 64, 64, 2), 100, 50, false);
+        retain_bitmap_during_resize(&mut pending, bitmap(0, 0, 100, 50, 3), 100, 50, false);
         let kept = pending.unwrap();
         assert!(covers_desktop(&kept, 100, 50));
         assert_eq!(kept.data[0], 3);
+    }
+
+    #[test]
+    fn resize_pending_merges_two_partial_tiles() {
+        // Both tiles are views into the same full-desktop buffer, as they
+        // always are in production (see `BitmapUpdate::sub`).
+        let full = bitmap(0, 0, 100, 50, 9);
+        let tile_a = full
+            .sub(
+                0,
+                0,
+                NonZeroU16::new(20).unwrap(),
+                NonZeroU16::new(20).unwrap(),
+            )
+            .unwrap();
+        let tile_b = full
+            .sub(
+                60,
+                30,
+                NonZeroU16::new(20).unwrap(),
+                NonZeroU16::new(20).unwrap(),
+            )
+            .unwrap();
+        let mut pending = None;
+        retain_bitmap_during_resize(&mut pending, tile_a, 100, 50, true);
+        retain_bitmap_during_resize(&mut pending, tile_b, 100, 50, true);
+        let kept = pending.unwrap();
+        // Neither tile alone covers the desktop, but the old "latest wins"
+        // behavior would have dropped the first tile entirely.
+        assert_eq!((kept.x, kept.y), (0, 0));
+        assert_eq!((kept.width.get(), kept.height.get()), (80, 50));
+    }
+
+    #[test]
+    fn resize_pending_without_merge_drops_earlier_partial_tile() {
+        // `merge_partials: false` - the exact original behavior, for
+        // clients this catch-up work is scoped away from.
+        let full = bitmap(0, 0, 100, 50, 9);
+        let tile_a = full
+            .sub(
+                0,
+                0,
+                NonZeroU16::new(20).unwrap(),
+                NonZeroU16::new(20).unwrap(),
+            )
+            .unwrap();
+        let tile_b = full
+            .sub(
+                60,
+                30,
+                NonZeroU16::new(20).unwrap(),
+                NonZeroU16::new(20).unwrap(),
+            )
+            .unwrap();
+        let mut pending = None;
+        retain_bitmap_during_resize(&mut pending, tile_a, 100, 50, false);
+        retain_bitmap_during_resize(&mut pending, tile_b, 100, 50, false);
+        let kept = pending.unwrap();
+        assert_eq!((kept.x, kept.y), (60, 30));
+    }
+
+    #[test]
+    fn resync_with_no_baseline_returns_whole_frame() {
+        let full = bitmap(0, 0, 64, 64, 7);
+        let result = resync_bitmap(None, &full).unwrap();
+        assert!(covers_desktop(&result, 64, 64));
+    }
+
+    #[test]
+    fn resync_finds_only_the_actually_changed_region() {
+        let old = bitmap(0, 0, 128, 128, 0);
+        let mut new_data = old.data.to_vec();
+        new_data[(64 * 128 + 64) * 4] = 1;
+        let current = BitmapUpdate {
+            data: std::sync::Arc::from(new_data),
+            ..old.clone()
+        };
+        let result = resync_bitmap(Some(&old), &current).unwrap();
+        assert_eq!((result.x, result.y), (64, 64));
+        assert_eq!((result.width.get(), result.height.get()), (64, 64));
+    }
+
+    #[test]
+    fn resync_ignores_a_region_that_ended_up_unchanged() {
+        // A running bounding-box union of every intermediate dirty rect
+        // would still flag a region that changed and changed back before
+        // this session caught up; a direct diff against the last
+        // confirmed sync correctly finds nothing to resend.
+        let old = bitmap(0, 0, 128, 128, 5);
+        let current = bitmap(0, 0, 128, 128, 5);
+        assert!(resync_bitmap(Some(&old), &current).is_none());
+    }
+
+    #[test]
+    fn resync_falls_back_to_full_frame_on_geometry_change() {
+        let old = bitmap(0, 0, 64, 64, 1);
+        let resized = bitmap(0, 0, 128, 64, 2);
+        let result = resync_bitmap(Some(&old), &resized).unwrap();
+        assert!(covers_desktop(&result, 128, 64));
     }
 
     #[test]

@@ -120,7 +120,10 @@ pub fn spawn_send_frames(
 
 /// Encodes Planar/NSCodec if GFX did not handle the frame, then starts at
 /// most one in-flight bulk send. If a send is already running, `bitmap` is
-/// kept as latest-wins instead of queueing a second burst.
+/// kept as latest-wins instead of queueing a second burst. (The caller in
+/// `session_loop.rs` only ever invokes this once `bulk_send` is confirmed
+/// `None`, so this branch is a defensive fallback, not a live path -
+/// catch-up policy lives in the caller now.)
 #[allow(clippy::too_many_arguments)]
 pub async fn encode_and_queue_bitmap(
     bitmap: BitmapUpdate,
