@@ -119,15 +119,14 @@ pub fn encode_format_data_response_error() -> Vec<u8> {
 fn decode_format_list(body: &[u8]) -> Result<Vec<u32>, DecodeError> {
     let mut cursor = ReadCursor::new(body);
     let mut ids = Vec::new();
-    while cursor.remaining() >= 6 {
+    while cursor.remaining() >= 4 {
         let id = cursor.read_u32_le()?;
-        loop {
-            cursor.ensure(2)?;
+        ids.push(id);
+        while cursor.remaining() >= 2 {
             if cursor.read_u16_le()? == 0 {
-                break; // NUL-terminated UTF-16 name, one code unit at a time
+                break;
             }
         }
-        ids.push(id);
     }
     Ok(ids)
 }

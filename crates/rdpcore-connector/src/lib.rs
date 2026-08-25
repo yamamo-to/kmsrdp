@@ -806,7 +806,8 @@ impl Acceptor {
             | ShareDataPduType::RefreshRect
             | ShareDataPduType::SuppressOutput
             | ShareDataPduType::SaveSessionInfo
-            | ShareDataPduType::MonitorLayout => {}
+            | ShareDataPduType::MonitorLayout
+            | ShareDataPduType::Input => {}
         }
 
         self.state = State::WaitFinalization(progress);

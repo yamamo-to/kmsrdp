@@ -121,23 +121,6 @@ impl X11Connection {
         self.conn
             .flush()
             .map_err(|e| io::Error::other(format!("flush failed: {e}")))?;
-
-        // Immediately blank this keycode back to NoSymbol. The race
-        // documented above assumes a lost race renders nothing because the
-        // stale mapping is empty - true only if every prior use of this
-        // slot cleaned up after itself. Left mapped to the last real
-        // character instead, a *future* race loss on this same slot (they
-        // rotate through only SCRATCH_KEYCODE_POOL_SIZE keycodes) doesn't
-        // silently drop a character - it retypes whatever was last typed
-        // through this slot, e.g. a previous 'x' reappearing on unrelated
-        // IME input. Best-effort: this keycode already did its job either
-        // way, so a failure here doesn't invalidate the character just sent.
-        self.conn
-            .change_keyboard_mapping(1, keycode, 1, &[0])
-            .map_err(|e| io::Error::other(format!("ChangeKeyboardMapping (clear) failed: {e}")))?;
-        self.conn
-            .flush()
-            .map_err(|e| io::Error::other(format!("flush failed: {e}")))?;
         Ok(())
     }
 }

@@ -13,7 +13,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rdpcore_cliprdr::pdu::CF_UNICODETEXT;
 use rdpcore_cliprdr::{
@@ -33,11 +33,6 @@ fn local_text() -> Option<String> {
 /// reassembly budget is 16 MiB; this is a tighter bound so a client cannot
 /// dump that much into X11/Wayland.
 const MAX_HOST_CLIPBOARD_BYTES: usize = 1024 * 1024;
-
-/// Startup Format Lists from macOS Windows App arrive in a burst; debounce
-/// paste requests so we do not overlap CLIPRDR channel setup. After this
-/// window, later Format Lists (real copy events) are forwarded again.
-const PASTE_DEBOUNCE: Duration = Duration::from_secs(2);
 
 fn set_local_text(text: String) {
     if text.len() > MAX_HOST_CLIPBOARD_BYTES {
@@ -277,7 +272,6 @@ impl CliprdrBackendFactory for LocalClipboardFactory {
             mode: self.mode,
             remote_has_text: false,
             delay_first_paste: true,
-            last_paste_at: None,
         })
     }
 }
@@ -286,10 +280,8 @@ struct LocalClipboardBackend {
     sender: UnboundedSender<ClipboardMessage>,
     mode: ClipboardMode,
     remote_has_text: bool,
-    /// First paste is delayed (see [`PASTE_DEBOUNCE`]); later ones go out
-    /// immediately after the debounce window.
+    /// First paste is delayed; later ones go out immediately.
     delay_first_paste: bool,
-    last_paste_at: Option<Instant>,
 }
 
 impl LocalClipboardBackend {
@@ -299,15 +291,9 @@ impl LocalClipboardBackend {
         if !self.remote_has_text {
             return None;
         }
-        if let Some(at) = self.last_paste_at
-            && at.elapsed() < PASTE_DEBOUNCE
-        {
-            return None;
-        }
-        self.last_paste_at = Some(Instant::now());
         if self.delay_first_paste {
             self.delay_first_paste = false;
-            Some(PASTE_DEBOUNCE)
+            Some(Duration::from_millis(500))
         } else {
             Some(Duration::ZERO)
         }
@@ -498,19 +484,16 @@ mod tests {
                 mode,
                 remote_has_text: false,
                 delay_first_paste: true,
-                last_paste_at: None,
             },
             rx,
         )
     }
 
     #[test]
-    fn paste_delay_debounces_then_allows_later_copies() {
+    fn paste_delay_delays_first_then_allows_immediate_later_copies() {
         let (mut backend, _rx) = backend(ClipboardMode::Bidirectional);
         backend.remote_has_text = true;
-        assert_eq!(backend.paste_delay(), Some(PASTE_DEBOUNCE));
-        assert_eq!(backend.paste_delay(), None);
-        backend.last_paste_at = Some(Instant::now() - PASTE_DEBOUNCE);
+        assert_eq!(backend.paste_delay(), Some(Duration::from_millis(500)));
         assert_eq!(backend.paste_delay(), Some(Duration::ZERO));
     }
 

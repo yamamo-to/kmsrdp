@@ -21,6 +21,8 @@ pub enum ShareDataPduType {
     SaveSessionInfo,
     /// Server → client: monitor rectangles (MS-RDPBCGR 2.2.12.1).
     MonitorLayout,
+    /// Client → server: input events (MS-RDPBCGR 2.2.8.1.1.3).
+    Input,
 }
 
 impl ShareDataPduType {
@@ -34,6 +36,7 @@ impl ShareDataPduType {
             Self::SuppressOutput => 0x23,
             Self::SaveSessionInfo => 0x26,
             Self::MonitorLayout => 0x37,
+            Self::Input => 0x1C,
         }
     }
 
@@ -47,6 +50,7 @@ impl ShareDataPduType {
             0x23 => Self::SuppressOutput,
             0x26 => Self::SaveSessionInfo,
             0x37 => Self::MonitorLayout,
+            0x1C => Self::Input,
             _ => return None,
         })
     }
@@ -396,6 +400,80 @@ pub fn decode_monitor_layout(body: &[u8]) -> Result<Vec<MonitorDef>, DecodeError
         monitors.push(MonitorDef::decode(&mut cursor)?);
     }
     Ok(monitors)
+}
+
+/// Decode TS_INPUT_PDU body into FastPathInputEvents (MS-RDPBCGR 2.2.8.1.1.3).
+pub fn decode_slowpath_input(
+    body: &[u8],
+) -> Result<Vec<crate::fastpath::FastPathInputEvent>, DecodeError> {
+    use crate::fastpath::{FastPathInputEvent, keyboard_flags};
+
+    let mut cursor = ReadCursor::new(body);
+    let num_events = cursor.read_u16_le()? as usize;
+    let _pad = cursor.read_u16_le()?;
+
+    let mut events = Vec::with_capacity(num_events);
+    for _ in 0..num_events {
+        let _event_time = cursor.read_u32_le()?;
+        let message_type = cursor.read_u16_le()?;
+        match message_type {
+            0x0000 => {
+                // INPUT_EVENT_SCANCODE
+                let kb_flags = cursor.read_u16_le()?;
+                let key_code = cursor.read_u16_le()? as u8;
+                let _pad2 = cursor.read_u16_le()?;
+
+                let mut flags = 0u8;
+                if kb_flags & 0x8000 != 0 {
+                    flags |= keyboard_flags::RELEASE;
+                }
+                if kb_flags & 0x0100 != 0 {
+                    flags |= keyboard_flags::EXTENDED;
+                }
+                if kb_flags & 0x0200 != 0 {
+                    flags |= keyboard_flags::EXTENDED1;
+                }
+                events.push(FastPathInputEvent::Scancode {
+                    flags,
+                    code: key_code,
+                });
+            }
+            0x0001 => {
+                // INPUT_EVENT_MOUSE
+                let pointer_flags = cursor.read_u16_le()?;
+                let x = cursor.read_u16_le()?;
+                let y = cursor.read_u16_le()?;
+                events.push(FastPathInputEvent::Mouse { pointer_flags, x, y });
+            }
+            0x0003 => {
+                // INPUT_EVENT_SYNC
+                let _pad2 = cursor.read_u16_le()?;
+                let toggle_flags = cursor.read_u32_le()?;
+                events.push(FastPathInputEvent::Sync {
+                    flags: toggle_flags as u8,
+                });
+            }
+            0x0004 => {
+                // INPUT_EVENT_UNICODE
+                let kb_flags = cursor.read_u16_le()?;
+                let unicode_code = cursor.read_u16_le()?;
+                let _pad2 = cursor.read_u16_le()?;
+
+                let mut flags = 0u8;
+                if kb_flags & 0x8000 != 0 {
+                    flags |= keyboard_flags::RELEASE;
+                }
+                events.push(FastPathInputEvent::Unicode {
+                    flags,
+                    code: unicode_code,
+                });
+            }
+            _ => {
+                break;
+            }
+        }
+    }
+    Ok(events)
 }
 
 #[cfg(test)]

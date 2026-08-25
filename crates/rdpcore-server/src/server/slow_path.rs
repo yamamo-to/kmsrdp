@@ -1,7 +1,7 @@
 //! Slow-Path (MCS Send Data) dispatch: SuppressOutput/RefreshRect on the I/O
 //! channel, and virtual-channel PDU responses (RDPSND/CLIPRDR/DVC/RDPDR).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rdpcore_cliprdr::CliprdrChannel;
 use rdpcore_dvc::DvcMux;
@@ -24,6 +24,7 @@ pub(super) async fn handle_slow_path_frame(
     io_channel_id: u16,
     display_updates_allowed: &mut bool,
     updates: &mut dyn crate::display::RdpServerDisplayUpdates,
+    input_handler: &Arc<Mutex<dyn crate::input::RdpServerInputHandler>>,
     rdpsnd: &Option<Arc<tokio::sync::Mutex<RdpsndChannel>>>,
     cliprdr: Option<&mut CliprdrChannel>,
     dvc: Option<&mut DvcMux>,
@@ -39,6 +40,16 @@ pub(super) async fn handle_slow_path_frame(
     if send_data.channel_id == io_channel_id {
         if let Ok(data_pdu) = DataPdu::decode(&send_data.data) {
             match data_pdu.pdu_type2 {
+                ShareDataPduType::Input => {
+                    if let Ok(events) =
+                        rdpcore_pdu::finalization::decode_slowpath_input(&data_pdu.body)
+                    {
+                        let mut handler = input_handler.lock().unwrap_or_else(|e| e.into_inner());
+                        for event in events {
+                            super::input_handler::dispatch_input_event(&mut *handler, event);
+                        }
+                    }
+                }
                 ShareDataPduType::SuppressOutput => {
                     if let Ok(allow) = decode_suppress_output(&data_pdu.body) {
                         let was = *display_updates_allowed;
