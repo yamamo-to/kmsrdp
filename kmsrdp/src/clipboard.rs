@@ -93,7 +93,11 @@ fn spawn_host_clipboard_worker() -> HostClipboard {
 
 fn local_text() -> Option<String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    if get_host_clipboard().sender.send(ClipboardReq::GetText(tx)).is_ok() {
+    if get_host_clipboard()
+        .sender
+        .send(ClipboardReq::GetText(tx))
+        .is_ok()
+    {
         rx.blocking_recv().unwrap_or(None)
     } else {
         None
@@ -106,7 +110,9 @@ fn local_text() -> Option<String> {
 const MAX_HOST_CLIPBOARD_BYTES: usize = 1024 * 1024;
 
 fn set_local_text(text: String) {
-    let _ = get_host_clipboard().sender.send(ClipboardReq::SetText(text));
+    let _ = get_host_clipboard()
+        .sender
+        .send(ClipboardReq::SetText(text));
 }
 
 fn advertise_unicode_formats(sender: &UnboundedSender<ClipboardMessage>) -> bool {
@@ -130,8 +136,11 @@ fn spawn_shared_clipboard_watcher(
             .await
             .unwrap_or(None);
         let mut xfixes_stop = Arc::new(AtomicBool::new(false));
-        let mut xfixes_active =
-            start_xfixes_watch(Arc::clone(&subscribers), Arc::clone(&last_written), Arc::clone(&xfixes_stop));
+        let mut xfixes_active = start_xfixes_watch(
+            Arc::clone(&subscribers),
+            Arc::clone(&last_written),
+            Arc::clone(&xfixes_stop),
+        );
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {
@@ -179,15 +188,15 @@ fn start_xfixes_watch(
     let active_for_thread = Arc::clone(&active);
     let _ = std::thread::Builder::new()
         .name("kmsrdp-clip-xfixes".into())
-        .spawn(
-            move || match xfixes_selection_loop(&subscribers, &last_written, &stop, &active_for_thread) {
+        .spawn(move || {
+            match xfixes_selection_loop(&subscribers, &last_written, &stop, &active_for_thread) {
                 Ok(()) => {}
                 Err(e) => {
                     active_for_thread.store(false, Ordering::SeqCst);
                     tracing::debug!(error = %e, "XFixes clipboard watch unavailable; using poll");
                 }
-            },
-        );
+            }
+        });
     active
 }
 
@@ -253,7 +262,10 @@ fn xfixes_selection_loop(
                 if !subs.is_empty() {
                     let current = local_text();
                     if matches!(&current, Some(t) if !t.is_empty()) {
-                        let written = last_written.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        let written = last_written
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
                         if matches!((&current, &written), (Some(c), Some(w)) if c == w) {
                             last_advertised = current;
                             continue;
@@ -331,7 +343,11 @@ impl LocalClipboardFactory {
         if mode.allows_host_to_client() {
             spawn_shared_clipboard_watcher(subscribers.clone(), last_written.clone(), session_rx);
         }
-        Self { subscribers, mode, last_written }
+        Self {
+            subscribers,
+            mode,
+            last_written,
+        }
     }
 }
 
@@ -641,7 +657,8 @@ mod tests {
         let factory = LocalClipboardFactory::new(session_rx(), ClipboardMode::default());
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut backend = factory.build_cliprdr_backend(tx);
-        backend.on_format_data_response(FormatDataResponse::new_unicode_string("hello_from_client"));
+        backend
+            .on_format_data_response(FormatDataResponse::new_unicode_string("hello_from_client"));
         tokio::time::sleep(Duration::from_millis(50)).await;
         let last = factory.last_written.lock().unwrap().clone();
         assert_eq!(last, Some("hello_from_client".to_string()));
@@ -649,10 +666,16 @@ mod tests {
 
     #[test]
     fn select_text_format_prioritizes_unicode_over_ansi() {
-        let formats = vec![ClipboardFormat { id: CF_TEXT }, ClipboardFormat { id: CF_UNICODETEXT }];
+        let formats = vec![
+            ClipboardFormat { id: CF_TEXT },
+            ClipboardFormat { id: CF_UNICODETEXT },
+        ];
         assert_eq!(select_text_format(&formats), Some(CF_UNICODETEXT));
 
-        let formats_ansi = vec![ClipboardFormat { id: CF_OEMTEXT }, ClipboardFormat { id: CF_TEXT }];
+        let formats_ansi = vec![
+            ClipboardFormat { id: CF_OEMTEXT },
+            ClipboardFormat { id: CF_TEXT },
+        ];
         assert_eq!(select_text_format(&formats_ansi), Some(CF_TEXT));
     }
 

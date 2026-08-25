@@ -443,7 +443,11 @@ pub fn decode_slowpath_input(
                 let pointer_flags = cursor.read_u16_le()?;
                 let x = cursor.read_u16_le()?;
                 let y = cursor.read_u16_le()?;
-                events.push(FastPathInputEvent::Mouse { pointer_flags, x, y });
+                events.push(FastPathInputEvent::Mouse {
+                    pointer_flags,
+                    x,
+                    y,
+                });
             }
             0x0003 => {
                 // INPUT_EVENT_SYNC
