@@ -325,6 +325,16 @@ where
     // toward `negotiated_color_loss`.
     let mut clean_sends_since_backlog: u32 = 0;
     const DECAY_AFTER_CLEAN_SENDS: u32 = 60;
+    // The very first full-desktop send is inherently large (a whole 4K
+    // frame, not an incremental diff) and takes noticeably longer than any
+    // later pump - that's expected, not the link falling behind, so don't
+    // let it trip the same miss counter that drives color_loss escalation
+    // (it otherwise reliably hits MISSED_BEFORE_RESYNC before the first
+    // frame is even off the wire, maxing out color_loss on every connect
+    // before the client has painted anything). Catch-up bookkeeping
+    // (merge/resync) still applies as normal during this window - only the
+    // quality escalation is held off.
+    let mut sent_first_frame = false;
     // Above this many bytes still unacknowledged in the kernel's TCP send
     // buffer, treat the connection as busy regardless of what our own
     // `bulk_send` bookkeeping thinks - see `socket_backlog`'s doc comment.
@@ -672,10 +682,13 @@ where
                             if missed_since_last_send >= MISSED_BEFORE_RESYNC {
                                 pending_resync = true;
                                 deferred_bitmap = None;
-                                current_color_loss = bump_color_loss_on_backlog(current_color_loss);
-                                set_color_loss_level(&mut bitmap_policy, current_color_loss);
-                                clean_sends_since_backlog = 0;
-                                debug!(color_loss_level = current_color_loss, "NSCodec backlog: raised color_loss_level");
+                                if sent_first_frame {
+                                    current_color_loss =
+                                        bump_color_loss_on_backlog(current_color_loss);
+                                    set_color_loss_level(&mut bitmap_policy, current_color_loss);
+                                    clean_sends_since_backlog = 0;
+                                    debug!(color_loss_level = current_color_loss, "NSCodec backlog: raised color_loss_level");
+                                }
                             } else {
                                 deferred_bitmap = Some(match deferred_bitmap.take() {
                                     Some(prev) => prev.union(bitmap),
@@ -718,6 +731,7 @@ where
                                 resync_target = None;
                                 current_color_loss = negotiated_color_loss.unwrap_or(0);
                                 clean_sends_since_backlog = 0;
+                                sent_first_frame = false;
                                 set_color_loss_level(&mut bitmap_policy, current_color_loss);
                                 if frame_sender.send(Frame { channel: ChannelKey::Io, priority: Priority::Latency, bytes: response }).is_err() {
                                     return finish_session(Err(SessionError::WriterClosed));
@@ -791,9 +805,15 @@ where
                     if missed_since_last_send >= MISSED_BEFORE_RESYNC {
                         pending_resync = true;
                         deferred_bitmap = None;
-                        current_color_loss = bump_color_loss_on_backlog(current_color_loss);
-                        set_color_loss_level(&mut bitmap_policy, current_color_loss);
-                        clean_sends_since_backlog = 0;
+                        if sent_first_frame {
+                            current_color_loss = bump_color_loss_on_backlog(current_color_loss);
+                            set_color_loss_level(&mut bitmap_policy, current_color_loss);
+                            clean_sends_since_backlog = 0;
+                            debug!(
+                                color_loss_level = current_color_loss,
+                                "NSCodec backlog: raised color_loss_level"
+                            );
+                        }
                     } else {
                         deferred_bitmap = Some(match deferred_bitmap.take() {
                             Some(prev) => prev.union(bitmap),
@@ -804,6 +824,7 @@ where
                 continue;
             }
             missed_since_last_send = 0;
+            sent_first_frame = true;
             if let Some(floor) = negotiated_color_loss {
                 clean_sends_since_backlog += 1;
                 if clean_sends_since_backlog >= DECAY_AFTER_CLEAN_SENDS {
