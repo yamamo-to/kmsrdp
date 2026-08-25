@@ -50,7 +50,7 @@ pub struct OpenH264Encoder {
     qp: u8,
     /// Monotonic frame time for OpenH264 RC (must not stay at ZERO).
     next_ts_ms: u64,
-    /// Reused across `encode_bgrx` calls (see AGENTS.md's zero-allocation
+    /// Reused across `encode_bgrx` calls (see docs/AGENTS.md's zero-allocation
     /// hot-path rule) instead of allocating a fresh I420 buffer every frame.
     i420_scratch: Vec<u8>,
 }

@@ -87,7 +87,7 @@ framebuffer). It does **not** create a virtual desktop.
 
 **Tested:** Proxmox VM (VirtIO-GPU/QXL) via Guacamole and direct clients;
 NVIDIA/Xorg via NvFBC fallback; macOS Windows App (NSCodec). See module docs
-for NvFBC / GBM details. See `ARCHITECTURE.md` § Client Interoperability for
+for NvFBC / GBM details. See `docs/ARCHITECTURE.md` § Client Interoperability for
 what's been confirmed against which client and what hasn't.
 
 ## Quick start
@@ -174,16 +174,17 @@ sudo systemctl enable --now kmsrdp.service
 
 ## Documentation
 
-- [Architecture & Protocol Flow](ARCHITECTURE.md): DRM capture pipeline, internal crates, and RDP connection sequence diagrams.
-- [Agent & Developer Guidelines](AGENTS.md): architecture assumptions, safety rules, and verification workflow.
-- [Quality Assessment](QUALITY.md): subjective snapshot scores (not an automated audit).
-- [Security Model & Advisories](SECURITY.md): threat model, deployment recommendations, and vulnerability reporting.
+- [Requirements Specification](docs/REQUIREMENTS.md): USDM functional and non-functional requirements.
+- [Architecture & Protocol Flow](docs/ARCHITECTURE.md): DRM capture pipeline, internal crates, and RDP connection sequence diagrams.
+- [Agent & Developer Guidelines](docs/AGENTS.md): architecture assumptions, safety rules, and verification workflow.
+- [Quality Assessment](docs/QUALITY.md): subjective snapshot scores (not an automated audit).
+- [Security Model & Advisories](docs/SECURITY.md): threat model, deployment recommendations, and vulnerability reporting.
 
 ## Security
 
 Treat a connected client like a person at the console. Use a strong password,
 keep env files mode `0600`, and restrict who can reach the listen port. Report
-vulnerabilities via GitHub Security Advisories — see [SECURITY.md](SECURITY.md).
+vulnerabilities via GitHub Security Advisories — see [SECURITY.md](docs/SECURITY.md).
 
 ## License
 

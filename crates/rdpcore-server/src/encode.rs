@@ -104,7 +104,7 @@ fn pooled_copy(pool: &mut Vec<Vec<u8>>, src: &[u8]) -> Vec<u8> {
 /// batched for strict clients (macOS Windows App).
 ///
 /// The caller-provided `scratch` is cleared and reused across frames to
-/// avoid per-frame heap allocations (see AGENTS.md Rule 2.6).
+/// avoid per-frame heap allocations (see docs/AGENTS.md Rule 2.6).
 pub(crate) fn encode_bitmap_update(
     bitmap: &BitmapUpdate,
     policy: &BitmapEncodePolicy,
