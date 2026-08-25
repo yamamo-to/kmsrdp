@@ -325,9 +325,17 @@ where
     // Above this many bytes still unacknowledged in the kernel's TCP send
     // buffer, treat the connection as busy regardless of what our own
     // `bulk_send` bookkeeping thinks - see `socket_backlog`'s doc comment.
-    // A few hundred KB is enough headroom for normal jitter on a healthy
-    // link while still catching a link that's genuinely fallen behind.
-    const KERNEL_SEND_BACKLOG_THRESHOLD_BYTES: u32 = 256 * 1024;
+    //
+    // Must sit well above the link's own bandwidth-delay product, or this
+    // fires on perfectly healthy in-flight data instead of a real backlog:
+    // BDP = RTT * bandwidth, e.g. ~275KB at a routine 25ms/90Mbps - a
+    // 256KB threshold sat right on top of that and mistook normal in-flight
+    // traffic for "hopelessly behind" on every single cycle, all but
+    // halting sends outright (observed: ~4.7 fps instead of the usual
+    // 10-30). Real problem backlogs observed on this link sat around 2MB
+    // and climbing; picking well above typical BDP but below that keeps
+    // margin on both sides.
+    const KERNEL_SEND_BACKLOG_THRESHOLD_BYTES: u32 = 2 * 1024 * 1024;
     // Scopes every catch-up-path behavior change below to NSCodec clients
     // (macOS "Windows App") - the ones actually affected by the residual-
     // pixel/growing-latency issues this exists to fix, since NSCodec's
