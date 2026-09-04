@@ -9,7 +9,7 @@ description = "From-scratch RDP wire-format codecs (TPKT/X.224/...) - no I/O, no
 
 [dev-dependencies]
 proptest = "1.6"
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "rdp6"
