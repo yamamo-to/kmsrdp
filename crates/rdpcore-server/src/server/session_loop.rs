@@ -326,14 +326,17 @@ where
     // and climbing; picking well above typical BDP but below that keeps
     // margin on both sides.
     const KERNEL_SEND_BACKLOG_THRESHOLD_BYTES: u32 = 2 * 1024 * 1024;
-    // Scopes every catch-up-path behavior change below to NSCodec clients
-    // (macOS "Windows App") - the ones actually affected by the residual-
-    // pixel/growing-latency issues this exists to fix, since NSCodec's
-    // slow, untiled encode is what makes this session fall behind often
-    // enough to matter. Planar clients (mstsc, xfreerdp, ...) keep the
-    // exact prior "latest wins" catch-up behavior, unchanged, so this work
-    // can't regress them.
-    let use_resync_catchup = bitmap_policy.nscodec.is_some();
+    // Union/resync catch-up applies to every client, not just NSCodec
+    // (macOS "Windows App"). The logic operates purely on `BitmapUpdate`
+    // dirty rects and has no codec dependency - a NSCodec-only gate here
+    // used to leave Planar clients (mstsc, xfreerdp, ... - the default
+    // path when GFX isn't negotiated) on the prior "latest wins" behavior,
+    // which drops any dirty rect that isn't superseded by a later
+    // overlapping one while busy (see `resync_bitmap`'s doc comment).
+    // That's the same residual-pixel bug NSCodec had, just less often hit
+    // there since Planar's faster encode falls behind less - but "less
+    // often" still means an occasional stuck/incorrect region for every
+    // client type.
     let defer_ms = initial_bitmap_defer_ms(client_label, bitmap_policy.nscodec.is_some());
     let mut metrics = SessionBitmapMetrics::default();
     let mut bitmap_gate_open = defer_ms == 0;
@@ -648,28 +651,24 @@ where
                             bitmap,
                             resize_desktop.width,
                             resize_desktop.height,
-                            use_resync_catchup,
+                            true,
                         );
                     }
                     Ok(Some(DisplayUpdate::Bitmap(bitmap))) if !bitmap_gate_open => {
-                        if !use_resync_catchup {
-                            deferred_bitmap = Some(bitmap);
+                        missed_since_last_send += 1;
+                        if missed_since_last_send >= MISSED_BEFORE_RESYNC {
+                            pending_resync = true;
+                            deferred_bitmap = None;
+                            // Reset so the next resync needs another
+                            // full run of misses, not the very next
+                            // dirty-rect (the counter only ever grows
+                            // otherwise).
+                            missed_since_last_send = 0;
                         } else {
-                            missed_since_last_send += 1;
-                            if missed_since_last_send >= MISSED_BEFORE_RESYNC {
-                                pending_resync = true;
-                                deferred_bitmap = None;
-                                // Reset so the next resync needs another
-                                // full run of misses, not the very next
-                                // dirty-rect (the counter only ever grows
-                                // otherwise).
-                                missed_since_last_send = 0;
-                            } else {
-                                deferred_bitmap = Some(match deferred_bitmap.take() {
-                                    Some(prev) => prev.union(bitmap),
-                                    None => bitmap,
-                                });
-                            }
+                            deferred_bitmap = Some(match deferred_bitmap.take() {
+                                Some(prev) => prev.union(bitmap),
+                                None => bitmap,
+                            });
                         }
                     }
                     Ok(Some(DisplayUpdate::Bitmap(_))) if !display_updates_allowed => {}
@@ -765,38 +764,31 @@ where
             // a busy `bulk_send` - it feeds the same miss/resync/color-loss
             // escalation below instead of silently piling more encodes on
             // top of data the client hasn't received yet.
-            let kernel_backlog_high = use_resync_catchup
-                && crate::socket_backlog::outstanding_send_bytes(raw_fd)
-                    .is_some_and(|bytes| bytes > KERNEL_SEND_BACKLOG_THRESHOLD_BYTES);
+            let kernel_backlog_high = crate::socket_backlog::outstanding_send_bytes(raw_fd)
+                .is_some_and(|bytes| bytes > KERNEL_SEND_BACKLOG_THRESHOLD_BYTES);
             if bulk_send.0.is_some() || kernel_backlog_high {
-                if !use_resync_catchup {
-                    deferred_bitmap = Some(bitmap);
+                missed_since_last_send += 1;
+                if missed_since_last_send >= MISSED_BEFORE_RESYNC {
+                    pending_resync = true;
+                    deferred_bitmap = None;
+                    // See the matching comment at the other call site -
+                    // without this, every miss while already flagged
+                    // re-triggers this branch instead of needing a
+                    // fresh run of misses.
+                    missed_since_last_send = 0;
                 } else {
-                    missed_since_last_send += 1;
-                    if missed_since_last_send >= MISSED_BEFORE_RESYNC {
-                        pending_resync = true;
-                        deferred_bitmap = None;
-                        // See the matching comment at the other call site -
-                        // without this, every miss while already flagged
-                        // re-triggers this branch instead of needing a
-                        // fresh run of misses.
-                        missed_since_last_send = 0;
-                    } else {
-                        deferred_bitmap = Some(match deferred_bitmap.take() {
-                            Some(prev) => prev.union(bitmap),
-                            None => bitmap,
-                        });
-                    }
+                    deferred_bitmap = Some(match deferred_bitmap.take() {
+                        Some(prev) => prev.union(bitmap),
+                        None => bitmap,
+                    });
                 }
                 continue;
             }
             missed_since_last_send = 0;
-            if use_resync_catchup {
-                if let Some(synced) = resync_target.take() {
-                    last_synced_full = Some(synced);
-                } else if covers_desktop(&bitmap, resize_desktop.width, resize_desktop.height) {
-                    last_synced_full = Some(bitmap.clone());
-                }
+            if let Some(synced) = resync_target.take() {
+                last_synced_full = Some(synced);
+            } else if covers_desktop(&bitmap, resize_desktop.width, resize_desktop.height) {
+                last_synced_full = Some(bitmap.clone());
             }
             let full = updates.latest_full_frame();
             #[cfg(feature = "gfx")]
