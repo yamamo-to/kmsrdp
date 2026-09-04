@@ -316,7 +316,12 @@ impl H264Encoder for MockH264Encoder {
     fn reset(&mut self) {}
 }
 
+// `as_chunks` (clippy's suggested replacement for `chunks_exact_mut` below)
+// stabilized after this workspace's MSRV (1.87, see the workspace
+// Cargo.toml comment) - keep `chunks_exact_mut` in these test helpers
+// rather than bump it for a lint.
 #[cfg(test)]
+#[allow(clippy::chunks_exact_to_as_chunks)]
 mod tests {
     use super::*;
 

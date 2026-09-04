@@ -48,6 +48,10 @@ pub fn encode_to(bgrx: &[u8], width: usize, height: usize, out: &mut Vec<u8>) {
         let mut r = [0u8; MAX_STACK_PIXELS];
         let mut g = [0u8; MAX_STACK_PIXELS];
         let mut b = [0u8; MAX_STACK_PIXELS];
+        // `as_chunks` (clippy's suggested replacement) stabilized after
+        // this workspace's MSRV (1.87, see the workspace Cargo.toml
+        // comment) - keep `chunks_exact` rather than bump it for a lint.
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         for (px, ((r_i, g_i), b_i)) in bgrx.chunks_exact(4).zip(
             r[..pixel_count]
                 .iter_mut()
@@ -65,6 +69,8 @@ pub fn encode_to(bgrx: &[u8], width: usize, height: usize, out: &mut Vec<u8>) {
         let mut r = vec![0u8; pixel_count];
         let mut g = vec![0u8; pixel_count];
         let mut b = vec![0u8; pixel_count];
+        // See the `chunks_exact_to_as_chunks` allow above - same MSRV reason.
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         for (px, ((r_i, g_i), b_i)) in bgrx
             .chunks_exact(4)
             .zip(r.iter_mut().zip(g.iter_mut()).zip(b.iter_mut()))
@@ -102,6 +108,8 @@ pub fn decode(data: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Decod
 
     let pixel_count = width * height;
     let mut bgrx = vec![0u8; pixel_count * 4];
+    // See the `chunks_exact_to_as_chunks` allow above - same MSRV reason.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for (px, ((&r_i, &g_i), &b_i)) in bgrx
         .chunks_exact_mut(4)
         .zip(r.iter().zip(g.iter()).zip(b.iter()))

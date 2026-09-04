@@ -27,6 +27,10 @@ pub fn read_fixed(bytes: &[u8]) -> String {
     // code units instead of collecting into an intermediate `Vec<u16>`
     // first (as `String::from_utf16_lossy` would need) - one fewer heap
     // buffer per decoded string field.
+    // `as_chunks` (clippy's suggested replacement) stabilized after this
+    // workspace's MSRV (1.87, see the workspace Cargo.toml comment) - keep
+    // `chunks_exact` rather than bump it for a lint.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     let units = bytes
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -48,6 +52,8 @@ pub fn encode_units(s: &str) -> Vec<u8> {
 
 /// Inverse of [`encode_units`]: decodes exactly `bytes` with no NUL search.
 pub fn decode_units(bytes: &[u8]) -> String {
+    // See `read_fixed`'s `chunks_exact_to_as_chunks` allow - same MSRV reason.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     let units = bytes
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]));
