@@ -141,13 +141,20 @@ async fn tls_connect(tcp: TcpStream) -> ClientTlsStream<TcpStream> {
 // =====================================================================
 
 struct SingleFrameDisplayUpdates {
-    update: Option<BitmapUpdate>,
+    // One-shot: consumed by `next_update` to produce the wake-up
+    // notification, same as a real capture loop's dirty-rect broadcast.
+    pending: Option<BitmapUpdate>,
+    // Durable: mirrors a real display's `latest_full` - the session loop's
+    // always-resync policy reads this on every catch-up, not just the one
+    // that follows the initial notification, so it must outlive `pending`
+    // being taken (see `ChannelDisplayUpdates` below for the same split).
+    full: BitmapUpdate,
 }
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for SingleFrameDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>, rdpcore_server::DisplayError> {
-        if let Some(update) = self.update.take() {
+        if let Some(update) = self.pending.take() {
             Ok(Some(DisplayUpdate::Bitmap(update)))
         } else {
             tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -156,7 +163,7 @@ impl RdpServerDisplayUpdates for SingleFrameDisplayUpdates {
     }
 
     fn latest_full_frame(&self) -> Option<BitmapUpdate> {
-        self.update.clone()
+        Some(self.full.clone())
     }
 }
 
@@ -191,18 +198,20 @@ impl RdpServerDisplay for SingleFrameDisplay {
         let width = core::num::NonZeroU16::new(self.width).unwrap();
         let height = core::num::NonZeroU16::new(self.height).unwrap();
         let stride = core::num::NonZeroUsize::new(usize::from(self.width) * 4).unwrap();
+        let full = BitmapUpdate {
+            x: 0,
+            y: 0,
+            width,
+            height,
+            format: PixelFormat::BgrX32,
+            data: Arc::clone(&self.data),
+            stride,
+            src_x: 0,
+            src_y: 0,
+        };
         Ok(Box::new(SingleFrameDisplayUpdates {
-            update: Some(BitmapUpdate {
-                x: 0,
-                y: 0,
-                width,
-                height,
-                format: PixelFormat::BgrX32,
-                data: Arc::clone(&self.data),
-                stride,
-                src_x: 0,
-                src_y: 0,
-            }),
+            pending: Some(full.clone()),
+            full,
         }))
     }
 }
