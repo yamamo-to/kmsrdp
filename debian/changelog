@@ -1,3 +1,12 @@
+kmsrdp (0.1.62) unstable; urgency=medium
+
+  * Extend resync catch-up (union/diff against last confirmed frame) to
+    Planar clients (mstsc, xfreerdp), not just NSCodec - fixes stuck or
+    incorrect screen regions when a busy session dropped a dirty rect
+    that no later update overlapped.
+
+ -- kmsrdp contributors <noreply@example.com>  Fri, 04 Sep 2026 12:30:00 +0900
+
 kmsrdp (0.1.61) unstable; urgency=medium
 
   * Fix NSCodec catch-up backlog growing unboundedly under sustained

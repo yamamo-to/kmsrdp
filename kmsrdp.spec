@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.61
+Version:        0.1.62
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,9 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Fri Sep 04 2026 kmsrdp contributors <noreply@example.com> - 0.1.62-1
+- Extend resync catch-up (union/diff against last confirmed frame) to Planar clients (mstsc, xfreerdp), not just NSCodec - fixes stuck or incorrect screen regions when a busy session dropped a dirty rect that no later update overlapped
+
 * Tue Aug 25 2026 kmsrdp contributors <noreply@example.com> - 0.1.61-1
 - Fix NSCodec catch-up backlog growing unboundedly under sustained display churn (e.g. video), causing multi-minute latency
 - Gate NSCodec catch-up on real kernel TCP send backlog, not just our own send-queue bookkeeping
