@@ -299,6 +299,14 @@ impl DisplayHub {
                         data,
                     });
 
+                    // One broadcast per capture tick, not one per dirty
+                    // tile. Fan-out of N tiles races the session loop's
+                    // encode/send: a later full/coalesced frame can be
+                    // applied, then an earlier tile from this same (or a
+                    // prior) tick paints stale glyphs back onto the
+                    // client. Unioning into a single view keeps the
+                    // bounding box covered by this frame's Arc only.
+                    let mut merged: Option<BitmapUpdate> = None;
                     for rect in &dirty_rects {
                         let (Some(w), Some(h)) = (
                             NonZeroU16::new(rect.width as u16),
@@ -309,7 +317,13 @@ impl DisplayHub {
                         let Some(sub) = full.sub(rect.x as u16, rect.y as u16, w, h) else {
                             continue;
                         };
-                        let _ = self.tx.send(DisplayUpdate::Bitmap(sub));
+                        merged = Some(match merged.take() {
+                            Some(prev) => prev.union(sub),
+                            None => sub,
+                        });
+                    }
+                    if let Some(bitmap) = merged {
+                        let _ = self.tx.send(DisplayUpdate::Bitmap(bitmap));
                     }
                 }
                 Err(e) => {

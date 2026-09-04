@@ -337,6 +337,13 @@ where
     // there since Planar's faster encode falls behind less - but "less
     // often" still means an occasional stuck/incorrect region for every
     // client type.
+    tracing::info!(
+        client = client_label,
+        nscodec = bitmap_policy.nscodec.is_some(),
+        planar = bitmap_policy.nscodec.is_none()
+            && !crate::encode::client_needs_compat_workarounds(client_label),
+        "kmsrdp: bitmap encode path selected"
+    );
     let defer_ms = initial_bitmap_defer_ms(client_label, bitmap_policy.nscodec.is_some());
     let mut metrics = SessionBitmapMetrics::default();
     let mut bitmap_gate_open = defer_ms == 0;
@@ -352,18 +359,8 @@ where
     // occasional single misses are normal encode/send latency and not
     // worth a full-frame diff for; a real backlog is).
     let mut deferred_bitmap: Option<BitmapUpdate> = None;
-    let mut missed_since_last_send: u32 = 0;
-    /// After this many consecutive misses, switch from unioning
-    /// (`deferred_bitmap`) to a real diff-based resync. A running union's
-    /// bounding box only grows across cycles - fine for a couple of
-    /// misses, but under sustained load (e.g. video) it keeps re-encoding
-    /// a bigger area every cycle, falling further behind each time.
-    /// Resyncing pays a full-frame diff once instead of letting that
-    /// compound; low-value for the 1-2-miss case this exists to keep
-    /// cheap, so the threshold stays above that.
-    const MISSED_BEFORE_RESYNC: u32 = 3;
-    // Set once `missed_since_last_send` crosses the threshold above. When
-    // it's finally ready to pump again, `resync_bitmap` recomputes
+    // Set when a capture dirty notification arrives (or a send is deferred).
+    // When it's finally ready to pump again, `resync_bitmap` recomputes
     // exactly what's different from `last_synced_full` rather than
     // resending whatever rect happened to arrive most recently - see its
     // doc comment for why that matters under sustained load.
@@ -683,26 +680,34 @@ where
                             true,
                         );
                     }
-                    Ok(Some(DisplayUpdate::Bitmap(bitmap))) if !bitmap_gate_open => {
-                        missed_since_last_send += 1;
-                        if missed_since_last_send >= MISSED_BEFORE_RESYNC {
-                            pending_resync = true;
-                            deferred_bitmap = None;
-                            // Reset so the next resync needs another
-                            // full run of misses, not the very next
-                            // dirty-rect (the counter only ever grows
-                            // otherwise).
-                            missed_since_last_send = 0;
-                        } else {
-                            deferred_bitmap = Some(match deferred_bitmap.take() {
-                                Some(prev) => prev.union(bitmap),
-                                None => bitmap,
-                            });
-                        }
+                    Ok(Some(DisplayUpdate::Bitmap(_bitmap))) if !bitmap_gate_open => {
+                        // Capture dirty rects are only a wake-up: we always
+                        // resync against `last_synced_full` so a missed tile
+                        // cannot leave residual glyphs on the client.
+                        pending_resync = true;
+                        deferred_bitmap = None;
                     }
                     Ok(Some(DisplayUpdate::Bitmap(_))) if !display_updates_allowed => {}
-                    Ok(Some(DisplayUpdate::Bitmap(bitmap))) => {
-                        bitmap_to_pump = Some(bitmap);
+                    Ok(Some(DisplayUpdate::Bitmap(_bitmap))) => {
+                        // Same policy as the gate-closed path: never paint a
+                        // capture-side dirty rect directly. Diff what we last
+                        // confirmed against `latest_full` so every send covers
+                        // every still-divergent region (Ctrl+L / scroll).
+                        pending_resync = true;
+                        deferred_bitmap = None;
+                        let (pump, target) = match take_catchup_bitmap(
+                            &mut pending_resync,
+                            &mut deferred_bitmap,
+                            last_synced_full.clone(),
+                            updates.latest_full_frame(),
+                        )
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => return finish_session(Err(e)),
+                        };
+                        bitmap_to_pump = pump;
+                        resync_target = target;
                     }
                     Ok(Some(DisplayUpdate::Resized(size))) if resizing => {
                         debug!("dropping resize to {}x{}: a previous resize is still in flight", size.width, size.height);
@@ -728,7 +733,6 @@ where
                                 resize_desktop = size;
                                 pending_after_resize = None;
                                 deferred_bitmap = None;
-                                missed_since_last_send = 0;
                                 pending_resync = false;
                                 last_synced_full = None;
                                 resync_target = None;
@@ -796,37 +800,35 @@ where
             let kernel_backlog_bytes = crate::socket_backlog::outstanding_send_bytes(raw_fd);
             let kernel_backlog_high = kernel_backlog_bytes
                 .is_some_and(|bytes| bytes > KERNEL_SEND_BACKLOG_THRESHOLD_BYTES);
+
             if bulk_send.0.is_some() || kernel_backlog_high {
-                missed_since_last_send += 1;
+                // A resync pump that can't go out yet must not leave
+                // `resync_target` armed: the next unrelated successful
+                // send would advance `last_synced_full` to a frame the
+                // client never received, and later resyncs would find
+                // "nothing different" while stale glyphs remain on
+                // screen. Re-arm pending_resync and drop the target.
+                if resync_target.take().is_some() {
+                    pending_resync = true;
+                    deferred_bitmap = None;
+                    debug!(
+                        busy = bulk_send.0.is_some(),
+                        kernel_backlog_high,
+                        kernel_backlog_bytes = kernel_backlog_bytes.unwrap_or(0),
+                        "kmsrdp: resync pump deferred; re-arming pending_resync"
+                    );
+                    continue;
+                }
+                pending_resync = true;
+                deferred_bitmap = None;
                 debug!(
-                    x = bitmap.x,
-                    y = bitmap.y,
-                    w = bitmap.width.get(),
-                    h = bitmap.height.get(),
                     busy = bulk_send.0.is_some(),
                     kernel_backlog_high,
                     kernel_backlog_bytes = kernel_backlog_bytes.unwrap_or(0),
-                    missed_since_last_send,
-                    "kmsrdp: bitmap update deferred"
+                    "kmsrdp: bitmap update deferred; arming resync"
                 );
-                if missed_since_last_send >= MISSED_BEFORE_RESYNC {
-                    pending_resync = true;
-                    deferred_bitmap = None;
-                    // See the matching comment at the other call site -
-                    // without this, every miss while already flagged
-                    // re-triggers this branch instead of needing a
-                    // fresh run of misses.
-                    missed_since_last_send = 0;
-                    debug!("kmsrdp: escalating to full resync");
-                } else {
-                    deferred_bitmap = Some(match deferred_bitmap.take() {
-                        Some(prev) => prev.union(bitmap),
-                        None => bitmap,
-                    });
-                }
                 continue;
             }
-            missed_since_last_send = 0;
             debug!(
                 x = bitmap.x,
                 y = bitmap.y,
@@ -835,11 +837,9 @@ where
                 from_resync = resync_target.is_some(),
                 "kmsrdp: sending bitmap update"
             );
-            if let Some(synced) = resync_target.take() {
-                last_synced_full = Some(synced);
-            } else if covers_desktop(&bitmap, resize_desktop.width, resize_desktop.height) {
-                last_synced_full = Some(bitmap.clone());
-            }
+            let advance_synced = resync_target.take();
+            let advance_full = covers_desktop(&bitmap, resize_desktop.width, resize_desktop.height)
+                .then(|| bitmap.clone());
             let full = updates.latest_full_frame();
             #[cfg(feature = "gfx")]
             let (gfx_handled, gfx_frames) = match try_encode_gfx_frame(
@@ -880,6 +880,25 @@ where
             {
                 return finish_session(Err(e));
             }
+            // Only advance the sync baseline once bytes are actually
+            // queued. An empty encode (skipped tiles / SoftSkip) must not
+            // claim the client has pixels it never received.
+            if bulk_send.0.is_some() {
+                if let Some(synced) = advance_synced {
+                    last_synced_full = Some(synced);
+                    pending_resync = false;
+                } else if let Some(full_bmp) = advance_full {
+                    last_synced_full = Some(full_bmp);
+                    pending_resync = false;
+                } else {
+                    // Partial non-resync send: heal any remaining gap next.
+                    pending_resync = true;
+                }
+                deferred_bitmap = None;
+            } else if advance_synced.is_some() {
+                pending_resync = true;
+            }
+            continue;
         }
     }
 }
@@ -948,6 +967,10 @@ async fn take_catchup_bitmap(
     latest_full: Option<BitmapUpdate>,
 ) -> Result<(Option<BitmapUpdate>, Option<BitmapUpdate>), SessionError> {
     if *pending_resync {
+        // Anything still sitting in `deferred_bitmap` is an older Arc that
+        // would paint stale pixels after the resync; drop it. The resync
+        // diffs against `latest_full`, which already includes those rects.
+        *deferred_bitmap = None;
         take_pending_resync(pending_resync, last_synced_full, latest_full).await
     } else {
         Ok((deferred_bitmap.take(), None))
