@@ -203,11 +203,27 @@ fn push_bitmap_rect(
 
     for row in (0..tile_height).rev() {
         let src_start = bitmap.src_byte_offset(tile_x, tile_y + row);
-        if let Some(slice) = bitmap.data.get(src_start..src_start + tile_row_bytes) {
-            tile_scratch.extend_from_slice(slice);
-        } else {
-            tile_scratch.extend(std::iter::repeat_n(0u8, tile_row_bytes));
-        }
+        let Some(slice) = bitmap.data.get(src_start..src_start + tile_row_bytes) else {
+            // Every producer of `bitmap` (`BitmapUpdate::sub`/`union`)
+            // validates this range against the backing buffer at
+            // construction time, so this should never trip - but zero-
+            // filling a missing row used to paint this tile black on the
+            // client instead of just not updating it. A stale-but-correct
+            // tile beats a corrupt one: skip the whole tile and log so the
+            // underlying cause (if this ever does fire) is visible.
+            tracing::warn!(
+                tile_x,
+                tile_y,
+                tile_width,
+                tile_height,
+                bitmap_width = bitmap.width.get(),
+                bitmap_height = bitmap.height.get(),
+                data_len = bitmap.data.len(),
+                "kmsrdp: bitmap tile read out of bounds; skipping tile instead of sending a black one"
+            );
+            return;
+        };
+        tile_scratch.extend_from_slice(slice);
     }
 
     let planar_ok = policy.use_rdp6_planar && tile_width.is_multiple_of(4);
@@ -265,6 +281,25 @@ pub(crate) fn encode_nscodec_update(
         bitmap.stride.get(),
         color_loss_level,
     );
+    if data.is_empty() {
+        // `bitmap.width`/`height` are `NonZeroU16`, so `nscodec::encode`
+        // only returns empty here when the source buffer doesn't actually
+        // cover the claimed rectangle (see its own doc comment) - every
+        // producer of `bitmap` is expected to guarantee that, but if it's
+        // ever violated, sending `SetSurfaceBits` with a zero-length codec
+        // payload tells the client "this rectangle changed" while handing
+        // it nothing to decode, which typically paints the region solid
+        // black. Skip sending instead, and log so the underlying cause
+        // (if this ever does fire) is visible.
+        tracing::warn!(
+            width = bitmap.width.get(),
+            height = bitmap.height.get(),
+            stride = bitmap.stride.get(),
+            data_len = bitmap.data.len(),
+            "kmsrdp: NSCodec encode produced no data; skipping update instead of sending a black surface"
+        );
+        return (Vec::new(), BitmapWireStats::default());
+    }
     let body = rdpcore_pdu::surface_commands::encode_set_surface_bits(
         bitmap.x,
         bitmap.y,
@@ -429,7 +464,10 @@ mod tests {
     use crate::display::{BitmapUpdate, PixelFormat};
     use core::num::{NonZeroU16, NonZeroUsize};
 
-    use super::{EncodeScratch, bitmap_encode_policy, encode_bitmap_update, max_raw_strip_height};
+    use super::{
+        EncodeScratch, bitmap_encode_policy, encode_bitmap_update, encode_nscodec_update,
+        max_raw_strip_height,
+    };
 
     fn bitmap(x: u16, y: u16, width: u16, height: u16, fill: u8) -> BitmapUpdate {
         let w = NonZeroU16::new(width).unwrap();
@@ -730,5 +768,54 @@ mod tests {
         assert!(!policy.use_rdp6_planar);
         assert_eq!(policy.nscodec, Some((1, 3)));
         assert_eq!(policy.max_rects_per_update, 32);
+    }
+
+    /// A `BitmapUpdate` claiming more pixels than its backing buffer
+    /// actually holds should never happen in production (`sub`/`union`
+    /// both validate this at construction), but if the invariant is ever
+    /// violated, the encoder must skip the affected tile instead of
+    /// zero-filling it (which painted the client's screen black - see
+    /// `push_bitmap_rect`'s doc comment).
+    #[test]
+    fn out_of_bounds_tile_is_skipped_instead_of_sent_black() {
+        let policy = bitmap_encode_policy("MSTSC", None, 8 * 1024 * 1024);
+        let short = BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(64).unwrap(),
+            height: NonZeroU16::new(64).unwrap(),
+            format: PixelFormat::BgrX32,
+            // Only enough bytes for a handful of rows, not the full tile.
+            data: std::sync::Arc::from(vec![0xAAu8; 64 * 4 * 4]),
+            stride: NonZeroUsize::new(64 * 4).unwrap(),
+            src_x: 0,
+            src_y: 0,
+        };
+        let mut scratch = EncodeScratch::default();
+        let stats = encode_bitmap_update(&short, &policy, &mut scratch);
+        assert_eq!(stats.tiles, 0, "no tile should be sent from a short buffer");
+        assert!(scratch.rectangles.is_empty());
+        assert!(scratch.batches.iter().all(|b| b.is_empty()));
+    }
+
+    /// Same invariant as above, for the NSCodec path: a short backing
+    /// buffer must not produce a `SetSurfaceBits` with an empty codec
+    /// payload (which the client renders as a black surface).
+    #[test]
+    fn nscodec_skips_update_instead_of_sending_empty_payload() {
+        let short = BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(64).unwrap(),
+            height: NonZeroU16::new(64).unwrap(),
+            format: PixelFormat::BgrX32,
+            data: std::sync::Arc::from(vec![0xAAu8; 64 * 4 * 4]),
+            stride: NonZeroUsize::new(64 * 4).unwrap(),
+            src_x: 0,
+            src_y: 0,
+        };
+        let (wire, stats) = encode_nscodec_update(&short, 1, 3, 8 * 1024 * 1024);
+        assert!(wire.is_empty());
+        assert_eq!(stats.encoded_bytes, 0);
     }
 }
