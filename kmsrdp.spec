@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.62
+Version:        0.1.63
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,9 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Fri Sep 04 2026 kmsrdp contributors <noreply@example.com> - 0.1.63-1
+- Retry a catch-up bitmap deferred by kernel send backlog on a periodic ticker instead of only on bulk_send completion - fixes a block-shaped region of the screen (e.g. a console left sitting at a login prompt after a bursty boot) never getting flushed once no further display updates arrive
+
 * Fri Sep 04 2026 kmsrdp contributors <noreply@example.com> - 0.1.62-1
 - Extend resync catch-up (union/diff against last confirmed frame) to Planar clients (mstsc, xfreerdp), not just NSCodec - fixes stuck or incorrect screen regions when a busy session dropped a dirty rect that no later update overlapped
 
