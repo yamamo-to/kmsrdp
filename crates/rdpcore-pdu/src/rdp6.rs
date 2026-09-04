@@ -401,6 +401,27 @@ mod tests {
     }
 
     #[test]
+    fn heap_path_tile_round_trips() {
+        // 128x96 = 12288 pixels, above MAX_STACK_PIXELS (4096) - exercises
+        // `encode_plane_heap`/its heap-allocated delta buffer. Not just a
+        // theoretical case: `rdpcore-server`'s raw-strip path (used for
+        // compat clients without RDP6 Planar) already produces tiles this
+        // large or larger for typical desktop widths (e.g. a 1920-wide
+        // strip is 8 rows tall to fit the 16-bit length budget, 15360
+        // pixels), so the stack-array fast path in `encode_to` is not the
+        // only one that needs to stay correct.
+        let mut state: u32 = 0xC0FFEE;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        let bgrx = make_tile(128, 96, |_, _| (next(), next(), next()));
+        let compressed = encode(&bgrx, 128, 96);
+        let decoded = decode(&compressed, 128, 96).unwrap();
+        assert_eq!(decoded, bgrx);
+    }
+
+    #[test]
     fn runs_crossing_the_extended_length_thresholds_round_trip() {
         // Exercise run lengths right around 16/32 (the extended-form
         // boundaries this encoder deliberately avoids) and past it.

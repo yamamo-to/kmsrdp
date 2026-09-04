@@ -793,10 +793,22 @@ where
             // a busy `bulk_send` - it feeds the same miss/resync/color-loss
             // escalation below instead of silently piling more encodes on
             // top of data the client hasn't received yet.
-            let kernel_backlog_high = crate::socket_backlog::outstanding_send_bytes(raw_fd)
+            let kernel_backlog_bytes = crate::socket_backlog::outstanding_send_bytes(raw_fd);
+            let kernel_backlog_high = kernel_backlog_bytes
                 .is_some_and(|bytes| bytes > KERNEL_SEND_BACKLOG_THRESHOLD_BYTES);
             if bulk_send.0.is_some() || kernel_backlog_high {
                 missed_since_last_send += 1;
+                debug!(
+                    x = bitmap.x,
+                    y = bitmap.y,
+                    w = bitmap.width.get(),
+                    h = bitmap.height.get(),
+                    busy = bulk_send.0.is_some(),
+                    kernel_backlog_high,
+                    kernel_backlog_bytes = kernel_backlog_bytes.unwrap_or(0),
+                    missed_since_last_send,
+                    "kmsrdp: bitmap update deferred"
+                );
                 if missed_since_last_send >= MISSED_BEFORE_RESYNC {
                     pending_resync = true;
                     deferred_bitmap = None;
@@ -805,6 +817,7 @@ where
                     // re-triggers this branch instead of needing a
                     // fresh run of misses.
                     missed_since_last_send = 0;
+                    debug!("kmsrdp: escalating to full resync");
                 } else {
                     deferred_bitmap = Some(match deferred_bitmap.take() {
                         Some(prev) => prev.union(bitmap),
@@ -814,6 +827,14 @@ where
                 continue;
             }
             missed_since_last_send = 0;
+            debug!(
+                x = bitmap.x,
+                y = bitmap.y,
+                w = bitmap.width.get(),
+                h = bitmap.height.get(),
+                from_resync = resync_target.is_some(),
+                "kmsrdp: sending bitmap update"
+            );
             if let Some(synced) = resync_target.take() {
                 last_synced_full = Some(synced);
             } else if covers_desktop(&bitmap, resize_desktop.width, resize_desktop.height) {
@@ -888,14 +909,27 @@ async fn take_pending_resync(
         return Ok((None, None));
     }
     let Some(full) = latest_full else {
+        debug!("kmsrdp: resync pending but no latest_full frame yet");
         return Ok((None, None));
     };
+    let had_baseline = last_synced_full.is_some();
     let full_for_diff = full.clone();
     let merged = tokio::task::spawn_blocking(move || {
         resync_bitmap(last_synced_full.as_ref(), &full_for_diff)
     })
     .await
     .map_err(|_| SessionError::EncodeJoin)?;
+    match &merged {
+        Some(m) => debug!(
+            x = m.x,
+            y = m.y,
+            w = m.width.get(),
+            h = m.height.get(),
+            had_baseline,
+            "kmsrdp: resync found changed region"
+        ),
+        None => debug!(had_baseline, "kmsrdp: resync found no difference"),
+    }
     Ok(match merged {
         Some(merged) => (Some(merged), Some(full)),
         None => (None, None),

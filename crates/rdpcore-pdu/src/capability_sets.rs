@@ -517,7 +517,13 @@ impl Default for BitmapCodecsCapability {
 
 impl BitmapCodecsCapability {
     pub fn encode_body(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(24);
+        // TS_BITMAP_CODECS_CAPABILITYSET (MS-RDPBCGR 2.2.7.2.10): codecCount(1)
+        // + one TS_BITMAP_CODEC per entry (codecGUID(16) + codecID(1) +
+        // codecPropertiesLength(2) + codecProperties). No trailing padding -
+        // the struct has no alignment requirement, and appending one threw
+        // off FreeRDP's own offset check (`rdp_read_capability_set`: actual
+        // 23 != expected 24), observed live against a real FreeRDP client.
+        let mut out = Vec::with_capacity(23);
         out.push(1); // codecCount
         out.write_slice(&NSCODEC_GUID);
         out.push(self.nscodec_id);
@@ -525,9 +531,6 @@ impl BitmapCodecsCapability {
         out.push(1); // dynamic fidelity allowed
         out.push(1); // subsampling allowed
         out.push(self.color_loss_level.clamp(1, 7));
-        if !out.len().is_multiple_of(2) {
-            out.push(0);
-        }
         out
     }
 }

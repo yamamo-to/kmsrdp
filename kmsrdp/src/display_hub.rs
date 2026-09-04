@@ -243,6 +243,7 @@ impl DisplayHub {
                         src_y: 0,
                     };
 
+                    let had_capturer_hint = raw.dirty_rects.is_some();
                     let dirty_rects = match raw.dirty_rects {
                         Some(rects) => {
                             coalesce_dirty_rects(rects, raw.width as usize, raw.height as usize)
@@ -270,6 +271,15 @@ impl DisplayHub {
                             _ => vec![Rect::new(0, 0, raw.width as usize, raw.height as usize)],
                         },
                     };
+
+                    tracing::debug!(
+                        rects = dirty_rects.len(),
+                        area = dirty_area(&dirty_rects),
+                        frame_w = raw.width,
+                        frame_h = raw.height,
+                        had_capturer_hint,
+                        "kmsrdp: capture dirty rects"
+                    );
 
                     // Publish `latest_full` *before* broadcasting. A slow
                     // subscriber that lags mid-scene-change recovers from

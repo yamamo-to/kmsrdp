@@ -66,10 +66,32 @@ pub async fn encode_outbound_bitmap(
     })
     .await
     .map_err(|_| SessionError::EncodeJoin)?;
+    tracing::debug!(
+        tiles = stats.tiles,
+        compressed_tiles = stats.compressed_tiles,
+        raw_tiles = stats.raw_tiles,
+        encoded_bytes = stats.encoded_bytes,
+        update_batches = stats.update_batches,
+        max_request_size = policy.max_request_size,
+        "kmsrdp: bitmap update encoded"
+    );
     metrics.record(stats);
 
     let id = *frame_id;
     *frame_id = frame_id.wrapping_add(1).max(1);
+    // Frame Marker is formally a Surface Commands concept (MS-RDPEGDI) with
+    // no defined role for the classic `TS_BITMAP_UPDATE_DATA` path the
+    // Planar branch above uses - a prior change here restricted it to
+    // NSCodec on that reading. In practice, real clients use it as a
+    // generic "a logical frame just completed" signal regardless of which
+    // update carried the pixels: Guacamole's guacd (`guac_rdp_gdi_*_frame_marker`
+    // in guacamole-server) drives its render thread's frame-boundary
+    // detection off exactly this PDU, falling back to a lossy ~10-100ms
+    // timing heuristic without it. Restricting it to NSCodec-only made that
+    // fallback guacd's *only* option for Planar (the path every non-NSCodec
+    // client, including guacd, actually uses) and didn't fix the stuck/stale
+    // region it was meant to address - so it goes back to wrapping every
+    // bitmap update, not just NSCodec's.
     let begin = encode_update_to_wire_frames(
         UPDATE_CODE_SURFACE_COMMANDS,
         &encode_frame_marker(FRAME_ACTION_BEGIN, id),
@@ -81,6 +103,21 @@ pub async fn encode_outbound_bitmap(
         policy.max_request_size,
     );
 
+    // NOTE: each of `begin`, one entry of `batches`, and `end` is the
+    // *complete* Fast-Path fragment sequence for one logical
+    // `TS_BITMAP_UPDATE_DATA`/Frame-Marker PDU, and the transport scheduler
+    // can interleave another channel's Latency frame between any two
+    // `Frame`s it's handed (by design, to bound audio/input latency during
+    // a bulk burst - see `scheduler.rs`). A prior version of this function
+    // concatenated each PDU's fragments into one `Frame` so the scheduler
+    // could only preempt between whole PDUs, on the theory that a client's
+    // Fast-Path reassembly (which tracks one global in-progress-fragmentation
+    // state) would otherwise reject a PDU interrupted mid-reassembly.
+    // Reverted: confirmed live to measurably worsen audio/input latency
+    // (a full multi-rect batch, not a single ~16KB fragment, became the
+    // unpreemptible unit) without fixing the stuck/stale-region symptom it
+    // was meant to address - so whatever is actually causing that remains
+    // open, and isn't worth this tradeoff on an unconfirmed theory.
     Ok(begin
         .into_iter()
         .chain(batches.into_iter().flatten())
@@ -385,5 +422,62 @@ mod tests {
         if let Some(handle) = bulk_send.take() {
             handle.abort();
         }
+    }
+
+    /// A classic `TS_BITMAP_UPDATE_DATA` (Planar/raw) update is still
+    /// bracketed in a Surface Commands Frame Marker even though it has no
+    /// frame-boundary concept of its own on paper - real clients (e.g.
+    /// Guacamole's guacd) treat it as a generic "frame complete" signal
+    /// regardless of which update carried the pixels, and fall back to a
+    /// lossy timing heuristic without it (see `encode_outbound_bitmap`'s
+    /// doc comment).
+    #[tokio::test]
+    async fn planar_path_keeps_frame_marker_wrapping() {
+        let policy = bitmap_encode_policy("test", None, 8192);
+        let bitmap = tiny_bitmap();
+
+        let mut scratch = EncodeScratch::default();
+        encode_bitmap_update(&bitmap, &policy, &mut scratch);
+        let planar_frame_count: usize = scratch.batches.iter().map(|b| b.len()).sum();
+        assert!(planar_frame_count > 0);
+
+        let mut frame_id = 1u32;
+        let mut metrics = SessionBitmapMetrics::default();
+        let frames = encode_outbound_bitmap(&bitmap, &policy, &mut frame_id, &mut metrics)
+            .await
+            .unwrap();
+
+        assert!(
+            frames.len() > planar_frame_count,
+            "Planar update must still be bracketed by begin/end frame markers"
+        );
+    }
+
+    /// NSCodec genuinely goes over Surface Commands (`SetSurfaceBits`), so
+    /// it keeps the Frame Marker wrapping.
+    #[tokio::test]
+    async fn nscodec_path_keeps_frame_marker_wrapping() {
+        let nscodec = rdpcore_pdu::capability_sets::NsCodecNegotiated {
+            codec_id: 1,
+            color_loss_level: 3,
+        };
+        let policy = bitmap_encode_policy("test", Some(nscodec), 8192);
+        let bitmap = tiny_bitmap();
+
+        let (nscodec_batches, _) =
+            crate::encode::encode_nscodec_update(&bitmap, 1, 3, policy.max_request_size);
+        let nscodec_frame_count: usize = nscodec_batches.iter().map(|b| b.len()).sum();
+        assert!(nscodec_frame_count > 0);
+
+        let mut frame_id = 1u32;
+        let mut metrics = SessionBitmapMetrics::default();
+        let frames = encode_outbound_bitmap(&bitmap, &policy, &mut frame_id, &mut metrics)
+            .await
+            .unwrap();
+
+        assert!(
+            frames.len() > nscodec_frame_count,
+            "NSCodec update must still be bracketed by begin/end frame markers"
+        );
     }
 }
