@@ -105,33 +105,30 @@ pub async fn encode_outbound_bitmap(
 
     // NOTE: each of `begin`, one entry of `batches`, and `end` is the
     // *complete* Fast-Path fragment sequence for one logical
-    // `TS_BITMAP_UPDATE_DATA`/Frame-Marker PDU. Fragments of a single PDU are
-    // concatenated into one `Frame` so the transport scheduler cannot
-    // interleave another channel's Latency frame mid-reassembly (clients
-    // keep one global Fast-Path reassembly buffer; an interruption drops
-    // or corrupts the update and leaves residual tiles). Preemption is
-    // still allowed between whole PDUs (BEGIN / each bitmap batch / END).
-    Ok(std::iter::once(concat_wire_pdu(begin))
-        .chain(batches.into_iter().map(concat_wire_pdu))
-        .chain(std::iter::once(concat_wire_pdu(end)))
-        .filter(|bytes| !bytes.is_empty())
+    // `TS_BITMAP_UPDATE_DATA`/Frame-Marker PDU, and the transport scheduler
+    // can interleave another channel's Latency frame between any two
+    // `Frame`s it's handed (by design, to bound audio/input latency during
+    // a bulk burst - see `scheduler.rs`). A tried variant concatenated each
+    // PDU's fragments into one `Frame` so the scheduler could only preempt
+    // between whole PDUs, on the theory that a client's Fast-Path reassembly
+    // (which tracks one global in-progress-fragmentation state) would
+    // otherwise reject a PDU interrupted mid-reassembly. Confirmed live to
+    // measurably worsen audio/input latency (a full multi-rect batch, not a
+    // single ~16KB fragment, became the unpreemptible unit); the residual
+    // stale-tile symptom this was meant to guard against turned out to be
+    // fixed by the always-resync-against-last_synced_full change in this
+    // same commit, so the atomicity trade isn't needed - back to per-fragment
+    // `Frame`s.
+    Ok(begin
+        .into_iter()
+        .chain(batches.into_iter().flatten())
+        .chain(end)
         .map(|bytes| Frame {
             channel: ChannelKey::Io,
             priority: Priority::Bulk,
             bytes,
         })
         .collect())
-}
-
-/// Concatenate the Fast-Path packets that make up one fragmented PDU into
-/// a single scheduler `Frame` so nothing else is written between them.
-fn concat_wire_pdu(parts: Vec<Vec<u8>>) -> Vec<u8> {
-    let len: usize = parts.iter().map(|p| p.len()).sum();
-    let mut out = Vec::with_capacity(len);
-    for part in parts {
-        out.extend(part);
-    }
-    out
 }
 
 pub async fn send_frames(
@@ -442,7 +439,8 @@ mod tests {
 
         let mut scratch = EncodeScratch::default();
         encode_bitmap_update(&bitmap, &policy, &mut scratch);
-        assert!(!scratch.batches.is_empty());
+        let planar_frame_count: usize = scratch.batches.iter().map(|b| b.len()).sum();
+        assert!(planar_frame_count > 0);
 
         let mut frame_id = 1u32;
         let mut metrics = SessionBitmapMetrics::default();
@@ -451,14 +449,9 @@ mod tests {
             .unwrap();
 
         assert!(
-            frames.len() >= 3,
-            "Planar update must still be bracketed by begin/end frame markers (got {} frames)",
-            frames.len()
+            frames.len() > planar_frame_count,
+            "Planar update must still be bracketed by begin/end frame markers"
         );
-        // Fragments of each PDU are concatenated, so the outbound frame
-        // count is 2 markers + number of bitmap batches — not one Frame
-        // per wire fragment.
-        assert_eq!(frames.len(), 2 + scratch.batches.len());
     }
 
     /// NSCodec genuinely goes over Surface Commands (`SetSurfaceBits`), so
@@ -474,7 +467,8 @@ mod tests {
 
         let (nscodec_batches, _) =
             crate::encode::encode_nscodec_update(&bitmap, 1, 3, policy.max_request_size);
-        assert!(!nscodec_batches.is_empty());
+        let nscodec_frame_count: usize = nscodec_batches.iter().map(|b| b.len()).sum();
+        assert!(nscodec_frame_count > 0);
 
         let mut frame_id = 1u32;
         let mut metrics = SessionBitmapMetrics::default();
@@ -483,10 +477,8 @@ mod tests {
             .unwrap();
 
         assert!(
-            frames.len() >= 3,
-            "NSCodec update must still be bracketed by begin/end frame markers (got {} frames)",
-            frames.len()
+            frames.len() > nscodec_frame_count,
+            "NSCodec update must still be bracketed by begin/end frame markers"
         );
-        assert_eq!(frames.len(), 2 + nscodec_batches.len());
     }
 }
