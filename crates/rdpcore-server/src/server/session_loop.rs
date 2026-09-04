@@ -442,6 +442,18 @@ where
     // A/V offset from connect). Abort on session end so the spawned
     // task cannot keep the writer alive after we return.
     let mut bulk_send = AbortHandleOnDrop::default();
+    // Retries a stuck catch-up flush. A `deferred_bitmap`/`pending_resync`
+    // produced while `kernel_backlog_high` was true (see that check further
+    // down) never starts a `bulk_send` - so if the desktop then goes idle
+    // (no further dirty rects at all, e.g. a console sitting at a login
+    // prompt after a bursty boot sequence filled the kernel send buffer),
+    // nothing else in this loop ever revisits it: the `join` arm only fires
+    // once a `bulk_send` is in flight, and the startup gate timer fires
+    // exactly once. Without this ticker that catch-up region stays stuck on
+    // the client's screen forever, even long after the backlog itself
+    // clears.
+    let mut catchup_ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+    catchup_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         let mut bitmap_to_pump: Option<BitmapUpdate> = None;
@@ -603,44 +615,61 @@ where
                     Err(_) => return finish_session(Err(SessionError::EncodeJoin)),
                 }
                 if display_updates_allowed && bitmap_gate_open {
-                    if pending_resync {
-                        let (pump, target) = match take_pending_resync(
-                            &mut pending_resync,
-                            last_synced_full.clone(),
-                            updates.latest_full_frame(),
-                        )
-                        .await
-                        {
-                            Ok(v) => v,
-                            Err(e) => return finish_session(Err(e)),
-                        };
-                        bitmap_to_pump = pump;
-                        resync_target = target;
-                    } else {
-                        bitmap_to_pump = deferred_bitmap.take();
-                    }
+                    let (pump, target) = match take_catchup_bitmap(
+                        &mut pending_resync,
+                        &mut deferred_bitmap,
+                        last_synced_full.clone(),
+                        updates.latest_full_frame(),
+                    )
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return finish_session(Err(e)),
+                    };
+                    bitmap_to_pump = pump;
+                    resync_target = target;
                 }
             }
             _ = &mut bitmap_gate, if !bitmap_gate_open => {
                 bitmap_gate_open = true;
                 if display_updates_allowed {
-                    if pending_resync {
-                        let (pump, target) = match take_pending_resync(
-                            &mut pending_resync,
-                            last_synced_full.clone(),
-                            updates.latest_full_frame(),
-                        )
-                        .await
-                        {
-                            Ok(v) => v,
-                            Err(e) => return finish_session(Err(e)),
-                        };
-                        bitmap_to_pump = pump;
-                        resync_target = target;
-                    } else {
-                        bitmap_to_pump = deferred_bitmap.take();
-                    }
+                    let (pump, target) = match take_catchup_bitmap(
+                        &mut pending_resync,
+                        &mut deferred_bitmap,
+                        last_synced_full.clone(),
+                        updates.latest_full_frame(),
+                    )
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return finish_session(Err(e)),
+                    };
+                    bitmap_to_pump = pump;
+                    resync_target = target;
                 }
+            }
+            // See `catchup_ticker`'s doc comment: retries a catch-up flush
+            // that a busy `bulk_send` or high kernel backlog deferred, in
+            // case nothing else (no new dirty rect, no in-flight send) would
+            // otherwise ever revisit it.
+            _ = catchup_ticker.tick(), if bulk_send.0.is_none()
+                && display_updates_allowed
+                && bitmap_gate_open
+                && (pending_resync || deferred_bitmap.is_some()) =>
+            {
+                let (pump, target) = match take_catchup_bitmap(
+                    &mut pending_resync,
+                    &mut deferred_bitmap,
+                    last_synced_full.clone(),
+                    updates.latest_full_frame(),
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => return finish_session(Err(e)),
+                };
+                bitmap_to_pump = pump;
+                resync_target = target;
             }
             update = updates.next_update() => {
                 match update {
@@ -871,6 +900,24 @@ async fn take_pending_resync(
         Some(merged) => (Some(merged), Some(full)),
         None => (None, None),
     })
+}
+
+/// Flushes whatever catch-up state is pending - a real diff-based resync,
+/// or just the cheap unioned [`deferred_bitmap`] - into a bitmap to send.
+/// Shared by every place allowed to resume sending: a completed bulk send,
+/// the startup gate opening, and the idle catch-up ticker (see
+/// `catchup_ticker`'s doc comment for why that last one exists).
+async fn take_catchup_bitmap(
+    pending_resync: &mut bool,
+    deferred_bitmap: &mut Option<BitmapUpdate>,
+    last_synced_full: Option<BitmapUpdate>,
+    latest_full: Option<BitmapUpdate>,
+) -> Result<(Option<BitmapUpdate>, Option<BitmapUpdate>), SessionError> {
+    if *pending_resync {
+        take_pending_resync(pending_resync, last_synced_full, latest_full).await
+    } else {
+        Ok((deferred_bitmap.take(), None))
+    }
 }
 
 fn initial_bitmap_defer_ms(client_name: &str, using_nscodec: bool) -> u64 {
