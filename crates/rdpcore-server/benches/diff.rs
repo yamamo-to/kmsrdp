@@ -1,3 +1,5 @@
+use std::hint::black_box;
+
 use criterion::{Criterion, criterion_group, criterion_main};
 use rdpcore_server::diff::find_dirty_rects;
 
@@ -10,9 +12,9 @@ fn dirty_rects_1080p_identical(c: &mut Criterion) {
     c.bench_function("diff_1080p_identical", |benches| {
         benches.iter(|| {
             find_dirty_rects(
-                criterion::black_box(&a),
+                black_box(&a),
                 stride,
-                criterion::black_box(&b),
+                black_box(&b),
                 stride,
                 width,
                 height,
@@ -32,9 +34,9 @@ fn dirty_rects_1080p_one_tile(c: &mut Criterion) {
     c.bench_function("diff_1080p_one_tile", |benches| {
         benches.iter(|| {
             find_dirty_rects(
-                criterion::black_box(&a),
+                black_box(&a),
                 stride,
-                criterion::black_box(&b),
+                black_box(&b),
                 stride,
                 width,
                 height,
