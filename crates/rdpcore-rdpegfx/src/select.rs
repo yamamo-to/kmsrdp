@@ -2,6 +2,7 @@
 
 #[cfg(any(feature = "nvenc", feature = "vaapi"))]
 use tracing::debug;
+#[cfg(any(feature = "nvenc", feature = "vaapi", feature = "openh264"))]
 use tracing::info;
 
 use crate::encoder::H264Encoder;
