@@ -1,16 +1,18 @@
+use std::hint::black_box;
+
 use criterion::{Criterion, criterion_group, criterion_main};
 use rdpcore_pdu::rdp6;
 
 fn encode_64x64(c: &mut Criterion) {
     let pixels = vec![0x40u8; 64 * 64 * 4];
     c.bench_function("rdp6_encode_64x64", |b| {
-        b.iter(|| rdp6::encode(criterion::black_box(&pixels), 64, 64))
+        b.iter(|| rdp6::encode(black_box(&pixels), 64, 64))
     });
     c.bench_function("rdp6_encode_to_64x64_pooled", |b| {
         let mut out = Vec::with_capacity(6145);
         b.iter(|| {
-            rdp6::encode_to(criterion::black_box(&pixels), 64, 64, &mut out);
-            criterion::black_box(&out);
+            rdp6::encode_to(black_box(&pixels), 64, 64, &mut out);
+            black_box(&out);
         })
     });
 }
@@ -18,7 +20,7 @@ fn encode_64x64(c: &mut Criterion) {
 fn encode_256x256(c: &mut Criterion) {
     let pixels = vec![0x40u8; 256 * 256 * 4];
     c.bench_function("rdp6_encode_256x256", |b| {
-        b.iter(|| rdp6::encode(criterion::black_box(&pixels), 256, 256))
+        b.iter(|| rdp6::encode(black_box(&pixels), 256, 256))
     });
 }
 
