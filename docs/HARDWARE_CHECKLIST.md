@@ -64,6 +64,6 @@ Record results in the table at the bottom (copy a row per run).
 
 ## Related automation
 
-- CI FreeRDP Planar short session: `crates/rdpcore-server/tests/e2e_freerdp.rs` (requires `freerdp-x11` + `xvfb`; enforced when `CI` / `KMSRDP_REQUIRE_FREERDP=1`).
+- CI FreeRDP Planar short session: `crates/rdpcore-server/tests/e2e_freerdp.rs` (requires `freerdp2-x11` + `xvfb` on Ubuntu 24.04 CI; enforced when `KMSRDP_REQUIRE_FREERDP=1`).
 - GFX wire / mock: `rdpcore-rdpegfx` unit tests + `cargo test -p rdpcore-server --features gfx`.
 - Interop summary: [ARCHITECTURE.md](ARCHITECTURE.md) § Client Interoperability.

@@ -28,7 +28,7 @@ const DESKTOP_H: u16 = 240;
 fn require_freerdp() -> bool {
     // Opt-in only. Do not key off bare `CI=true`: coverage/fuzz jobs also set
     // CI but do not install FreeRDP. The main rust job sets
-    // `KMSRDP_REQUIRE_FREERDP=1` after installing freerdp-x11 + xvfb.
+    // `KMSRDP_REQUIRE_FREERDP=1` after installing freerdp2-x11 + xvfb.
     std::env::var_os("KMSRDP_REQUIRE_FREERDP").is_some_and(|v| v != "0")
 }
 
@@ -57,7 +57,7 @@ fn ensure_freerdp_tools() -> Option<&'static str> {
         _ if require_freerdp() => {
             panic!(
                 "FreeRDP e2e required (CI/KMSRDP_REQUIRE_FREERDP) but tools missing: \
-                 freerdp_bin={client:?} Xvfb={xvfb}. Install freerdp-x11 and xvfb."
+                 freerdp_bin={client:?} Xvfb={xvfb}. Install freerdp2-x11 (or freerdp3-x11) and xvfb."
             );
         }
         _ => {

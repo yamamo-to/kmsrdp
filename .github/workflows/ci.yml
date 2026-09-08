@@ -19,9 +19,11 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
+          # Ubuntu 24.04 (noble) runners: FreeRDP X11 client is freerdp2-x11
+          # (freerdp-x11 is not an install candidate; it points at freerdp2-x11).
           sudo apt-get install -y \
             build-essential g++ libfuse3-dev pkg-config libpulse-dev \
-            freerdp-x11 xvfb
+            freerdp2-x11 xvfb
 
       - name: Install Rust components
         run: rustup component add rustfmt clippy

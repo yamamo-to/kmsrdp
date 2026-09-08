@@ -22,13 +22,14 @@ use tracing::{debug, warn};
 
 use crate::display::{BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay};
 use crate::encode::{
-    bitmap_encode_policy, client_needs_compat_workarounds, covers_desktop, resync_bitmap,
+    bitmap_encode_policy, client_needs_compat_workarounds, covers_desktop,
     retain_bitmap_during_resize,
 };
 use crate::error::{SessionError, finish_session};
 use crate::input::{ConnectionScopedInput, RdpServerInputHandler};
 use crate::transport::{SteadyStateFrame, read_steady_state_frame};
 
+use super::bitmap_sync::BitmapSyncState;
 #[cfg(feature = "gfx")]
 use super::frame_pump::{
     apply_gfx_encode_outcome, build_gfx_frames, send_gfx_frames, try_encode_gfx_frame,
@@ -38,6 +39,8 @@ use super::frame_pump::{
 };
 use super::input_handler::dispatch_input_event;
 use super::metrics::SessionBitmapMetrics;
+use super::session_audio::{PlayQueueDiag, send_wave_frames};
+use super::session_guards::{AbortHandleOnDrop, AbortOnDrop, ResetInputOnDrop};
 use super::slow_path::handle_slow_path_frame;
 
 /// Per-connection dependencies and feature toggles for [`run_steady_state`].
@@ -354,26 +357,12 @@ where
     // this session can't act on it yet (startup gate still closed, or a
     // bulk send already in flight) is merged here via `BitmapUpdate::union`
     // - no frame-wide diff, same cost as before this catch-up logic
-    // existed at all. Escalates to `pending_resync` only after
-    // `MISSED_BEFORE_RESYNC` consecutive misses (see there for why:
-    // occasional single misses are normal encode/send latency and not
-    // worth a full-frame diff for; a real backlog is).
+    // existed at all. Escalates to `BitmapSyncState` only after sustained
+    // misses (see that type's docs): occasional single misses are normal
+    // encode/send latency and not worth a full-frame diff.
     let mut deferred_bitmap: Option<BitmapUpdate> = None;
-    // Set when a capture dirty notification arrives (or a send is deferred).
-    // When it's finally ready to pump again, `resync_bitmap` recomputes
-    // exactly what's different from `last_synced_full` rather than
-    // resending whatever rect happened to arrive most recently - see its
-    // doc comment for why that matters under sustained load.
-    let mut pending_resync = false;
-    // The last full-desktop frame this session is confirmed to have sent
-    // in its entirety (either directly, or as the baseline a resync
-    // diffed against and then fully covered).
-    let mut last_synced_full: Option<BitmapUpdate> = None;
-    // Set alongside `bitmap_to_pump` when it came from a resync, so once
-    // that pump actually gets queued for sending, `last_synced_full` only
-    // advances to it then - not before, since a resync only reflects
-    // reality once it's actually been handed off to be sent.
-    let mut resync_target: Option<BitmapUpdate> = None;
+    // Confirmed baseline + pending resync bookkeeping (see `bitmap_sync`).
+    let mut sync = BitmapSyncState::new();
     let mut display_updates_allowed = true;
     let mut frame_id = 1u32;
     let io_channel_id = accepted.io_channel_id;
@@ -439,7 +428,7 @@ where
     // A/V offset from connect). Abort on session end so the spawned
     // task cannot keep the writer alive after we return.
     let mut bulk_send = AbortHandleOnDrop::default();
-    // Retries a stuck catch-up flush. A `deferred_bitmap`/`pending_resync`
+    // Retries a stuck catch-up flush. A `deferred_bitmap` / pending resync
     // produced while `kernel_backlog_high` was true (see that check further
     // down) never starts a `bulk_send` - so if the desktop then goes idle
     // (no further dirty rects at all, e.g. a console sitting at a login
@@ -612,37 +601,25 @@ where
                     Err(_) => return finish_session(Err(SessionError::EncodeJoin)),
                 }
                 if display_updates_allowed && bitmap_gate_open {
-                    let (pump, target) = match take_catchup_bitmap(
-                        &mut pending_resync,
-                        &mut deferred_bitmap,
-                        last_synced_full.clone(),
-                        updates.latest_full_frame(),
-                    )
-                    .await
+                    bitmap_to_pump = match sync
+                        .take_catchup(&mut deferred_bitmap, updates.latest_full_frame())
+                        .await
                     {
                         Ok(v) => v,
                         Err(e) => return finish_session(Err(e)),
                     };
-                    bitmap_to_pump = pump;
-                    resync_target = target;
                 }
             }
             _ = &mut bitmap_gate, if !bitmap_gate_open => {
                 bitmap_gate_open = true;
                 if display_updates_allowed {
-                    let (pump, target) = match take_catchup_bitmap(
-                        &mut pending_resync,
-                        &mut deferred_bitmap,
-                        last_synced_full.clone(),
-                        updates.latest_full_frame(),
-                    )
-                    .await
+                    bitmap_to_pump = match sync
+                        .take_catchup(&mut deferred_bitmap, updates.latest_full_frame())
+                        .await
                     {
                         Ok(v) => v,
                         Err(e) => return finish_session(Err(e)),
                     };
-                    bitmap_to_pump = pump;
-                    resync_target = target;
                 }
             }
             // See `catchup_ticker`'s doc comment: retries a catch-up flush
@@ -652,21 +629,15 @@ where
             _ = catchup_ticker.tick(), if bulk_send.0.is_none()
                 && display_updates_allowed
                 && bitmap_gate_open
-                && (pending_resync || deferred_bitmap.is_some()) =>
+                && (sync.has_pending() || deferred_bitmap.is_some()) =>
             {
-                let (pump, target) = match take_catchup_bitmap(
-                    &mut pending_resync,
-                    &mut deferred_bitmap,
-                    last_synced_full.clone(),
-                    updates.latest_full_frame(),
-                )
-                .await
+                bitmap_to_pump = match sync
+                    .take_catchup(&mut deferred_bitmap, updates.latest_full_frame())
+                    .await
                 {
                     Ok(v) => v,
                     Err(e) => return finish_session(Err(e)),
                 };
-                bitmap_to_pump = pump;
-                resync_target = target;
             }
             update = updates.next_update() => {
                 match update {
@@ -682,9 +653,9 @@ where
                     }
                     Ok(Some(DisplayUpdate::Bitmap(_bitmap))) if !bitmap_gate_open => {
                         // Capture dirty rects are only a wake-up: we always
-                        // resync against `last_synced_full` so a missed tile
-                        // cannot leave residual glyphs on the client.
-                        pending_resync = true;
+                        // resync against the last confirmed full frame so a
+                        // missed tile cannot leave residual glyphs on the client.
+                        sync.mark_dirty();
                         deferred_bitmap = None;
                     }
                     Ok(Some(DisplayUpdate::Bitmap(_))) if !display_updates_allowed => {}
@@ -693,21 +664,15 @@ where
                         // capture-side dirty rect directly. Diff what we last
                         // confirmed against `latest_full` so every send covers
                         // every still-divergent region (Ctrl+L / scroll).
-                        pending_resync = true;
+                        sync.mark_dirty();
                         deferred_bitmap = None;
-                        let (pump, target) = match take_catchup_bitmap(
-                            &mut pending_resync,
-                            &mut deferred_bitmap,
-                            last_synced_full.clone(),
-                            updates.latest_full_frame(),
-                        )
-                        .await
+                        bitmap_to_pump = match sync
+                            .take_catchup(&mut deferred_bitmap, updates.latest_full_frame())
+                            .await
                         {
                             Ok(v) => v,
                             Err(e) => return finish_session(Err(e)),
                         };
-                        bitmap_to_pump = pump;
-                        resync_target = target;
                     }
                     Ok(Some(DisplayUpdate::Resized(size))) if resizing => {
                         debug!("dropping resize to {}x{}: a previous resize is still in flight", size.width, size.height);
@@ -733,9 +698,7 @@ where
                                 resize_desktop = size;
                                 pending_after_resize = None;
                                 deferred_bitmap = None;
-                                pending_resync = false;
-                                last_synced_full = None;
-                                resync_target = None;
+                                sync.reset();
                                 if frame_sender.send(Frame { channel: ChannelKey::Io, priority: Priority::Latency, bytes: response }).is_err() {
                                     return finish_session(Err(SessionError::WriterClosed));
                                 }
@@ -802,42 +765,30 @@ where
                 .is_some_and(|bytes| bytes > KERNEL_SEND_BACKLOG_THRESHOLD_BYTES);
 
             if bulk_send.0.is_some() || kernel_backlog_high {
-                // A resync pump that can't go out yet must not leave
-                // `resync_target` armed: the next unrelated successful
-                // send would advance `last_synced_full` to a frame the
-                // client never received, and later resyncs would find
-                // "nothing different" while stale glyphs remain on
-                // screen. Re-arm pending_resync and drop the target.
-                if resync_target.take().is_some() {
-                    pending_resync = true;
-                    deferred_bitmap = None;
-                    debug!(
-                        busy = bulk_send.0.is_some(),
-                        kernel_backlog_high,
-                        kernel_backlog_bytes = kernel_backlog_bytes.unwrap_or(0),
-                        "kmsrdp: resync pump deferred; re-arming pending_resync"
-                    );
-                    continue;
-                }
-                pending_resync = true;
+                // A resync pump that can't go out yet must not leave a
+                // resync target armed: the next unrelated successful send
+                // would advance the baseline to a frame the client never
+                // received. `defer` re-arms pending and drops the target.
+                let had_target = sync.defer();
                 deferred_bitmap = None;
                 debug!(
                     busy = bulk_send.0.is_some(),
                     kernel_backlog_high,
                     kernel_backlog_bytes = kernel_backlog_bytes.unwrap_or(0),
+                    had_resync_target = had_target,
                     "kmsrdp: bitmap update deferred; arming resync"
                 );
                 continue;
             }
+            let advance_synced = sync.take_resync_target();
             debug!(
                 x = bitmap.x,
                 y = bitmap.y,
                 w = bitmap.width.get(),
                 h = bitmap.height.get(),
-                from_resync = resync_target.is_some(),
+                from_resync = advance_synced.is_some(),
                 "kmsrdp: sending bitmap update"
             );
-            let advance_synced = resync_target.take();
             let advance_full = covers_desktop(&bitmap, resize_desktop.width, resize_desktop.height)
                 .then(|| bitmap.clone());
             let full = updates.latest_full_frame();
@@ -870,8 +821,7 @@ where
                 &mut bulk_send.0,
                 // `bulk_send.0` is always `None` here (checked just above),
                 // so `encode_and_queue_bitmap`'s own defer branch never
-                // fires - this session tracks catch-up itself via
-                // `pending_resync`/`resync_bitmap` instead.
+                // fires - this session tracks catch-up via `BitmapSyncState`.
                 &mut None,
                 gfx_frames,
                 gfx_handled,
@@ -883,20 +833,10 @@ where
             // Only advance the sync baseline once bytes are actually
             // queued. An empty encode (skipped tiles / SoftSkip) must not
             // claim the client has pixels it never received.
-            if bulk_send.0.is_some() {
-                if let Some(synced) = advance_synced {
-                    last_synced_full = Some(synced);
-                    pending_resync = false;
-                } else if let Some(full_bmp) = advance_full {
-                    last_synced_full = Some(full_bmp);
-                    pending_resync = false;
-                } else {
-                    // Partial non-resync send: heal any remaining gap next.
-                    pending_resync = true;
-                }
+            let queued = bulk_send.0.is_some();
+            sync.confirm_send(queued, advance_synced, advance_full);
+            if queued {
                 deferred_bitmap = None;
-            } else if advance_synced.is_some() {
-                pending_resync = true;
             }
             continue;
         }
@@ -905,76 +845,6 @@ where
 
 fn trim_client_name(name: &str) -> &str {
     name.trim_end_matches('\0').trim()
-}
-
-/// Consumes a pending catch-up flag and turns it into a bitmap to send (via
-/// [`resync_bitmap`]), plus the full-frame baseline `last_synced_full`
-/// should advance to once that bitmap is actually queued for sending.
-/// Returns `(None, None)` if there was nothing pending, the display has no
-/// full frame yet, or the resync found nothing actually different.
-///
-/// `resync_bitmap` walks the whole frame (a tile-diff, same cost class as
-/// the capture-side dirty-diff it mirrors) - run on the blocking pool, not
-/// inline on this connection's select! task, for the same reason
-/// `encode_outbound_bitmap` does: a synchronous full-frame scan here would
-/// otherwise stall Fast-Path input dispatch (and every other connection
-/// sharing this runtime) for its duration on every catch-up cycle.
-async fn take_pending_resync(
-    pending_resync: &mut bool,
-    last_synced_full: Option<BitmapUpdate>,
-    latest_full: Option<BitmapUpdate>,
-) -> Result<(Option<BitmapUpdate>, Option<BitmapUpdate>), SessionError> {
-    if !std::mem::take(pending_resync) {
-        return Ok((None, None));
-    }
-    let Some(full) = latest_full else {
-        debug!("kmsrdp: resync pending but no latest_full frame yet");
-        return Ok((None, None));
-    };
-    let had_baseline = last_synced_full.is_some();
-    let full_for_diff = full.clone();
-    let merged = tokio::task::spawn_blocking(move || {
-        resync_bitmap(last_synced_full.as_ref(), &full_for_diff)
-    })
-    .await
-    .map_err(|_| SessionError::EncodeJoin)?;
-    match &merged {
-        Some(m) => debug!(
-            x = m.x,
-            y = m.y,
-            w = m.width.get(),
-            h = m.height.get(),
-            had_baseline,
-            "kmsrdp: resync found changed region"
-        ),
-        None => debug!(had_baseline, "kmsrdp: resync found no difference"),
-    }
-    Ok(match merged {
-        Some(merged) => (Some(merged), Some(full)),
-        None => (None, None),
-    })
-}
-
-/// Flushes whatever catch-up state is pending - a real diff-based resync,
-/// or just the cheap unioned [`deferred_bitmap`] - into a bitmap to send.
-/// Shared by every place allowed to resume sending: a completed bulk send,
-/// the startup gate opening, and the idle catch-up ticker (see
-/// `catchup_ticker`'s doc comment for why that last one exists).
-async fn take_catchup_bitmap(
-    pending_resync: &mut bool,
-    deferred_bitmap: &mut Option<BitmapUpdate>,
-    last_synced_full: Option<BitmapUpdate>,
-    latest_full: Option<BitmapUpdate>,
-) -> Result<(Option<BitmapUpdate>, Option<BitmapUpdate>), SessionError> {
-    if *pending_resync {
-        // Anything still sitting in `deferred_bitmap` is an older Arc that
-        // would paint stale pixels after the resync; drop it. The resync
-        // diffs against `latest_full`, which already includes those rects.
-        *deferred_bitmap = None;
-        take_pending_resync(pending_resync, last_synced_full, latest_full).await
-    } else {
-        Ok((deferred_bitmap.take(), None))
-    }
 }
 
 fn initial_bitmap_defer_ms(client_name: &str, using_nscodec: bool) -> u64 {
@@ -995,137 +865,5 @@ async fn recv_optional<T>(rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<T
             msg
         }
         None => std::future::pending().await,
-    }
-}
-
-/// Aborts the wrapped task when dropped, instead of letting it run
-/// detached forever after this connection ends.
-pub struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// Same as [`AbortOnDrop`], but for a bulk-graphics send that the session
-/// loop also awaits. Dropping the handle without abort would detach the
-/// task and keep the connection writer alive after the session returns.
-#[derive(Default)]
-struct AbortHandleOnDrop(Option<tokio::task::JoinHandle<Result<(), SessionError>>>);
-
-impl Drop for AbortHandleOnDrop {
-    fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
-            handle.abort();
-        }
-    }
-}
-
-/// Calls `reset()` on the wrapped input handler when dropped, so a
-/// connection that ends (normally, on error, or via panic) always
-/// releases whatever keys/buttons it was holding.
-pub struct ResetInputOnDrop(pub Arc<Mutex<dyn RdpServerInputHandler>>);
-
-impl Drop for ResetInputOnDrop {
-    fn drop(&mut self) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).reset();
-    }
-}
-
-fn send_wave_frames(
-    channel: &mut RdpsndChannel,
-    frame_sender: &rdpcore_transport::FrameSender,
-    pcm: Vec<u8>,
-    timestamp_ms: u32,
-    diag: &mut PlayQueueDiag,
-) {
-    let channel_id = channel.channel_id();
-    let encoded = channel.encode_wave(pcm, timestamp_ms);
-    let stats = channel.play_queue_stats();
-    if encoded.is_empty() {
-        diag.note_skip(&stats);
-        return;
-    }
-    let frames = encoded
-        .into_iter()
-        .map(|bytes| Frame {
-            channel: ChannelKey::Static(channel_id),
-            priority: Priority::Latency,
-            bytes,
-        })
-        .collect();
-    let _ = frame_sender.send_live(frames);
-    diag.note_send(&stats);
-}
-
-struct PlayQueueDiag {
-    first_send: Option<std::time::Instant>,
-    logged_first_confirm: bool,
-    last_log: std::time::Instant,
-    sent: u32,
-    skipped: u32,
-}
-
-impl Default for PlayQueueDiag {
-    fn default() -> Self {
-        Self {
-            first_send: None,
-            logged_first_confirm: false,
-            last_log: std::time::Instant::now(),
-            sent: 0,
-            skipped: 0,
-        }
-    }
-}
-
-impl PlayQueueDiag {
-    fn note_skip(&mut self, stats: &rdpcore_rdpsnd::PlayQueueStats) {
-        self.skipped = self.skipped.saturating_add(1);
-        self.maybe_log(stats);
-    }
-
-    fn note_send(&mut self, stats: &rdpcore_rdpsnd::PlayQueueStats) {
-        if self.first_send.is_none() {
-            self.first_send = Some(std::time::Instant::now());
-        }
-        self.sent = self.sent.saturating_add(1);
-        self.maybe_log(stats);
-    }
-
-    fn maybe_log(&mut self, stats: &rdpcore_rdpsnd::PlayQueueStats) {
-        if !self.logged_first_confirm
-            && let Some(rtt_ms) = stats.last_confirm_rtt_ms
-        {
-            self.logged_first_confirm = true;
-            let wait_ms = self
-                .first_send
-                .map(|t| t.elapsed().as_millis())
-                .unwrap_or(0);
-            debug!(
-                wait_ms,
-                rtt_ms,
-                pending_blocks = stats.pending_blocks,
-                "rdpsnd: first WaveConfirm (wait_ms ≈ client preroll; rtt_ms ≈ play-queue depth)"
-            );
-        }
-        if self.last_log.elapsed() < std::time::Duration::from_secs(1) {
-            return;
-        }
-        debug!(
-            sent = self.sent,
-            skipped = self.skipped,
-            pending_blocks = stats.pending_blocks,
-            last_confirm_rtt_ms = stats.last_confirm_rtt_ms,
-            best_confirm_rtt_ms = stats.best_confirm_rtt_ms,
-            ready = stats.ready,
-            rtt_behind = stats.rtt_behind,
-            receive_ack_count = stats.receive_ack_count,
-            estimated_hold_ms = stats.estimated_hold_ms,
-            "rdpsnd: play-queue (estimated_hold_ms is measured FIFO; last_confirm_rtt_ms is the latest ack and may be a 0 ms receive-ack)"
-        );
-        self.last_log = std::time::Instant::now();
-        self.sent = 0;
-        self.skipped = 0;
     }
 }

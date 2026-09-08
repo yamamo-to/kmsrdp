@@ -19,10 +19,13 @@ use crate::credentials::{CredentialValidator, Credentials};
 use crate::display::RdpServerDisplay;
 use crate::input::RdpServerInputHandler;
 
+mod bitmap_sync;
 mod frame_pump;
 mod handshake;
 mod input_handler;
 mod metrics;
+mod session_audio;
+mod session_guards;
 mod session_loop;
 mod slow_path;
 
@@ -31,7 +34,7 @@ pub(crate) use frame_pump::gfx_already_sent_frame;
 #[cfg(test)]
 pub(crate) use input_handler::translate_mouse;
 #[cfg(test)]
-pub(crate) use session_loop::{AbortOnDrop, ResetInputOnDrop};
+pub(crate) use session_guards::{AbortOnDrop, ResetInputOnDrop};
 
 static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
