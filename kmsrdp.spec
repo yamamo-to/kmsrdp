@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.66
+Version:        0.1.67
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,9 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Tue Sep 08 2026 kmsrdp contributors <noreply@example.com> - 0.1.67-1
+- Add FreeRDP Planar short-session e2e in CI (freerdp-x11 + Xvfb) and GFX multipart / Caps regressions; document hardware checklist
+
 * Tue Sep 08 2026 kmsrdp contributors <noreply@example.com> - 0.1.66-1
 - Fix rustfmt failures that broke CI on v0.1.65
 - Add versioned git pre-commit hooks (fmt + clippy) and Cursor hooks so commits are checked before push
