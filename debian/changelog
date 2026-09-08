@@ -1,3 +1,11 @@
+kmsrdp (0.1.68) unstable; urgency=medium
+
+  * Reconnect RDPSND capture and RDPEAI virtual-mic playback when
+    logind switches the active session's Pulse/PipeWire server
+    (e.g. gdm-greeter → user), so audio is not stuck silent after login.
+
+ -- kmsrdp contributors <noreply@example.com>  Wed, 09 Sep 2026 02:48:16 +0900
+
 kmsrdp (0.1.67) unstable; urgency=medium
 
   * Add FreeRDP Planar short-session e2e in CI (freerdp-x11 + Xvfb)

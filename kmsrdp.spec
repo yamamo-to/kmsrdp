@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.67
+Version:        0.1.68
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,9 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Wed Sep 09 2026 kmsrdp contributors <noreply@example.com> - 0.1.68-1
+- Reconnect RDPSND/RDPEAI when the active session Pulse/PipeWire server changes (greeter → user)
+
 * Tue Sep 08 2026 kmsrdp contributors <noreply@example.com> - 0.1.67-1
 - Add FreeRDP Planar short-session e2e in CI (freerdp-x11 + Xvfb) and GFX multipart / Caps regressions; document hardware checklist
 
