@@ -66,6 +66,22 @@ KMSRDP is a pure-Rust, high-performance RDP remote desktop server for Linux that
 * **Structured Logging**:
   * Do not use raw `println!` or `eprintln!` in production code. Always use `tracing` (`error!`, `warn!`, `info!`, `debug!`, `trace!`) with structured key-value fields.
 
+### 2.7 Design discipline (keep the architecture from drifting)
+
+These rules protect the ~8/10 design posture: capability-first negotiation and
+thin session orchestration. Violating them for “one more client quirk” is how
+the codebase slides back toward ad-hoc special cases.
+
+* **No new client-name sniffs without review**:
+  * Do **not** add `client_name.contains(...)` (or equivalent) policy branches.
+  * Prefer capability negotiation (NSCodec, GFX CapsAdvertise, etc.).
+  * Existing sniffs are inventoried in [`CLIENT_NAME_SNIFFS.md`](CLIENT_NAME_SNIFFS.md); freeze growth unless a sniff is unavoidable, documented there in the same PR, and explicitly reviewed.
+* **`session_loop` is a wiring board only**:
+  * Do **not** grow `run_steady_state`'s `tokio::select!` with new policy, encode, or channel state machines.
+  * Put new logic in focused modules under `crates/rdpcore-server/src/server/` (pattern: `bitmap_sync`, `frame_pump`, `session_audio`, `session_guards`) and call them from the loop.
+  * The loop may own locals and dispatch; it should not re-implement resync, GFX encode, or audio queue math inline.
+  * **Audit (2026-09-08):** after extracting `bitmap_sync` / `session_guards` / `session_audio`, `session_loop.rs` is orchestration + dispatch only; the next behavioral change that would add state must land in a sibling module first (do not re-inline).
+
 ---
 
 ## 3. Development & Verification Workflows
@@ -92,13 +108,19 @@ git config core.hooksPath .githooks
 ```
 
 `.githooks/pre-commit` runs the same early CI checks (`cargo fmt --all --check` and
-`cargo clippy --workspace --all-targets -- -D warnings`). Cursor also enables this
-`hooksPath` automatically before agent `git commit` commands (see `.cursor/hooks.json`).
+`cargo clippy --workspace --all-targets -- -D warnings`). Cursor IDE hooks under
+`.cursor/` are **local-only** (gitignored); do not commit them. Agent/developer
+commits still go through `.githooks` once `core.hooksPath` is set as above.
 
 ### Real-client / hardware verification
-CI covers FreeRDP NLA + short Planar sessions and GFX wire/mock regressions. For DRM,
-heavy scroll, residual tiles, and `KMSRDP_GFX=1` under load, follow
+CI covers FreeRDP NLA + short Planar sessions and GFX wire/mock regressions
+(`freerdp2-x11` + Xvfb on Ubuntu 24.04 runners; see the green `Format, lint,
+and test` job on commit `3307a4f` / run
+[34225040225](https://github.com/yamamo-to/kmsrdp/actions/runs/34225040225)).
+For DRM, heavy scroll, residual tiles, and `KMSRDP_GFX=1` under load, follow
 [`docs/HARDWARE_CHECKLIST.md`](HARDWARE_CHECKLIST.md).
+
+Client-name sniff inventory (frozen): [`CLIENT_NAME_SNIFFS.md`](CLIENT_NAME_SNIFFS.md).
 
 ### Version Bump & Release Procedure (Lockstep Requirement)
 When bumping the version (e.g. `0.1.48` $\rightarrow$ `0.1.49`), all 4 files **MUST** be updated in lockstep in a dedicated commit:
