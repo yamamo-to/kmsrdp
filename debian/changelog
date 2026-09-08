@@ -1,3 +1,11 @@
+kmsrdp (0.1.66) unstable; urgency=medium
+
+  * Fix rustfmt failures that broke CI on v0.1.65.
+  * Add versioned git pre-commit hooks (fmt + clippy) and Cursor
+    hooks so commits are checked before push.
+
+ -- kmsrdp contributors <noreply@example.com>  Tue, 08 Sep 2026 19:57:47 +0900
+
 kmsrdp (0.1.65) unstable; urgency=medium
 
   * Fix FreeRDP hang/disconnect under GFX (KMSRDP_GFX=1) when large
