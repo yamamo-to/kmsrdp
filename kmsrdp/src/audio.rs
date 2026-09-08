@@ -84,7 +84,10 @@ enum CaptureEnd {
     /// RDP sound handler stopped or the wave publisher closed.
     Stopped,
     /// `PULSE_SERVER` changed — reconnect immediately to the new session.
-    SessionChanged { from: Option<String>, to: Option<String> },
+    SessionChanged {
+        from: Option<String>,
+        to: Option<String>,
+    },
     /// Connect/stream failure — retry after a short backoff.
     Transient,
 }
@@ -585,10 +588,7 @@ mod tests {
             std::env::set_var("PULSE_SERVER", "unix:/run/user/60578/pulse/native");
         }
         let bound = pulse_server_env();
-        assert_eq!(
-            bound.as_deref(),
-            Some("unix:/run/user/60578/pulse/native")
-        );
+        assert_eq!(bound.as_deref(), Some("unix:/run/user/60578/pulse/native"));
         unsafe {
             std::env::set_var("PULSE_SERVER", "unix:/run/user/1000/pulse/native");
         }
