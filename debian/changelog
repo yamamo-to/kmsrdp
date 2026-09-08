@@ -1,3 +1,13 @@
+kmsrdp (0.1.65) unstable; urgency=medium
+
+  * Fix FreeRDP hang/disconnect under GFX (KMSRDP_GFX=1) when large
+    AVC420 WireToSurface PDUs exceeded the 64KiB RDP8 single-segment
+    limit; split oversized payloads into MULTIPART segments.
+  * Bump rust dependencies and GitHub Actions upload-artifact; clear CI
+    audit noise from yanked/unsound transitive deps.
+
+ -- kmsrdp contributors <noreply@example.com>  Tue, 08 Sep 2026 19:47:26 +0900
+
 kmsrdp (0.1.64) unstable; urgency=medium
 
   * Fix TS_BITMAP_CODECS_CAPABILITYSET encoding a spec-nonexistent padding

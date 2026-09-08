@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.64
+Version:        0.1.65
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,10 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Tue Sep 08 2026 kmsrdp contributors <noreply@example.com> - 0.1.65-1
+- Fix FreeRDP hang/disconnect under GFX (KMSRDP_GFX=1) when large AVC420 WireToSurface PDUs exceeded the 64KiB RDP8 single-segment limit; split oversized payloads into MULTIPART segments
+- Bump rust dependencies and GitHub Actions upload-artifact; clear CI audit noise from yanked/unsound transitive deps
+
 * Fri Sep 04 2026 kmsrdp contributors <noreply@example.com> - 0.1.64-1
 - Fix TS_BITMAP_CODECS_CAPABILITYSET encoding a spec-nonexistent padding byte, which FreeRDP clients rejected as a capability-set length mismatch
 - Fix residual/stale console tiles surviving a terminal clear or scroll (e.g. Ctrl+L then `ls -l`) by always resyncing sends against the last confirmed frame instead of relaying raw capture dirty-rects
