@@ -552,6 +552,39 @@ mod tests {
     }
 
     #[test]
+    fn oversized_wire_to_surface_wrap_is_multipart_and_reassembles() {
+        // Bitstream alone already exceeds the RDP8 single-segment limit so the
+        // WireToSurface PDU (header + metablock + stream) must use MULTIPART —
+        // the FreeRDP zgfx failure mode under heavy GFX scroll.
+        let big = vec![0x5Eu8; ZGFX_MAX_SEGMENT_PAYLOAD];
+        let data = encode_avc420_bitmap_stream(1920, 1080, 22, 100, &big);
+        let pdu = encode_wire_to_surface_1_avc420(1, 1920, 1080, &data);
+        assert!(
+            pdu.len() > ZGFX_MAX_SEGMENT_PAYLOAD,
+            "precondition: wire PDU must exceed single-segment limit"
+        );
+        let wrapped = encode_segmented(&pdu);
+        assert_eq!(wrapped[0], SEGMENTED_MULTIPART);
+
+        let segment_count = u16::from_le_bytes(wrapped[1..3].try_into().unwrap()) as usize;
+        assert!(segment_count >= 2);
+        let uncompressed = u32::from_le_bytes(wrapped[3..7].try_into().unwrap()) as usize;
+        assert_eq!(uncompressed, pdu.len());
+
+        let mut rebuilt = Vec::with_capacity(uncompressed);
+        let mut off = 7usize;
+        for _ in 0..segment_count {
+            let seg_size = u32::from_le_bytes(wrapped[off..off + 4].try_into().unwrap()) as usize;
+            off += 4;
+            assert_eq!(wrapped[off], PACKET_COMPR_TYPE_RDP8);
+            rebuilt.extend_from_slice(&wrapped[off + 1..off + seg_size]);
+            off += seg_size;
+        }
+        assert_eq!(rebuilt, pdu);
+        assert_eq!(&rebuilt[0..2], &CMD_WIRE_TO_SURFACE_1.to_le_bytes());
+    }
+
+    #[test]
     fn avc420_preserves_annex_b_start_codes_on_wire() {
         let annex_b = [
             0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x00, 0x00, 0x01, 0x65,

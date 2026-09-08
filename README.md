@@ -176,6 +176,7 @@ sudo systemctl enable --now kmsrdp.service
 
 - [Requirements Specification](docs/REQUIREMENTS.md): USDM functional and non-functional requirements.
 - [Architecture & Protocol Flow](docs/ARCHITECTURE.md): DRM capture pipeline, internal crates, and RDP connection sequence diagrams.
+- [Hardware / real-client checklist](docs/HARDWARE_CHECKLIST.md): manual Planar/GFX/Guacamole verification after display changes.
 - [Agent & Developer Guidelines](docs/AGENTS.md): architecture assumptions, safety rules, and verification workflow.
 - [Quality Assessment](docs/QUALITY.md): subjective snapshot scores (not an automated audit).
 - [Security Model & Advisories](docs/SECURITY.md): threat model, deployment recommendations, and vulnerability reporting.

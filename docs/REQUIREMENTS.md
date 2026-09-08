@@ -60,8 +60,8 @@
 |---|---|---|---|
 | SPC-DISP-5-1 | Default to RDP 6.0 Planar RLE (SurfaceCommands) for compatibility with standard clients (mstsc, xfreerdp) | `rdpcore-pdu`, `server/encode.rs` | YES |
 | SPC-DISP-5-2 | Force NSCodec for macOS "Windows App" (`mac`/`darwin`/`iphone`/`ipad` client names) | `server/encode.rs` | PARTIAL |
-| SPC-DISP-5-3 | Enable MS-RDPEGFX (AVC420, OpenH264) when requested via `KMSRDP_GFX=1` (disabled by default) | `crates/rdpcore-rdpegfx` | PARTIAL |
-| SPC-DISP-5-4 | Negotiate GFX AVC420 capabilities during CapsAdvertise exchange (`CAP_VERSION_8`..`104`) | `rdpcore-rdpegfx/src/select.rs` | PARTIAL |
+| SPC-DISP-5-3 | Enable MS-RDPEGFX (AVC420, OpenH264) when requested via `KMSRDP_GFX=1` (disabled by default) | `crates/rdpcore-rdpegfx` | YES (unit + `e2e_mock_client` with `--features gfx`); MANUAL for real FreeRDP/mstsc pixels — see `docs/HARDWARE_CHECKLIST.md` |
+| SPC-DISP-5-4 | Negotiate GFX AVC420 capabilities during CapsAdvertise exchange (`CAP_VERSION_8`..`104`) | `rdpcore-rdpegfx/src/select.rs` | YES |
 | SPC-DISP-5-5 | Support optional hardware encoding via `gfx-vaapi` / `gfx-nvenc` cargo features (OpenH264 CPU fallback) | `nvenc_enc.rs`, `vaapi_enc.rs`, `openh264_enc.rs` | YES (Unit tests) |
 | SPC-DISP-5-6 | Separate GFX encoder mutex locks to prevent CPU encoding from blocking `FrameAcknowledge` processing | `rdpcore-rdpegfx/src/encoder.rs` | YES |
 | SPC-DISP-5-7 | Send Save Session Info (PLAINNOTIFY) PDU immediately following connection establishment | `server/handshake.rs` | PARTIAL |
@@ -234,7 +234,7 @@
 |---|---|---|---|
 | SPC-NFR-4-1 | Maintain comprehensive unit test coverage across workspace crates | `docs/QUALITY.md` | YES |
 | SPC-NFR-4-2 | Apply `proptest` property-based testing across core PDU codecs and virtual channels | Workspace unit test suites | YES |
-| SPC-NFR-4-3 | Run FreeRDP E2E handshake integration tests in CI harness | `tests/e2e_freerdp.rs` | YES |
+| SPC-NFR-4-3 | Run FreeRDP E2E integration tests in CI (NLA + short Planar session; FreeRDP+Xvfb installed; skip forbidden in CI) | `tests/e2e_freerdp.rs`, `.github/workflows/ci.yml` | YES |
 
 ### REQ-NFR-5: Maintainability
 | Spec ID | Specification | Implementation | Test |

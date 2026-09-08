@@ -19,7 +19,9 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential g++ libfuse3-dev pkg-config libpulse-dev
+          sudo apt-get install -y \
+            build-essential g++ libfuse3-dev pkg-config libpulse-dev \
+            freerdp-x11 xvfb
 
       - name: Install Rust components
         run: rustup component add rustfmt clippy
@@ -31,7 +33,15 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run tests
+        env:
+          # Fail (do not skip) FreeRDP e2e when xfreerdp/Xvfb are missing.
+          KMSRDP_REQUIRE_FREERDP: "1"
         run: cargo test --workspace
+
+      - name: Run GFX-enabled server integration tests
+        env:
+          KMSRDP_REQUIRE_FREERDP: "1"
+        run: cargo test -p rdpcore-server --features gfx
 
       - name: Release build
         run: cargo build --release --workspace

@@ -95,6 +95,11 @@ git config core.hooksPath .githooks
 `cargo clippy --workspace --all-targets -- -D warnings`). Cursor also enables this
 `hooksPath` automatically before agent `git commit` commands (see `.cursor/hooks.json`).
 
+### Real-client / hardware verification
+CI covers FreeRDP NLA + short Planar sessions and GFX wire/mock regressions. For DRM,
+heavy scroll, residual tiles, and `KMSRDP_GFX=1` under load, follow
+[`docs/HARDWARE_CHECKLIST.md`](HARDWARE_CHECKLIST.md).
+
 ### Version Bump & Release Procedure (Lockstep Requirement)
 When bumping the version (e.g. `0.1.48` $\rightarrow$ `0.1.49`), all 4 files **MUST** be updated in lockstep in a dedicated commit:
 

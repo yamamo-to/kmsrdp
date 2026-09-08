@@ -64,6 +64,45 @@ fn caps_configures_surface_immediately() {
     assert!(frames.iter().all(|r| r[0] == 0xe0 || r[0] == 0xe1));
 }
 
+/// Encoder that emits a bitstream large enough that WireToSurface exceeds the
+/// RDP8 single-segment limit (FreeRDP zgfx 64KiB).
+struct OversizedMockEncoder;
+
+impl H264Encoder for OversizedMockEncoder {
+    fn encode_bgrx(
+        &mut self,
+        _width: u16,
+        _height: u16,
+        _stride: usize,
+        _pixels: &[u8],
+        force_idr: bool,
+    ) -> Result<EncodedAu, EncoderError> {
+        let mut annex_b = vec![0x00, 0x00, 0x00, 0x01, if force_idr { 0x65 } else { 0x41 }];
+        annex_b.resize(crate::pdu::ZGFX_MAX_SEGMENT_PAYLOAD + 256, 0x5A);
+        Ok(EncodedAu { annex_b, qp: 22 })
+    }
+
+    fn reset(&mut self) {}
+}
+
+#[test]
+fn encode_oversized_wire_frame_uses_multipart() {
+    let session = GfxSession::new(Box::new(OversizedMockEncoder), 64, 64);
+    let mut handler = session.dvc_handler();
+    let advertise = encode_caps_advertise_for_test(&[RawCapabilitySet::flags_only(
+        CAP_VERSION_81,
+        CAPS_FLAG_AVC420_ENABLED,
+    )]);
+    let _ = handler.on_data(&advertise);
+    let pixels = vec![0u8; 64 * 64 * 4];
+    let frames = expect_frames(session.encode_frame(64, 64, 64 * 4, &pixels));
+    assert_eq!(frames.len(), 3);
+    assert_eq!(frames[0][0], 0xe0); // StartFrame stays SINGLE
+    assert_eq!(frames[1][0], 0xe1); // WireToSurface must be MULTIPART
+    assert_eq!(frames[2][0], 0xe0); // EndFrame stays SINGLE
+    assert_eq!(segmented_cmd_id(&frames[1]), 0x0001);
+}
+
 #[test]
 fn no_avc_capability_marks_failed() {
     let session = GfxSession::mock(32, 32);
