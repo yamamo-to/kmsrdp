@@ -11,7 +11,9 @@
 //! Session awareness: `XDG_RUNTIME_DIR` / `PULSE_SERVER` are kept up-to-date
 //! in the process environment by [`crate::session_watcher`]. The null sink is
 //! initialized per session UID so each user's PulseAudio instance gets its own
-//! virtual microphone.
+//! virtual microphone. When `PULSE_SERVER` changes mid-connection (greeter →
+//! user login), the playback writer is dropped and reopened against the new
+//! instance.
 
 use std::collections::HashSet;
 use std::sync::mpsc::Sender;
@@ -25,7 +27,7 @@ use pulse::stream::Direction;
 use rdpcore_rdpeai::pdu::AudioFormat;
 use rdpcore_rdpeai::{AudioInputBackend, AudioInputBackendFactory};
 
-use crate::pulse_util::{self, VIRTUAL_MIC_SINK};
+use crate::pulse_util::{self, VIRTUAL_MIC_SINK, pulse_server_env};
 
 static INITIALIZED_UIDS: LazyLock<Mutex<HashSet<u32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -71,6 +73,7 @@ impl AudioInputBackendFactory for VirtualMicFactory {
         Box::new(VirtualMicBackend {
             tx: None,
             retry_after: None,
+            bound_pulse: None,
         })
     }
 }
@@ -83,6 +86,8 @@ const RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2)
 struct VirtualMicBackend {
     tx: Option<Sender<Vec<u8>>>,
     retry_after: Option<std::time::Instant>,
+    /// `PULSE_SERVER` value used when `tx` was opened (if any).
+    bound_pulse: Option<String>,
 }
 
 fn current_session_uid() -> Option<u32> {
@@ -148,6 +153,17 @@ fn spawn_writer(format: &AudioFormat) -> Option<Sender<Vec<u8>>> {
 
 impl AudioInputBackend for VirtualMicBackend {
     fn on_audio_data(&mut self, format: &AudioFormat, data: &[u8]) {
+        let current_pulse = pulse_server_env();
+        if self.tx.is_some() && self.bound_pulse != current_pulse {
+            tracing::info!(
+                from = ?self.bound_pulse,
+                to = ?current_pulse,
+                "kmsrdp: virtual mic reconnecting after session Pulse server change"
+            );
+            self.tx = None;
+            self.bound_pulse = None;
+            self.retry_after = None;
+        }
         if self.tx.is_none() {
             let in_cooldown = self
                 .retry_after
@@ -156,16 +172,18 @@ impl AudioInputBackend for VirtualMicBackend {
                 return;
             }
             self.tx = spawn_writer(format);
-            self.retry_after = if self.tx.is_some() {
-                None
+            if self.tx.is_some() {
+                self.bound_pulse = current_pulse;
+                self.retry_after = None;
             } else {
-                Some(std::time::Instant::now() + RECONNECT_BACKOFF)
-            };
+                self.retry_after = Some(std::time::Instant::now() + RECONNECT_BACKOFF);
+            }
         }
         if let Some(tx) = &self.tx
             && tx.send(data.to_vec()).is_err()
         {
             self.tx = None; // writer thread died - respawn (after cooldown) on next chunk
+            self.bound_pulse = None;
             self.retry_after = Some(std::time::Instant::now() + RECONNECT_BACKOFF);
         }
     }
@@ -246,6 +264,29 @@ mod tests {
         let format = AudioFormat::pcm(1, 48_000, 16);
         backend.on_audio_data(&format, &[0u8; 4]);
         backend.on_audio_data(&format, &[0u8; 8]);
+    }
+
+    #[test]
+    fn backend_drops_writer_when_pulse_server_changes() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+            std::env::set_var("PULSE_SERVER", "unix:/run/user/1/pulse/native");
+        }
+        let mut backend = VirtualMicBackend {
+            tx: Some(std::sync::mpsc::channel().0),
+            retry_after: None,
+            bound_pulse: Some("unix:/run/user/1/pulse/native".into()),
+        };
+        unsafe {
+            std::env::set_var("PULSE_SERVER", "unix:/run/user/2/pulse/native");
+        }
+        let format = AudioFormat::pcm(1, 48_000, 16);
+        // No live Pulse at the new path — clears the old writer and fails to open.
+        backend.on_audio_data(&format, &[0u8; 4]);
+        assert!(backend.tx.is_none());
+        assert!(backend.bound_pulse.is_none());
+        assert!(backend.retry_after.is_some());
     }
 
     #[test]

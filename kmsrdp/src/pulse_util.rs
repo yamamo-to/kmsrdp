@@ -13,6 +13,15 @@ pub const VIRTUAL_MIC_SINK: &str = "kmsrdp_mic";
 
 const MAX_MAINLOOP_WAITS: u32 = 1_000;
 
+/// `PULSE_SERVER` as set by [`crate::session_watcher`] for the active login.
+///
+/// Libpulse/`pa_simple` read this at connect time. Capture and playback
+/// backends must reconnect when the value changes (e.g. gdm-greeter → user),
+/// otherwise they stay stuck on the previous session's silent Pulse instance.
+pub fn pulse_server_env() -> Option<String> {
+    std::env::var("PULSE_SERVER").ok()
+}
+
 /// Ensure `module-null-sink` named [`VIRTUAL_MIC_SINK`] is loaded.
 pub fn ensure_virtual_mic_sink() -> bool {
     let Some(mut mainloop) = Mainloop::new() else {
@@ -152,6 +161,22 @@ mod tests {
         assert!(take_wait_budget(&mut waits));
         assert!(!take_wait_budget(&mut waits));
         assert_eq!(waits, 0);
+    }
+
+    #[test]
+    fn pulse_server_env_reads_process_environment() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("PULSE_SERVER", "unix:/run/user/1000/pulse/native");
+        }
+        assert_eq!(
+            pulse_server_env().as_deref(),
+            Some("unix:/run/user/1000/pulse/native")
+        );
+        unsafe {
+            std::env::remove_var("PULSE_SERVER");
+        }
+        assert_eq!(pulse_server_env(), None);
     }
 
     #[test]

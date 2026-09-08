@@ -9,6 +9,11 @@
 //!   while `write_index - read_index` is seconds. We key off timing_info.
 //! - Leftover keeps only the newest 20 ms. Publish is capped to wall-clock
 //!   1× with no catch-up burst. Dropouts under load are the live-A/V trade.
+//!
+//! Session awareness: [`crate::session_watcher`] updates `PULSE_SERVER` when
+//! the active login changes (e.g. gdm-greeter → user). The capture thread
+//! reconnects when that value changes so RDPSND does not stay stuck on a
+//! silent greeter Pulse instance after the desktop session appears.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +29,8 @@ use pulse::sample::{Format, Spec};
 use pulse::stream::{FlagSet as StreamFlagSet, PeekResult, Stream};
 use rdpcore_rdpsnd::pdu::{AudioFormat, NegotiatedFormat};
 use rdpcore_rdpsnd::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory, WavePublisher};
+
+use crate::pulse_util::pulse_server_env;
 
 const SAMPLE_RATE: u32 = 48000;
 const CHANNELS: u16 = 2;
@@ -61,6 +68,8 @@ fn capture_buffer_attr() -> BufferAttr {
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Backoff between reconnect attempts when Pulse is missing or broken.
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 
 /// How far sent PCM may lead wall time before we drop a chunk.
 const MAX_AHEAD_MS: u64 = 40;
@@ -69,6 +78,16 @@ const SNAP_BEHIND_MS: u64 = 80;
 /// Daemon record queue above this is discarded via `flush` (peek only sees
 /// one fragment, so a 4 MB PipeWire buffer would otherwise drain at 1×).
 const MAX_PULSE_BUFFER_BYTES: u32 = (CHUNK_BYTES * 2) as u32;
+
+/// Why one Pulse capture attempt ended.
+enum CaptureEnd {
+    /// RDP sound handler stopped or the wave publisher closed.
+    Stopped,
+    /// `PULSE_SERVER` changed — reconnect immediately to the new session.
+    SessionChanged { from: Option<String>, to: Option<String> },
+    /// Connect/stream failure — retry after a short backoff.
+    Transient,
+}
 
 /// Decide whether one [`CHUNK_MS`] of PCM may go to the client.
 ///
@@ -231,42 +250,82 @@ fn pulse_queued_bytes(stream: &mut Stream) -> Option<u64> {
     Some(info.write_index.abs_diff(info.read_index))
 }
 
+/// Sleep up to `RECONNECT_BACKOFF`, waking early on stop or `PULSE_SERVER` change.
+fn wait_before_retry(stop: &AtomicBool, bound: Option<&str>) {
+    let deadline = Instant::now() + RECONNECT_BACKOFF;
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        if pulse_server_env().as_deref() != bound {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn run_capture(publisher: WavePublisher, stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Acquire) {
+        let bound = pulse_server_env();
+        match capture_one_server(&publisher, &stop, bound.as_deref()) {
+            CaptureEnd::Stopped => return,
+            CaptureEnd::SessionChanged { from, to } => {
+                tracing::info!(
+                    ?from,
+                    ?to,
+                    "kmsrdp: RDPSND reconnecting after session Pulse server change"
+                );
+            }
+            CaptureEnd::Transient => {
+                wait_before_retry(&stop, bound.as_deref());
+            }
+        }
+    }
+}
+
+/// Connect to the Pulse instance implied by the current env and capture until
+/// stop, publisher close, stream failure, or `PULSE_SERVER` changes.
+fn capture_one_server(
+    publisher: &WavePublisher,
+    stop: &AtomicBool,
+    bound_pulse: Option<&str>,
+) -> CaptureEnd {
     let spec = capture_spec();
     if !spec.is_valid() {
         tracing::warn!("kmsrdp: invalid PulseAudio capture spec: {spec:?}");
-        return;
+        return CaptureEnd::Transient;
     }
 
     let Some(mut mainloop) = Mainloop::new() else {
         tracing::warn!("kmsrdp: PulseAudio mainloop create failed");
-        return;
+        return CaptureEnd::Transient;
     };
     let Some(mut context) = Context::new(&mainloop, "kmsrdp-rdpsnd") else {
         tracing::warn!("kmsrdp: PulseAudio context create failed");
-        return;
+        return CaptureEnd::Transient;
     };
     if context
         .connect(None, ContextFlagSet::NOFLAGS, None)
         .is_err()
     {
         tracing::warn!("kmsrdp: PulseAudio context connect failed");
-        return;
+        return CaptureEnd::Transient;
     }
 
     let deadline = Instant::now() + CONNECT_TIMEOUT;
-    if !iterate_until(&mut mainloop, &stop, deadline, || {
-        context_is_ready(&context)
-    }) {
+    if !iterate_until(&mut mainloop, stop, deadline, || context_is_ready(&context)) {
+        if stop.load(Ordering::Acquire) {
+            return CaptureEnd::Stopped;
+        }
         tracing::warn!("kmsrdp: PulseAudio context not ready for RDPSND capture");
-        return;
+        return CaptureEnd::Transient;
     }
 
     let mut stream_props = match Proplist::new() {
         Some(p) => p,
         None => {
             tracing::warn!("kmsrdp: PulseAudio proplist create failed");
-            return;
+            return CaptureEnd::Transient;
         }
     };
     let _ = stream_props.set_str(pulse::proplist::properties::MEDIA_NAME, "RDP audio capture");
@@ -280,7 +339,7 @@ fn run_capture(publisher: WavePublisher, stop: Arc<AtomicBool>) {
         &mut stream_props,
     ) else {
         tracing::warn!("kmsrdp: PulseAudio stream create failed");
-        return;
+        return CaptureEnd::Transient;
     };
 
     let attr = capture_buffer_attr();
@@ -293,17 +352,20 @@ fn run_capture(publisher: WavePublisher, stop: Arc<AtomicBool>) {
         .is_err()
     {
         tracing::warn!("kmsrdp: PulseAudio record connect failed");
-        return;
+        return CaptureEnd::Transient;
     }
 
     if !iterate_until(
         &mut mainloop,
-        &stop,
+        stop,
         Instant::now() + CONNECT_TIMEOUT,
         || stream_is_ready(&stream),
     ) {
+        if stop.load(Ordering::Acquire) {
+            return CaptureEnd::Stopped;
+        }
         tracing::warn!("kmsrdp: PulseAudio record stream not ready");
-        return;
+        return CaptureEnd::Transient;
     }
 
     if let Some(actual) = stream.get_buffer_attr() {
@@ -342,13 +404,41 @@ fn run_capture(publisher: WavePublisher, stop: Arc<AtomicBool>) {
     let mut budget_drops = 0u32;
     let mut pulse_flushes = 0u32;
 
-    while !stop.load(Ordering::Acquire) {
+    let end = loop {
+        if stop.load(Ordering::Acquire) {
+            break CaptureEnd::Stopped;
+        }
+        let current = pulse_server_env();
+        if current.as_deref() != bound_pulse {
+            break CaptureEnd::SessionChanged {
+                from: bound_pulse.map(str::to_owned),
+                to: current,
+            };
+        }
+        match context.get_state() {
+            pulse::context::State::Failed | pulse::context::State::Terminated => {
+                tracing::warn!("kmsrdp: RDPSND Pulse context failed; will reconnect");
+                break CaptureEnd::Transient;
+            }
+            _ => {}
+        }
+        match stream.get_state() {
+            pulse::stream::State::Failed | pulse::stream::State::Terminated => {
+                tracing::warn!("kmsrdp: RDPSND Pulse record stream failed; will reconnect");
+                break CaptureEnd::Transient;
+            }
+            _ => {}
+        }
+
         match mainloop.iterate(true) {
             IterateResult::Success(_) => {}
-            IterateResult::Quit(_) | IterateResult::Err(_) => break,
+            IterateResult::Quit(_) | IterateResult::Err(_) => {
+                tracing::warn!("kmsrdp: RDPSND Pulse mainloop ended; will reconnect");
+                break CaptureEnd::Transient;
+            }
         }
         if stop.load(Ordering::Acquire) {
-            break;
+            break CaptureEnd::Stopped;
         }
 
         if pulse_queued_bytes(&mut stream).is_some_and(|n| n > u64::from(MAX_PULSE_BUFFER_BYTES)) {
@@ -371,7 +461,7 @@ fn run_capture(publisher: WavePublisher, stop: Arc<AtomicBool>) {
 
         let timestamp_ms = elapsed_ms as u32;
         if !publisher.publish(RdpsndServerMessage::Wave(chunk.to_vec(), timestamp_ms)) {
-            break;
+            break CaptureEnd::Stopped;
         }
         published = published.saturating_add(1);
 
@@ -405,6 +495,7 @@ fn run_capture(publisher: WavePublisher, stop: Arc<AtomicBool>) {
                 published,
                 budget_drops,
                 pulse_flushes,
+                pulse_server = bound_pulse,
                 "kmsrdp: RDPSND capture 1s (buffer_ms is Pulse record queue; pulse_lat_ms subtracts sink and can hide it)"
             );
             last_diag = Instant::now();
@@ -412,9 +503,10 @@ fn run_capture(publisher: WavePublisher, stop: Arc<AtomicBool>) {
             budget_drops = 0;
             pulse_flushes = 0;
         }
-    }
+    };
 
     let _ = stream.disconnect();
+    end
 }
 
 impl RdpsndServerHandler for LocalAudioHandler {
@@ -484,6 +576,26 @@ mod tests {
         assert_eq!(pcm_send_budget(200, 50), None);
         // Far behind: snap to now, then allow one live chunk (not the gap).
         assert_eq!(pcm_send_budget(0, 1_000), Some(1_000 + u64::from(CHUNK_MS)));
+    }
+
+    #[test]
+    fn session_pulse_change_is_detected_against_bound_server() {
+        let _guard = crate::test_env::env_lock();
+        unsafe {
+            std::env::set_var("PULSE_SERVER", "unix:/run/user/60578/pulse/native");
+        }
+        let bound = pulse_server_env();
+        assert_eq!(
+            bound.as_deref(),
+            Some("unix:/run/user/60578/pulse/native")
+        );
+        unsafe {
+            std::env::set_var("PULSE_SERVER", "unix:/run/user/1000/pulse/native");
+        }
+        assert_ne!(pulse_server_env().as_deref(), bound.as_deref());
+        unsafe {
+            std::env::remove_var("PULSE_SERVER");
+        }
     }
 
     #[test]
