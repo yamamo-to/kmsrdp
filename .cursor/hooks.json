@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "hooks": {
+    "afterFileEdit": [
+      {
+        "command": ".cursor/hooks/rustfmt-edited.sh",
+        "matcher": "Write|TabWrite"
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": ".cursor/hooks/ensure-git-hooks.sh",
+        "matcher": "git.*commit",
+        "failClosed": true
+      }
+    ]
+  }
+}

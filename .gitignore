@@ -3,7 +3,10 @@
 /.rpmbuild
 /.debbuild
 /.claude/
-/.cursor/
+/.cursor/*
+!/.cursor/hooks.json
+!/.cursor/hooks/
+!/.cursor/hooks/**
 **/fuzz/corpus/
 **/fuzz/artifacts/
 **/fuzz/target/

@@ -125,8 +125,7 @@ fn segmented_cmd_id(segmented: &[u8]) -> u16 {
         let mut rebuilt = Vec::new();
         let mut off = 7usize;
         for _ in 0..segment_count {
-            let seg_size =
-                u32::from_le_bytes(segmented[off..off + 4].try_into().unwrap()) as usize;
+            let seg_size = u32::from_le_bytes(segmented[off..off + 4].try_into().unwrap()) as usize;
             off += 4;
             rebuilt.extend_from_slice(&segmented[off + 1..off + seg_size]);
             off += seg_size;

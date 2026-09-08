@@ -84,6 +84,17 @@ cargo clippy --workspace --all-targets
 cargo build --release --bin rdp_server
 ```
 
+### Local git hooks (fmt + clippy on commit)
+Once per clone, point git at the versioned hooks:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+`.githooks/pre-commit` runs the same early CI checks (`cargo fmt --all --check` and
+`cargo clippy --workspace --all-targets -- -D warnings`). Cursor also enables this
+`hooksPath` automatically before agent `git commit` commands (see `.cursor/hooks.json`).
+
 ### Version Bump & Release Procedure (Lockstep Requirement)
 When bumping the version (e.g. `0.1.48` $\rightarrow$ `0.1.49`), all 4 files **MUST** be updated in lockstep in a dedicated commit:
 

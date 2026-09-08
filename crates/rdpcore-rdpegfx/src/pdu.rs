@@ -192,11 +192,7 @@ pub fn encode_segmented(gfx_pdus: &[u8]) -> Vec<u8> {
 
     // descriptor(1) + segmentCount(2) + uncompressedSize(4)
     // + per segment: size(4) + header(1) + payload
-    let capacity = 7
-        + chunks
-            .iter()
-            .map(|c| 4 + 1 + c.len())
-            .sum::<usize>();
+    let capacity = 7 + chunks.iter().map(|c| 4 + 1 + c.len()).sum::<usize>();
     let mut out = Vec::with_capacity(capacity);
     out.write_u8(SEGMENTED_MULTIPART);
     out.write_u16_le(segment_count as u16);
@@ -432,13 +428,20 @@ mod tests {
         let seg0_size = u32::from_le_bytes(wrapped[7..11].try_into().unwrap()) as usize;
         assert_eq!(seg0_size, 1 + ZGFX_MAX_SEGMENT_PAYLOAD);
         assert_eq!(wrapped[11], PACKET_COMPR_TYPE_RDP8);
-        assert_eq!(&wrapped[12..12 + ZGFX_MAX_SEGMENT_PAYLOAD], &payload[..ZGFX_MAX_SEGMENT_PAYLOAD]);
+        assert_eq!(
+            &wrapped[12..12 + ZGFX_MAX_SEGMENT_PAYLOAD],
+            &payload[..ZGFX_MAX_SEGMENT_PAYLOAD]
+        );
 
         let seg1_off = 11 + seg0_size;
-        let seg1_size = u32::from_le_bytes(wrapped[seg1_off..seg1_off + 4].try_into().unwrap()) as usize;
+        let seg1_size =
+            u32::from_le_bytes(wrapped[seg1_off..seg1_off + 4].try_into().unwrap()) as usize;
         assert_eq!(seg1_size, 1 + 10);
         assert_eq!(wrapped[seg1_off + 4], PACKET_COMPR_TYPE_RDP8);
-        assert_eq!(&wrapped[seg1_off + 5..], &payload[ZGFX_MAX_SEGMENT_PAYLOAD..]);
+        assert_eq!(
+            &wrapped[seg1_off + 5..],
+            &payload[ZGFX_MAX_SEGMENT_PAYLOAD..]
+        );
         // size field (4) + segment payload (seg1_size)
         assert_eq!(wrapped.len(), seg1_off + 4 + seg1_size);
     }
