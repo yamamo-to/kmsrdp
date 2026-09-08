@@ -1390,11 +1390,36 @@ enum GfxServerPdu {
 
 #[cfg(feature = "gfx")]
 fn parse_gfx_pdus(payload: &[u8]) -> Vec<GfxServerPdu> {
-    let mut out = Vec::new();
     let mut data = payload;
+    // RDP_SEGMENTED_DATA: SINGLE (0xe0) or MULTIPART (0xe1) uncompressed RDP8.
     if data.len() >= 2 && data[0] == 0xe0 && data[1] == 0x04 {
         data = &data[2..];
+    } else if data.len() >= 7 && data[0] == 0xe1 {
+        // descriptor(1) + segmentCount(2) + uncompressedSize(4) + segments...
+        let mut rebuilt = Vec::new();
+        let mut off = 7usize;
+        let segment_count = u16::from_le_bytes([data[1], data[2]]) as usize;
+        for _ in 0..segment_count {
+            if off + 5 > data.len() {
+                break;
+            }
+            let seg_size = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+            off += 4;
+            if seg_size == 0 || off + seg_size > data.len() {
+                break;
+            }
+            // Skip PACKET_COMPR_TYPE_RDP8 header byte; append raw segment body.
+            rebuilt.extend_from_slice(&data[off + 1..off + seg_size]);
+            off += seg_size;
+        }
+        return parse_gfx_pdus_body(&rebuilt);
     }
+    parse_gfx_pdus_body(data)
+}
+
+#[cfg(feature = "gfx")]
+fn parse_gfx_pdus_body(data: &[u8]) -> Vec<GfxServerPdu> {
+    let mut out = Vec::new();
     let mut cursor = rdpcore_pdu::cursor::ReadCursor::new(data);
     while cursor.remaining() >= 8 {
         let Ok(cmd_id) = cursor.read_u16_le() else {

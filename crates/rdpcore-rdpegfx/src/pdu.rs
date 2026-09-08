@@ -1,7 +1,12 @@
 //! MS-RDPEGFX wire format: the subset needed for AVC420 full-frame streaming.
 //!
-//! Server-to-client messages are wrapped in [`encode_segmented_single`]
+//! Server-to-client messages are wrapped in [`encode_segmented`]
 //! (`RDP_SEGMENTED_DATA` with uncompressed `RDP8_BULK_ENCODED_DATA`).
+//! Payloads larger than the RDP8 single-segment limit (65535 bytes) are
+//! split into `MULTIPART` segments — FreeRDP's zgfx decompressor keeps a
+//! fixed 64KiB output buffer per segment and returns
+//! `zgfx_decompress failure` on an oversized SINGLE (observed with
+//! xfreerdp3 under heavy console scroll).
 //! Client-to-server messages arrive as raw GFX PDUs (no segmented wrapper).
 
 use rdpcore_pdu::DecodeError;
@@ -41,7 +46,13 @@ pub const CAPS_FLAG_AVC420_ENABLED: u32 = 0x10;
 pub const CAPS_FLAG_AVC_DISABLED: u32 = 0x20;
 
 const SEGMENTED_SINGLE: u8 = 0xe0;
+const SEGMENTED_MULTIPART: u8 = 0xe1;
 const PACKET_COMPR_TYPE_RDP8: u8 = 0x04;
+
+/// RDP 8.0 bulk compressor limit: max uncompressed bytes per segment
+/// (MS-RDPEGDI / FreeRDP zgfx). Exceeding this in a SINGLE descriptor makes
+/// FreeRDP's `zgfx_decompress` fail (`OutputBuffer` is 65536 bytes).
+pub const ZGFX_MAX_SEGMENT_PAYLOAD: usize = 65535;
 
 /// Total encoded size of `RDPGFX_RESET_GRAPHICS_PDU` including header (MS-RDPEGFX).
 const RESET_GRAPHICS_TOTAL_SIZE: usize = 340;
@@ -162,13 +173,47 @@ fn write_header(out: &mut Vec<u8>, cmd_id: u16, body_len: usize) {
     out.write_u32_le(pdu_length);
 }
 
-/// Wrap one or more GFX PDUs in an uncompressed `RDP_SEGMENTED_DATA` SINGLE.
-pub fn encode_segmented_single(gfx_pdus: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + gfx_pdus.len());
-    out.write_u8(SEGMENTED_SINGLE);
-    out.write_u8(PACKET_COMPR_TYPE_RDP8);
-    out.write_slice(gfx_pdus);
+/// Wrap one or more GFX PDUs in `RDP_SEGMENTED_DATA` with uncompressed
+/// `RDP8_BULK_ENCODED_DATA`. Uses `SINGLE` when the payload fits in one
+/// RDP8 segment; otherwise `MULTIPART` with ≤[`ZGFX_MAX_SEGMENT_PAYLOAD`]
+/// bytes per segment.
+pub fn encode_segmented(gfx_pdus: &[u8]) -> Vec<u8> {
+    if gfx_pdus.len() <= ZGFX_MAX_SEGMENT_PAYLOAD {
+        let mut out = Vec::with_capacity(2 + gfx_pdus.len());
+        out.write_u8(SEGMENTED_SINGLE);
+        out.write_u8(PACKET_COMPR_TYPE_RDP8);
+        out.write_slice(gfx_pdus);
+        return out;
+    }
+
+    let chunks: Vec<&[u8]> = gfx_pdus.chunks(ZGFX_MAX_SEGMENT_PAYLOAD).collect();
+    let segment_count = chunks.len();
+    debug_assert!(segment_count <= usize::from(u16::MAX));
+
+    // descriptor(1) + segmentCount(2) + uncompressedSize(4)
+    // + per segment: size(4) + header(1) + payload
+    let capacity = 7
+        + chunks
+            .iter()
+            .map(|c| 4 + 1 + c.len())
+            .sum::<usize>();
+    let mut out = Vec::with_capacity(capacity);
+    out.write_u8(SEGMENTED_MULTIPART);
+    out.write_u16_le(segment_count as u16);
+    out.write_u32_le(gfx_pdus.len() as u32);
+    for chunk in chunks {
+        let segment_size = 1 + chunk.len();
+        out.write_u32_le(segment_size as u32);
+        out.write_u8(PACKET_COMPR_TYPE_RDP8);
+        out.write_slice(chunk);
+    }
     out
+}
+
+/// Alias kept for call sites / tests that historically assumed SINGLE only.
+/// Prefer [`encode_segmented`]; this now auto-upgrades to MULTIPART.
+pub fn encode_segmented_single(gfx_pdus: &[u8]) -> Vec<u8> {
+    encode_segmented(gfx_pdus)
 }
 
 pub fn encode_caps_confirm(cap: &RawCapabilitySet) -> Vec<u8> {
@@ -368,9 +413,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn segmented_single_wraps_payload() {
-        let wrapped = encode_segmented_single(&[0xab, 0xcd]);
+    fn segmented_single_wraps_small_payload() {
+        let wrapped = encode_segmented(&[0xab, 0xcd]);
         assert_eq!(wrapped, vec![0xe0, 0x04, 0xab, 0xcd]);
+    }
+
+    #[test]
+    fn segmented_multipart_splits_oversized_payload() {
+        let payload = vec![0x5Au8; ZGFX_MAX_SEGMENT_PAYLOAD + 10];
+        let wrapped = encode_segmented(&payload);
+        assert_eq!(wrapped[0], SEGMENTED_MULTIPART);
+        let segment_count = u16::from_le_bytes(wrapped[1..3].try_into().unwrap());
+        assert_eq!(segment_count, 2);
+        let uncompressed = u32::from_le_bytes(wrapped[3..7].try_into().unwrap());
+        assert_eq!(uncompressed as usize, payload.len());
+
+        // First segment: size(4) + header(1) + 65535 bytes
+        let seg0_size = u32::from_le_bytes(wrapped[7..11].try_into().unwrap()) as usize;
+        assert_eq!(seg0_size, 1 + ZGFX_MAX_SEGMENT_PAYLOAD);
+        assert_eq!(wrapped[11], PACKET_COMPR_TYPE_RDP8);
+        assert_eq!(&wrapped[12..12 + ZGFX_MAX_SEGMENT_PAYLOAD], &payload[..ZGFX_MAX_SEGMENT_PAYLOAD]);
+
+        let seg1_off = 11 + seg0_size;
+        let seg1_size = u32::from_le_bytes(wrapped[seg1_off..seg1_off + 4].try_into().unwrap()) as usize;
+        assert_eq!(seg1_size, 1 + 10);
+        assert_eq!(wrapped[seg1_off + 4], PACKET_COMPR_TYPE_RDP8);
+        assert_eq!(&wrapped[seg1_off + 5..], &payload[ZGFX_MAX_SEGMENT_PAYLOAD..]);
+        // size field (4) + segment payload (seg1_size)
+        assert_eq!(wrapped.len(), seg1_off + 4 + seg1_size);
+    }
+
+    #[test]
+    fn segmented_exact_limit_stays_single() {
+        let payload = vec![0u8; ZGFX_MAX_SEGMENT_PAYLOAD];
+        let wrapped = encode_segmented(&payload);
+        assert_eq!(wrapped[0], SEGMENTED_SINGLE);
+        assert_eq!(wrapped.len(), 2 + ZGFX_MAX_SEGMENT_PAYLOAD);
     }
 
     #[test]

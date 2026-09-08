@@ -61,7 +61,7 @@ fn caps_configures_surface_immediately() {
     let frames = expect_frames(session.encode_frame(64, 64, 64 * 4, &pixels));
     // Start + Wire + End (surface already configured)
     assert_eq!(frames.len(), 3);
-    assert!(frames.iter().all(|r| r[0] == 0xe0));
+    assert!(frames.iter().all(|r| r[0] == 0xe0 || r[0] == 0xe1));
 }
 
 #[test]
@@ -115,16 +115,47 @@ fn encode_auto_resizes_surface() {
 
 fn segmented_cmd_id(segmented: &[u8]) -> u16 {
     assert!(segmented.len() >= 4);
-    assert_eq!(segmented[0], 0xe0);
-    assert_eq!(segmented[1], 0x04);
-    u16::from_le_bytes([segmented[2], segmented[3]])
+    assert!(segmented[0] == 0xe0 || segmented[0] == 0xe1);
+    let gfx = if segmented[0] == 0xe0 {
+        assert_eq!(segmented[1], 0x04);
+        &segmented[2..]
+    } else {
+        // MULTIPART: rebuild uncompressed GFX body from segments.
+        let segment_count = u16::from_le_bytes([segmented[1], segmented[2]]) as usize;
+        let mut rebuilt = Vec::new();
+        let mut off = 7usize;
+        for _ in 0..segment_count {
+            let seg_size =
+                u32::from_le_bytes(segmented[off..off + 4].try_into().unwrap()) as usize;
+            off += 4;
+            rebuilt.extend_from_slice(&segmented[off + 1..off + seg_size]);
+            off += seg_size;
+        }
+        // Leak for simple &[u8] return in tests — use owned path instead.
+        return u16::from_le_bytes([rebuilt[0], rebuilt[1]]);
+    };
+    u16::from_le_bytes([gfx[0], gfx[1]])
 }
 
-fn wire_bitmap_payload(segmented_wire: &[u8]) -> &[u8] {
-    // SEGMENTED + GFX header(8) + surfaceId(2)+codec(2)+pix(1)+rect(8)+bitmapLen(4)
-    let gfx = &segmented_wire[2..];
+fn wire_bitmap_payload(segmented_wire: &[u8]) -> Vec<u8> {
+    let gfx: Vec<u8> = if segmented_wire[0] == 0xe0 {
+        segmented_wire[2..].to_vec()
+    } else {
+        let segment_count = u16::from_le_bytes([segmented_wire[1], segmented_wire[2]]) as usize;
+        let mut rebuilt = Vec::new();
+        let mut off = 7usize;
+        for _ in 0..segment_count {
+            let seg_size =
+                u32::from_le_bytes(segmented_wire[off..off + 4].try_into().unwrap()) as usize;
+            off += 4;
+            rebuilt.extend_from_slice(&segmented_wire[off + 1..off + seg_size]);
+            off += seg_size;
+        }
+        rebuilt
+    };
+    // GFX header(8) + surfaceId(2)+codec(2)+pix(1)+rect(8)+bitmapLen(4)
     let bitmap_len = u32::from_le_bytes(gfx[21..25].try_into().unwrap()) as usize;
-    &gfx[25..25 + bitmap_len]
+    gfx[25..25 + bitmap_len].to_vec()
 }
 
 #[test]
