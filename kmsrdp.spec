@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.68
+Version:        0.1.69
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,10 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Thu Sep 24 2026 kmsrdp contributors <noreply@example.com> - 0.1.69-1
+- Bump rand, rustls, sspi, and tokio-rustls (rustls: HRR handshake hardening; sspi: Kerberos AP-REP/MIC validation fixes)
+- Fix sspi 0.22.0 breaking change: TsRequest::buffer_len() is now fallible
+
 * Wed Sep 09 2026 kmsrdp contributors <noreply@example.com> - 0.1.68-1
 - Reconnect RDPSND/RDPEAI when the active session Pulse/PipeWire server changes (greeter → user)
 

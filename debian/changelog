@@ -1,3 +1,12 @@
+kmsrdp (0.1.69) unstable; urgency=medium
+
+  * Bump rand, rustls, sspi, and tokio-rustls (rustls: HRR handshake
+    hardening; sspi: Kerberos AP-REP/MIC validation fixes).
+  * Fix sspi 0.22.0 breaking change: TsRequest::buffer_len() is now
+    fallible.
+
+ -- kmsrdp contributors <noreply@example.com>  Thu, 24 Sep 2026 21:35:00 +0900
+
 kmsrdp (0.1.68) unstable; urgency=medium
 
   * Reconnect RDPSND capture and RDPEAI virtual-mic playback when
