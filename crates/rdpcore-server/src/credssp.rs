@@ -204,7 +204,10 @@ async fn write_ts_request<S: AsyncWrite + Unpin>(
     stream: &mut S,
     ts_request: &TsRequest,
 ) -> Result<(), CredSspError> {
-    let mut buf = Vec::with_capacity(usize::from(ts_request.buffer_len()));
+    let capacity = ts_request
+        .buffer_len()
+        .map_err(|e| CredSspError::Encode(e.to_string()))?;
+    let mut buf = Vec::with_capacity(usize::from(capacity));
     ts_request
         .encode_ts_request(&mut buf)
         .map_err(|e| CredSspError::Encode(e.to_string()))?;
