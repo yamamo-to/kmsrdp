@@ -1,3 +1,18 @@
+kmsrdp (0.1.70) unstable; urgency=medium
+
+  * Bump arboard, thiserror, libc, rustls, tokio, zbus (5->6), zeroize,
+    proptest, openh264, sspi (0.22->0.23), and tokio-rustls.
+  * Fix zbus 6.0.0 breaking changes: the proxy macro/module now needs the
+    "proxy" feature explicitly; zbus::zvariant::{Object,OwnedObject}Path
+    renamed to zbus::{Object,OwnedObject}Path; proxy::Builder::path is
+    now infallible.
+  * Fix rustls-webpki RUSTSEC-2026-0382 (accepted distrusted
+    intermediates) - rustls doesn't pull a fixed version on its own.
+  * Fix Rust 1.99 deprecation: Atomic::fetch_update renamed to
+    try_update.
+
+ -- kmsrdp contributors <noreply@example.com>  Fri, 23 Oct 2026 14:30:00 +0900
+
 kmsrdp (0.1.69) unstable; urgency=medium
 
   * Bump rand, rustls, sspi, and tokio-rustls (rustls: HRR handshake

@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           kmsrdp
-Version:        0.1.69
+Version:        0.1.70
 Release:        1%{?dist}
 Summary:        DRM/KMS-based RDP remote desktop server (pure Rust)
 
@@ -99,6 +99,12 @@ MSG
 %{_docdir}/%{name}/%{name}-system.env.example
 
 %changelog
+* Fri Oct 23 2026 kmsrdp contributors <noreply@example.com> - 0.1.70-1
+- Bump arboard, thiserror, libc, rustls, tokio, zbus (5->6), zeroize, proptest, openh264, sspi (0.22->0.23), and tokio-rustls
+- Fix zbus 6.0.0 breaking changes: proxy feature now explicit; zvariant path type aliases renamed; proxy::Builder::path is infallible
+- Fix rustls-webpki RUSTSEC-2026-0382 (accepted distrusted intermediates)
+- Fix Rust 1.99 deprecation: Atomic::fetch_update renamed to try_update
+
 * Thu Sep 24 2026 kmsrdp contributors <noreply@example.com> - 0.1.69-1
 - Bump rand, rustls, sspi, and tokio-rustls (rustls: HRR handshake hardening; sspi: Kerberos AP-REP/MIC validation fixes)
 - Fix sspi 0.22.0 breaking change: TsRequest::buffer_len() is now fallible
