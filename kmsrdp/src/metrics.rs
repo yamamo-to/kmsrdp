@@ -40,7 +40,7 @@ impl GlobalMetrics {
         // Avoid underflow if decrement called without prior increment
         let _ = self
             .active_sessions
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
                 Some(val.saturating_sub(1))
             });
     }

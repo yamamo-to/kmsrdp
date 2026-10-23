@@ -18,7 +18,7 @@ use zbus::proxy;
 
 use crate::session::{Session, find_xauthority, resolve_x11_display};
 
-type LogindSession = (String, u32, String, String, zbus::zvariant::OwnedObjectPath);
+type LogindSession = (String, u32, String, String, zbus::OwnedObjectPath);
 
 #[proxy(
     interface = "org.freedesktop.login1.Manager",
@@ -29,17 +29,13 @@ trait LoginManager {
     fn list_sessions(&self) -> zbus::Result<Vec<LogindSession>>;
 
     #[zbus(signal)]
-    fn session_new(
-        &self,
-        session_id: &str,
-        object_path: zbus::zvariant::ObjectPath<'_>,
-    ) -> zbus::Result<()>;
+    fn session_new(&self, session_id: &str, object_path: zbus::ObjectPath<'_>) -> zbus::Result<()>;
 
     #[zbus(signal)]
     fn session_removed(
         &self,
         session_id: &str,
-        object_path: zbus::zvariant::ObjectPath<'_>,
+        object_path: zbus::ObjectPath<'_>,
     ) -> zbus::Result<()>;
 }
 
@@ -72,11 +68,10 @@ async fn session_from_proxy(
     conn: &Connection,
     uid: u32,
     username: String,
-    path: zbus::zvariant::OwnedObjectPath,
+    path: zbus::OwnedObjectPath,
 ) -> Option<(String, Session)> {
     let proxy = LoginSessionProxy::builder(conn)
         .path(path)
-        .ok()?
         .build()
         .await
         .ok()?;
